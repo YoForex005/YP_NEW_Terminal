@@ -1,0 +1,313 @@
+/* ── React Grid Layout ── */
+@import "react-grid-layout/css/styles.css";
+@import "react-resizable/css/styles.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* ─── LIGHT THEME: Authentic Exness Light ─── */
+    --background: 210 20% 98%;        /* #f8f9fa — Light gray background / gaps */
+    --foreground: 222 47% 11%;        /* #0f172a — Near black text */
+    --card: 0 0% 100%;                /* #ffffff — Pure white panels */
+    --card-foreground: 222 47% 11%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+    --primary: 142 71% 45%;           /* Premium Green */
+    --primary-foreground: 222 47% 11%;
+    --secondary: 210 40% 96.1%;
+    --secondary-foreground: 222 47% 11%;
+    --muted: 210 40% 96.1%;           /* #f1f5f9 */
+    --muted-foreground: 215 16% 47%;  /* #64748b */
+    --accent: 210 40% 96.1%;
+    --accent-foreground: 222 47% 11%;
+    --destructive: 355 89% 58%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 215 16% 84%;            /* #cbd5e1 - Slate 300 for clearer thin border */
+    --input: 214 32% 91%;
+    --ring: 142 71% 45%;
+    --radius: 0.5rem;
+    --success: 142 76% 36%;
+    --warning: 45 93% 47%;
+
+    --success-05: hsl(142 76% 36% / 0.05);
+    --success-10: hsl(142 76% 36% / 0.1);
+    --success-20: hsl(142 76% 36% / 0.2);
+    --danger-10: hsl(0 84% 60% / 0.1);
+
+    /* Trading specific palette */
+    --bull: #46cd7c;
+    --bull-dim: rgba(70, 205, 124, 0.15);
+    --bear: #f23645;
+    --bear-dim: rgba(242, 54, 69, 0.15);
+  }
+
+  :root {
+    /* Dark fallback overrides light legacy tokens before next-themes hydrates. */
+    --background: 222 26% 8%;
+    --foreground: 204 13% 94%;
+    --card: 222 26% 12%;
+    --card-foreground: 204 13% 94%;
+    --popover: 222 26% 12%;
+    --popover-foreground: 204 13% 94%;
+    --primary: 142 69% 58%;
+    --primary-foreground: 222 26% 11%;
+    --secondary: 222 26% 11%;
+    --secondary-foreground: 204 13% 94%;
+    --muted: 220 22% 14%;
+    --muted-foreground: 204 13% 94%;
+    --accent: 204 22% 14%;
+    --accent-foreground: 204 13% 94%;
+    --destructive: 355 89% 58%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 218 16% 20%;
+    --input: 218 16% 20%;
+    --ring: 142 69% 58%;
+    --success: 144 57% 54%;
+    --warning: 52 100% 50%;
+    --success-05: rgba(70, 205, 124, 0.05);
+    --success-10: rgba(70, 205, 124, 0.1);
+    --success-20: rgba(70, 205, 124, 0.2);
+    --danger-10: rgba(242, 54, 69, 0.12);
+  }
+
+  .dark {
+    /* ─── DARK THEME: Authentic Exness Colors ─── */
+    --background: 222 26% 8%;         /* #11141d - Darker background for separation */
+    --foreground: 204 13% 94%;        /* rgba(237, 240, 242, 1) — Exness Text Primary */
+    --card: 222 26% 12%;              /* Lighter card to stand out */
+    --card-foreground: 204 13% 94%;
+    --popover: 222 26% 12%;
+    --popover-foreground: 204 13% 94%;
+    --primary: 142 69% 58%;           /* Premium Light Green */
+    --primary-foreground: 222 26% 11%;
+    --secondary: 222 26% 11%;
+    --secondary-foreground: 204 13% 94%;
+    --muted: 220 22% 14%;
+    --muted-foreground: 204 13% 94%;  /* Will apply 0.6 opacity where used */
+    --accent: 204 22% 14%;
+    --accent-foreground: 204 13% 94%;
+    --destructive: 355 89% 58%;       /* #f23645 red */
+    --destructive-foreground: 0 0% 100%;
+    --border: 218 16% 20%;            /* #2a2f3a */
+    --input: 218 16% 20%;
+    --ring: 142 69% 58%;
+
+    --success: 144 57% 54%;           /* rgba(70, 205, 124, 1) — Exness Success Main */
+    --warning: 52 100% 50%;           /* Exness Yellow */
+
+    --success-05: rgba(70, 205, 124, 0.05);
+    --success-10: rgba(70, 205, 124, 0.1);
+    --success-20: rgba(70, 205, 124, 0.2);
+    --danger-10: rgba(242, 54, 69, 0.12);
+
+    /* Trading specific palette */
+    --bull: #46cd7c;                  /* Exness Success Main */
+    --bull-dim: rgba(70, 205, 124, 0.15);
+    --bear: #f23645;
+    --bear-dim: rgba(242, 54, 69, 0.15);
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+/* ── Custom Component Classes ── */
+@layer components {
+
+  .stat-card-gradient {
+    @apply bg-gradient-to-br from-card via-card to-muted/30;
+  }
+
+  .custom-scrollbar {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--border)) transparent;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    background-color: hsl(var(--border));
+    border-radius: 3px;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+    background-color: hsl(var(--muted-foreground) / 0.4);
+  }
+
+  .layout-editing .react-grid-item.react-grid-placeholder {
+    @apply bg-primary/20 rounded-md border-2 border-dashed border-primary/40;
+    opacity: 1 !important;
+  }
+
+  .layout-editing .react-resizable-handle {
+    opacity: 0;
+  }
+
+  .layout-editing .react-grid-item:hover .react-resizable-handle {
+    opacity: 1;
+  }
+
+  .quote-flash-cell {
+    @apply relative overflow-hidden;
+  }
+
+  .quote-flash-content {
+    @apply relative z-[1];
+  }
+
+  .quote-flash-overlay {
+    @apply pointer-events-none absolute inset-0 z-0;
+    animation-duration: 320ms;
+    animation-fill-mode: forwards;
+    animation-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .quote-flash-up {
+    animation-name: quote-flash-up;
+  }
+
+  .quote-flash-down {
+    animation-name: quote-flash-down;
+  }
+
+  .quote-flash-buy {
+    animation-name: quote-flash-buy;
+  }
+
+  .quote-flash-sell {
+    animation-name: quote-flash-sell;
+  }
+
+  .quote-flash-tick {
+    animation-name: quote-flash-tick;
+    animation-duration: 220ms;
+  }
+
+  /* Direct-DOM tick flash — added/removed by class toggling, no overlay span */
+  .flash-up {
+    animation: flash-up-kf 280ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  }
+  .flash-dn {
+    animation: flash-dn-kf 280ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .quote-flash-overlay {
+      animation: none;
+    }
+    .flash-up, .flash-dn { animation: none; }
+  }
+}
+
+@keyframes flash-up-kf {
+  0%   { background-color: transparent; }
+  100% { background-color: transparent; }
+}
+@keyframes flash-dn-kf {
+  0%   { background-color: transparent; }
+  100% { background-color: transparent; }
+}
+
+/* ── Keyframe Animations ── */
+@keyframes roulette-zoom-in {
+  0% {
+    opacity: 0;
+    transform: scale(0.5);
+  }
+
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes roulette-slide-up {
+  0% {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes scale-in {
+  0% {
+    opacity: 0;
+    transform: scale(0.9);
+  }
+
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes quote-flash-up {
+  0% {
+    box-shadow: inset 0 0 0 1px rgba(8, 153, 129, 0.38);
+  }
+
+  100% {
+    box-shadow: inset 0 0 0 1px transparent;
+  }
+}
+
+@keyframes quote-flash-down {
+  0% {
+    box-shadow: inset 0 0 0 1px rgba(242, 54, 69, 0.38);
+  }
+
+  100% {
+    box-shadow: inset 0 0 0 1px transparent;
+  }
+}
+
+@keyframes quote-flash-buy {
+  0% {
+    box-shadow: inset 0 0 0 1px rgba(96, 165, 250, 0.42);
+  }
+
+  100% {
+    box-shadow: inset 0 0 0 1px transparent;
+  }
+}
+
+@keyframes quote-flash-sell {
+  0% {
+    box-shadow: inset 0 0 0 1px rgba(242, 54, 69, 0.42);
+  }
+
+  100% {
+    box-shadow: inset 0 0 0 1px transparent;
+  }
+}
+
+@keyframes quote-flash-tick {
+  0% {
+    box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.2);
+  }
+
+  100% {
+    box-shadow: inset 0 0 0 1px transparent;
+  }
+}

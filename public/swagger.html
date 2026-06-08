@@ -1,0 +1,812 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <title>fxtrusts – API Docs</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css" />
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: #1e293b;
+      font-family: sans-serif;
+    }
+
+    .topbar-banner {
+      background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 100%);
+      padding: 16px 32px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      border-bottom: 1px solid #334155;
+    }
+
+    .topbar-banner h1 {
+      margin: 0;
+      font-size: 20px;
+      font-weight: 700;
+      color: #f8fafc;
+      letter-spacing: 0.3px;
+    }
+
+    .topbar-banner .badge {
+      background: #22c55e;
+      color: #fff;
+      font-size: 11px;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 99px;
+      letter-spacing: 0.5px;
+    }
+
+    #swagger-ui {
+      background: #fff;
+    }
+
+    #swagger-ui .swagger-ui .info {
+      margin: 20px 0;
+    }
+  </style>
+</head>
+
+<body>
+
+  <div class="topbar-banner">
+    <img src="/assets/logo_white.png" alt="FxTrusts Logo" height="32" style="height: 32px; width: auto;" />
+    <h1>API Documentation</h1>
+    <span class="badge">v1.0</span>
+  </div>
+
+  <div id="swagger-ui"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-standalone-preset.js"></script>
+  <script>
+    window.addEventListener('load', function () {
+
+      var spec = {
+        openapi: "3.0.3",
+        info: {
+          title: "fxtrusts API",
+          version: "1.0.0",
+          description: "Complete REST API for the fxtrusts platform.\n\n**Authentication:** All `/api/private/*` routes accept either the `crm_session` cookie set by `POST /api/auth/login` or `Authorization: Bearer <CRM access token>`.\n\n**Terminal testing flow:** login to get the CRM access token, call `/api/private/accounts/{accountId}/terminal-session` to get the dotted terminal token, then use Postman WebSocket against `ws://127.0.0.1:8080/ws`. Swagger can test the HTTP token/state endpoints, but standard Swagger UI cannot send WebSocket frames."
+        },
+        servers: [
+          { url: window.location.origin, description: "Current environment" }
+        ],
+        tags: [
+          { name: "Authentication", description: "Login, logout, and current-user lookup" },
+          { name: "Dashboard", description: "Full dashboard snapshot (wallets, accounts, transactions)" },
+          { name: "Trading Accounts", description: "Create, list, archive, delete, and sync MT5/cTrader accounts" },
+          { name: "Wallet", description: "Deposit / withdraw / transfer funds" },
+          { name: "Profile", description: "User profile read and update" },
+          { name: "Social Trading", description: "Strategy discovery" },
+          { name: "Trading Data", description: "REST bridge for live MT5 terminal account, positions, orders, history, and symbols" },
+          { name: "WebTrader Terminal", description: "MT5 terminal session token, terminal state, and realtime WebSocket test flow" }
+        ],
+        components: {
+          securitySchemes: {
+            cookieAuth: {
+              type: "apiKey",
+              in: "cookie",
+              name: "crm_session",
+              description: "Session cookie set by POST /api/auth/login"
+            },
+            bearerAuth: {
+              type: "http",
+              scheme: "bearer",
+              bearerFormat: "CRM access token",
+              description: "Paste the accessToken returned by POST /api/auth/login. Do not paste the terminal WebSocket token here."
+            }
+          },
+          schemas: {
+            User: {
+              type: "object",
+              properties: {
+                id: { type: "string", example: "usr_a1b2c3" },
+                email: { type: "string", example: "trader@example.com" },
+                name: { type: "string", example: "John Doe" },
+                role: { type: "string", enum: ["user", "admin"] }
+              }
+            },
+            TradingAccount: {
+              type: "object",
+              properties: {
+                id: { type: "string", example: "acc-uuid-1234" },
+                accountNumber: { type: "string", example: "900847" },
+                name: { type: "string", example: "MetaTrader 5 Demo" },
+                platform: { type: "string", enum: ["mt5", "ctrader"] },
+                type: { type: "string", enum: ["Live", "Demo"] },
+                leverage: { type: "integer", example: 100 },
+                serverIp: { type: "string", example: "86.104.251.172" },
+                currency: { type: "string", enum: ["USD", "EUR"] },
+                balance: { type: "number", example: 700 },
+                equity: { type: "number", example: 700 },
+                freeMargin: { type: "number", example: 700 },
+                margin: { type: "number", example: 0 },
+                status: { type: "string", enum: ["Active", "Archived"] }
+              }
+            },
+            Transaction: {
+              type: "object",
+              properties: {
+                id: { type: "string", example: "txn-532ab2ee" },
+                type: { type: "string", enum: ["Deposit", "Withdrawal", "Transfer to MT5", "Transfer from MT5", "Transfer to cTrader", "Transfer from cTrader", "Transfer to cTrader Demo", "Transfer from cTrader Demo", "Admin Adjustment"] },
+                amount: { type: "number", example: 500 },
+                currency: { type: "string", enum: ["USD", "EUR"] },
+                method: { type: "string", enum: ["card", "crypto"] },
+                status: { type: "string", enum: ["Completed", "Rejected", "Pending", "Processing"] },
+                createdAt: { type: "string", example: "3/6/26, 10:57 AM" }
+              }
+            },
+            Snapshot: {
+              type: "object",
+              properties: {
+                wallets: { type: "object", properties: { USD: { type: "number" }, EUR: { type: "number" } } },
+                tradingAccounts: { type: "array", items: { "$ref": "#/components/schemas/TradingAccount" } },
+                transactions: { type: "array", items: { "$ref": "#/components/schemas/Transaction" } },
+                positions: { type: "array", items: { type: "object" } },
+                pnlSeries: { type: "array", items: { type: "object" } }
+              }
+            },
+            TerminalSession: {
+              type: "object",
+              properties: {
+                ok: { type: "boolean", example: true },
+                state: { type: "string", enum: ["ready", "locked"], example: "ready" },
+                requiresPassword: { type: "boolean", example: false },
+                accountId: { type: "string", example: "mt5-303108" },
+                login: { type: "integer", example: 303108 },
+                server: { type: "string", example: "Demo" },
+                group: { type: "string", example: "demo\\standard" },
+                terminalSessionId: { type: "string", example: "9d3e1f..." },
+                token: {
+                  type: "string",
+                  description: "Dotted terminal token for the Rust WebSocket. This is NOT the CRM login token.",
+                  example: "eyJhbGciOiJIUzI1NiJ9.eyJsb2dpbiI6MzAzMTA4fQ.signature"
+                },
+                code: { type: "string", example: "PASSWORD_REQUIRED" },
+                error: { type: "string", example: "Trading password is required." }
+              }
+            },
+            TerminalState: {
+              type: "object",
+              properties: {
+                selectedSymbol: { type: "string", example: "XAUUSD" },
+                timeframeMinutes: { type: "integer", example: 1 },
+                watchlistSymbols: { type: "array", items: { type: "string" }, example: ["XAUUSD", "EURUSD", "BTCUSD"] },
+                openTabs: { type: "array", items: { type: "string" }, example: ["XAUUSD"] },
+                layout: { type: "object" },
+                drawings: { type: "array", items: { type: "object" } },
+                indicators: { type: "array", items: { type: "object" } }
+              }
+            },
+            TerminalWebSocketFrame: {
+              type: "object",
+              required: ["action", "requestId"],
+              properties: {
+                action: {
+                  type: "string",
+                  enum: [
+                    "auth_with_token",
+                    "get_accounts",
+                    "get_symbols",
+                    "request_bootstrap_state",
+                    "request_account_info",
+                    "request_positions",
+                    "request_orders",
+                    "request_history",
+                    "request_ohlc_history",
+                    "subscribe_symbols",
+                    "unsubscribe_symbols",
+                    "subscribe_ohlc",
+                    "unsubscribe_ohlc",
+                    "place_order",
+                    "modify_order",
+                    "cancel_order",
+                    "close_position",
+                    "ping"
+                  ],
+                  example: "auth_with_token"
+                },
+                requestId: { type: "string", example: "auth-1" },
+                data: {
+                  type: "object",
+                  example: {
+                    token: "eyJhbGciOiJIUzI1NiJ9.eyJsb2dpbiI6MzAzMTA4fQ.signature"
+                  }
+                }
+              }
+            },
+            TerminalTradeRequest: {
+              type: "object",
+              required: ["symbol", "type", "volume"],
+              properties: {
+                symbol: { type: "string", example: "XAUUSD" },
+                type: { type: "string", enum: ["buy", "sell", "buy_limit", "sell_limit", "buy_stop", "sell_stop"], example: "buy" },
+                volume: { type: "number", example: 0.01 },
+                price: { type: "number", example: 4694.19, description: "Market orders are server-priced; pending orders require price." },
+                sl: { type: "number", example: 4680 },
+                tp: { type: "number", example: 4720 },
+                deviation: { type: "integer", example: 20 }
+              }
+            }
+          }
+        },
+        security: [{ cookieAuth: [] }, { bearerAuth: [] }],
+        paths: {
+
+          "/api/auth/login": {
+            post: {
+              tags: ["Authentication"],
+              summary: "Login",
+              description: "Authenticate with email and password. Sets a session cookie on success.",
+              security: [],
+              requestBody: {
+                required: true,
+                content: {
+                  "application/json": {
+                    schema: {
+                      type: "object",
+                      required: ["email", "password"],
+                      properties: {
+                        email: { type: "string", example: "trader@example.com" },
+                        password: { type: "string", example: "SecureP@ss1!" }
+                      }
+                    }
+                  }
+                }
+              },
+              responses: {
+                "200": {
+                  description: "Login successful - cookie set and CRM access token returned",
+                  content: {
+                    "application/json": {
+                      schema: {
+                        type: "object",
+                        properties: {
+                          ok: { type: "boolean", example: true },
+                          accessToken: { type: "string", example: "602d6cc13e22efb5d9792709a7a7d18eafc349002b92ea5fbeda0ada848861fc" },
+                          token: { type: "string", description: "Same CRM access token, kept for compatibility." },
+                          expiresAt: { type: "string", example: "2026-05-07T07:46:51Z" },
+                          refreshToken: { type: "string" },
+                          refreshExpiresAt: { type: "string", example: "2026-06-05T07:46:51Z" },
+                          user: { "$ref": "#/components/schemas/User" }
+                        }
+                      }
+                    }
+                  }
+                },
+                "400": { description: "Missing fields" },
+                "401": { description: "Invalid credentials" }
+              }
+            }
+          },
+
+          "/api/auth/logout": {
+            post: {
+              tags: ["Authentication"],
+              summary: "Logout",
+              description: "Clears the session cookie.",
+              responses: {
+                "200": { description: "Logged out successfully" }
+              }
+            }
+          },
+
+          "/api/auth/me": {
+            get: {
+              tags: ["Authentication"],
+              summary: "Get current user",
+              description: "Returns the user profile from the active session cookie.",
+              responses: {
+                "200": { description: "Current user", content: { "application/json": { schema: { type: "object", properties: { user: { "$ref": "#/components/schemas/User" } } } } } },
+                "401": { description: "Unauthorized" }
+              }
+            }
+          },
+
+          "/api/dashboard/snapshot": {
+            get: {
+              tags: ["Dashboard"],
+              summary: "Public dashboard snapshot",
+              security: [],
+              responses: {
+                "200": { description: "Dashboard data", content: { "application/json": { schema: { "$ref": "#/components/schemas/Snapshot" } } } }
+              }
+            }
+          },
+
+          "/api/private/dashboard/snapshot": {
+            get: {
+              tags: ["Dashboard"],
+              summary: "Private dashboard snapshot",
+              description: "Full snapshot for the authenticated user: wallets, accounts, transactions, positions.",
+              responses: {
+                "200": { description: "Full snapshot", content: { "application/json": { schema: { "$ref": "#/components/schemas/Snapshot" } } } },
+                "401": { description: "Unauthorized" }
+              }
+            }
+          },
+
+          "/api/private/accounts": {
+            get: {
+              tags: ["Trading Accounts"],
+              summary: "List trading accounts",
+              responses: {
+                "200": { description: "Account list", content: { "application/json": { schema: { type: "object", properties: { accounts: { type: "array", items: { "$ref": "#/components/schemas/TradingAccount" } } } } } } },
+                "401": { description: "Unauthorized" }
+              }
+            },
+            post: {
+              tags: ["Trading Accounts"],
+              summary: "Create trading account",
+              description: "Creates a new MT5 or cTrader account. MT5 accounts are provisioned via the platform MT5 Manager API.",
+              requestBody: {
+                required: true,
+                content: {
+                  "application/json": {
+                    schema: {
+                      type: "object",
+                      properties: {
+                        platform: { type: "string", enum: ["mt5", "ctrader"], default: "mt5" },
+                        mode: { type: "string", enum: ["demo", "live"], default: "demo" },
+                        currency: { type: "string", enum: ["USD", "EUR"], default: "USD" },
+                        initialBalance: { type: "number", example: 500 },
+                        leverage: { type: "integer", example: 100, description: "1 to 1000" },
+                        group: { type: "string", example: "demo-std-usd", description: "Account type alias or exact MT5 group name" }
+                      }
+                    }
+                  }
+                }
+              },
+              responses: {
+                "201": { description: "Account created", content: { "application/json": { schema: { type: "object", properties: { ok: { type: "boolean" }, account: { "$ref": "#/components/schemas/TradingAccount" }, snapshot: { "$ref": "#/components/schemas/Snapshot" } } } } } },
+                "400": { description: "Validation error" },
+                "401": { description: "Unauthorized" },
+                "502": { description: "MT5 provisioning failed" }
+              }
+            }
+          },
+
+          "/api/private/accounts/sync-all-balances": {
+            post: {
+              tags: ["Trading Accounts"],
+              summary: "Sync all balances from MT5",
+              description: "Triggers a live balance sync for all MT5 accounts. Requires the CRM server IP to be whitelisted by the broker.",
+              responses: {
+                "200": { description: "Sync complete", content: { "application/json": { schema: { type: "object", properties: { ok: { type: "boolean" }, data: { type: "object", properties: { updated: { type: "integer", example: 3 } } } } } } } },
+                "401": { description: "Unauthorized" },
+                "502": { description: "MT5 unreachable / IP not whitelisted" }
+              }
+            }
+          },
+
+          "/api/private/accounts/{accountId}": {
+            delete: {
+              tags: ["Trading Accounts"],
+              summary: "Delete account",
+              description: "Permanently removes an account. Must be Archived first.",
+              parameters: [{ name: "accountId", in: "path", required: true, schema: { type: "string" }, example: "acc-uuid-1234" }],
+              responses: {
+                "200": { description: "Deleted" },
+                "400": { description: "Account not archived" },
+                "401": { description: "Unauthorized" }
+              }
+            }
+          },
+
+          "/api/private/accounts/{accountId}/status": {
+            patch: {
+              tags: ["Trading Accounts"],
+              summary: "Archive or restore account",
+              description: "Toggles account between Active and Archived. MT5 accounts are deactivated/activated on the broker server simultaneously.",
+              parameters: [{ name: "accountId", in: "path", required: true, schema: { type: "string" } }],
+              requestBody: {
+                required: true,
+                content: { "application/json": { schema: { type: "object", required: ["status"], properties: { status: { type: "string", enum: ["Active", "Archived"] } } } } }
+              },
+              responses: {
+                "200": { description: "Status updated" },
+                "401": { description: "Unauthorized" }
+              }
+            }
+          },
+
+          "/api/private/accounts/{accountId}/sync-balance": {
+            post: {
+              tags: ["Trading Accounts"],
+              summary: "Sync single account balance",
+              description: "Fetches live balance, equity, and free margin for one account from the MT5 server.",
+              parameters: [{ name: "accountId", in: "path", required: true, schema: { type: "string" } }],
+              responses: {
+                "200": { description: "Balance synced", content: { "application/json": { schema: { type: "object", properties: { ok: { type: "boolean" }, data: { type: "object", properties: { balance: { type: "number" }, equity: { type: "number" }, freeMargin: { type: "number" }, syncedAt: { type: "string" } } } } } } } },
+                "401": { description: "Unauthorized" },
+                "502": { description: "MT5 server unreachable" }
+              }
+            }
+          },
+
+          "/api/private/accounts/{accountId}/credentials/verify": {
+            post: {
+              tags: ["Trading Accounts"],
+              summary: "Verify MT5 credentials",
+              description: "Verifies a trading or investor password against the live MT5 server. Returns live balance data on success.",
+              parameters: [{ name: "accountId", in: "path", required: true, schema: { type: "string" } }],
+              requestBody: {
+                required: true,
+                content: { "application/json": { schema: { type: "object", required: ["passwordType"], properties: { passwordType: { type: "string", enum: ["trading", "investor"] }, password: { type: "string", description: "Leave blank to use stored password" } } } } }
+              },
+              responses: {
+                "200": { description: "Verified", content: { "application/json": { schema: { type: "object", properties: { ok: { type: "boolean" }, account: { "$ref": "#/components/schemas/TradingAccount" }, serverHost: { type: "string" }, serverPort: { type: "integer" } } } } } },
+                "401": { description: "Unauthorized" }
+              }
+            }
+          },
+
+          "/api/private/accounts/{accountId}/password": {
+            patch: {
+              tags: ["Trading Accounts"],
+              summary: "Change MT5 account password",
+              description: "Changes trading or investor password on the live MT5 server. Must be 8+ chars with uppercase, number, and special char.",
+              parameters: [{ name: "accountId", in: "path", required: true, schema: { type: "string" } }],
+              requestBody: {
+                required: true,
+                content: { "application/json": { schema: { type: "object", required: ["passwordType", "newPassword"], properties: { passwordType: { type: "string", enum: ["trading", "investor"] }, newPassword: { type: "string", example: "NewP@ss1!" } } } } }
+              },
+              responses: {
+                "200": { description: "Password changed" },
+                "400": { description: "Weak password" },
+                "401": { description: "Unauthorized" }
+              }
+            }
+          },
+
+          "/api/private/accounts/{accountId}/terminal-session": {
+            get: {
+              tags: ["WebTrader Terminal"],
+              summary: "Get terminal WebSocket token",
+              description: "Step 2 for the terminal page. Use the CRM login token/cookie here. The response `token` is the dotted terminal token that must be sent as the first WebSocket frame to `ws://127.0.0.1:8080/ws`.",
+              parameters: [
+                { name: "accountId", in: "path", required: true, schema: { type: "string" }, example: "mt5-303108", description: "Trading account id or `mt5-{login}`." }
+              ],
+              responses: {
+                "200": { description: "Terminal token ready or account locked", content: { "application/json": { schema: { "$ref": "#/components/schemas/TerminalSession" } } } },
+                "400": { description: "Unsupported platform / archived account / missing account id" },
+                "401": { description: "Unauthorized CRM token or cookie" },
+                "404": { description: "Account not found" },
+                "422": { description: "Invalid MT5 login on account" },
+                "500": { description: "Terminal token secret/config error" }
+              }
+            },
+            post: {
+              tags: ["WebTrader Terminal"],
+              summary: "Unlock terminal session with MT5 password",
+              description: "Use this when GET returns `state: locked` or `code: PASSWORD_REQUIRED`. On success it stores verified MT5 metadata/password for this user and returns the terminal WebSocket token.",
+              parameters: [
+                { name: "accountId", in: "path", required: true, schema: { type: "string" }, example: "mt5-303108" }
+              ],
+              requestBody: {
+                required: false,
+                content: {
+                  "application/json": {
+                    schema: {
+                      type: "object",
+                      properties: {
+                        tradingPassword: { type: "string", example: "YourMT5P@ss1" },
+                        password: { type: "string", description: "Alias for tradingPassword." }
+                      }
+                    }
+                  }
+                }
+              },
+              responses: {
+                "200": { description: "Terminal token ready", content: { "application/json": { schema: { "$ref": "#/components/schemas/TerminalSession" } } } },
+                "400": { description: "Password required or invalid body" },
+                "401": { description: "Unauthorized CRM token/cookie or invalid MT5 password" },
+                "404": { description: "Account not found" },
+                "502": { description: "MT5 password verification backend failed" }
+              }
+            }
+          },
+
+          "/api/private/accounts/{accountId}/terminal-state": {
+            get: {
+              tags: ["WebTrader Terminal"],
+              summary: "Get saved terminal layout/state",
+              description: "Loads the saved terminal state for the account: selected symbol, timeframe, tabs, watchlist, layouts, indicators, and drawings.",
+              parameters: [
+                { name: "accountId", in: "path", required: true, schema: { type: "string" }, example: "mt5-303108" }
+              ],
+              responses: {
+                "200": { description: "Saved terminal state", content: { "application/json": { schema: { type: "object", properties: { ok: { type: "boolean" }, data: { "$ref": "#/components/schemas/TerminalState" } } } } } },
+                "401": { description: "Unauthorized" },
+                "404": { description: "MT5 login not found" },
+                "502": { description: "Terminal state backend failed" }
+              }
+            },
+            put: {
+              tags: ["WebTrader Terminal"],
+              summary: "Save terminal layout/state",
+              description: "Persists the terminal UI state for the account. This is what the chart page uses when you change symbol/timeframe/layout.",
+              parameters: [
+                { name: "accountId", in: "path", required: true, schema: { type: "string" }, example: "mt5-303108" }
+              ],
+              requestBody: {
+                required: true,
+                content: {
+                  "application/json": {
+                    schema: { "$ref": "#/components/schemas/TerminalState" },
+                    example: {
+                      selectedSymbol: "XAUUSD",
+                      timeframeMinutes: 1,
+                      watchlistSymbols: ["XAUUSD", "EURUSD", "BTCUSD"],
+                      openTabs: ["XAUUSD"]
+                    }
+                  }
+                }
+              },
+              responses: {
+                "200": { description: "Terminal state saved", content: { "application/json": { schema: { type: "object", properties: { ok: { type: "boolean" }, data: { "$ref": "#/components/schemas/TerminalState" } } } } } },
+                "400": { description: "Invalid JSON body" },
+                "401": { description: "Unauthorized" },
+                "404": { description: "MT5 login not found" },
+                "502": { description: "Terminal state backend failed" }
+              }
+            }
+          },
+
+          "/ws": {
+            get: {
+              tags: ["WebTrader Terminal"],
+              summary: "Rust realtime WebSocket endpoint",
+              description: "Documentation-only entry for the terminal realtime stream. Swagger UI cannot send WebSocket frames. Test this in Postman WebSocket: connect to `ws://127.0.0.1:8080/ws`, send `auth_with_token` first with the terminal token from `/terminal-session`, then send actions such as `get_symbols`, `request_account_info`, `request_positions`, `request_orders`, `request_ohlc_history`, `subscribe_symbols`, `place_order`, `modify_order`, `cancel_order`, and `close_position`.",
+              servers: [
+                { url: "http://127.0.0.1:8080", description: "Rust realtime gateway documentation base" }
+              ],
+              requestBody: {
+                required: false,
+                content: {
+                  "application/json": {
+                    schema: { "$ref": "#/components/schemas/TerminalWebSocketFrame" },
+                    examples: {
+                      auth: {
+                        summary: "First frame - authenticate",
+                        value: {
+                          action: "auth_with_token",
+                          requestId: "auth-1",
+                          data: { token: "<terminal token from terminal-session>" }
+                        }
+                      },
+                      ohlc: {
+                        summary: "Request chart candles",
+                        value: {
+                          action: "request_ohlc_history",
+                          requestId: "ohlc-1",
+                          data: { symbol: "XAUUSD", timeframeMinutes: 1, limit: 50 }
+                        }
+                      },
+                      placeOrder: {
+                        summary: "Place market order",
+                        value: {
+                          action: "place_order",
+                          requestId: "trade-1",
+                          data: { symbol: "XAUUSD", type: "buy", volume: 0.01, deviation: 20 }
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              responses: {
+                "101": { description: "Switching protocols when used as a real WebSocket connection" },
+                "200": { description: "Use Postman WebSocket or the terminal UI for realtime frames." }
+              }
+            }
+          },
+
+          "/api/private/wallet/funds": {
+            post: {
+              tags: ["Wallet"],
+              summary: "Deposit or withdraw (wallet)",
+              description: "Adds or removes funds from the CRM wallet. Does NOT touch MT5 directly — use /wallet/transfer for MT5 transfers.",
+              requestBody: {
+                required: true,
+                content: { "application/json": { schema: { type: "object", required: ["type", "amount", "currency", "method"], properties: { type: { type: "string", enum: ["deposit", "withdraw"] }, amount: { type: "number", example: 100 }, currency: { type: "string", enum: ["USD", "EUR"] }, method: { type: "string", enum: ["card", "crypto"] } } } } }
+              },
+              responses: {
+                "200": { description: "Wallet updated", content: { "application/json": { schema: { type: "object", properties: { ok: { type: "boolean" }, message: { type: "string" }, snapshot: { "$ref": "#/components/schemas/Snapshot" } } } } } },
+                "400": { description: "Insufficient balance or invalid amount" },
+                "401": { description: "Unauthorized" }
+              }
+            }
+          },
+
+          "/api/private/wallet/transfer": {
+            post: {
+              tags: ["Wallet"],
+              summary: "Transfer wallet ↔ MT5",
+              description: "Moves funds between the CRM wallet and an MT5 trading account. Wallet→MT5 credits the MT5 account via the MT5 Manager API and records the transaction as **Transfer to MT5**.",
+              requestBody: {
+                required: true,
+                content: { "application/json": { schema: { type: "object", required: ["amount", "from", "to", "accountId"], properties: { amount: { type: "number", example: 200 }, from: { type: "string", enum: ["wallet", "mt5"] }, to: { type: "string", enum: ["wallet", "mt5"] }, accountId: { type: "string", example: "acc-uuid-1234" } } } } }
+              },
+              responses: {
+                "200": { description: "Transfer complete", content: { "application/json": { schema: { type: "object", properties: { ok: { type: "boolean" }, message: { type: "string" }, snapshot: { "$ref": "#/components/schemas/Snapshot" } } } } } },
+                "400": { description: "Insufficient balance / invalid account / demo restriction" },
+                "401": { description: "Unauthorized" },
+                "502": { description: "MT5 server error" }
+              }
+            }
+          },
+
+          "/api/private/profile": {
+            get: {
+              tags: ["Profile"],
+              summary: "Get profile",
+              responses: {
+                "200": { description: "Profile data", content: { "application/json": { schema: { type: "object", properties: { user: { "$ref": "#/components/schemas/User" } } } } } },
+                "401": { description: "Unauthorized" }
+              }
+            },
+            patch: {
+              tags: ["Profile"],
+              summary: "Update profile",
+              requestBody: { required: true, content: { "application/json": { schema: { type: "object", properties: { name: { type: "string" }, email: { type: "string" } } } } } },
+              responses: {
+                "200": { description: "Profile updated" },
+                "401": { description: "Unauthorized" }
+              }
+            }
+          },
+
+          "/api/private/social/strategies": {
+            get: {
+              tags: ["Social Trading"],
+              summary: "List strategies",
+              description: "Returns available social trading strategies and signal providers.",
+              responses: {
+                "200": { description: "Strategy list", content: { "application/json": { schema: { type: "object", properties: { strategies: { type: "array", items: { type: "object", properties: { id: { type: "string" }, name: { type: "string" }, description: { type: "string" }, performance: { type: "number" } } } } } } } } },
+                "401": { description: "Unauthorized" }
+              }
+            }
+          },
+
+          "/api/trading/auth": {
+            post: {
+              tags: ["Trading Data"],
+              summary: "Authenticate trading session",
+              description: "Starts a cTrader OAuth session for live market data access.",
+              security: [],
+              requestBody: { required: true, content: { "application/json": { schema: { type: "object", properties: { code: { type: "string", description: "OAuth authorization code" } } } } } },
+              responses: {
+                "200": { description: "Session started" },
+                "400": { description: "Invalid code" }
+              }
+            }
+          },
+
+          "/api/trading/positions": {
+            get: {
+              tags: ["Trading Data"],
+              summary: "Open positions",
+              description: "REST bridge to the MT5 terminal WebSocket `request_positions` action. Requires `accountId`, for example `mt5-303108`.",
+              parameters: [
+                { name: "accountId", in: "query", required: true, schema: { type: "string" }, example: "mt5-303108", description: "Trading account id or `mt5-{login}`." }
+              ],
+              responses: {
+                "200": { description: "Live positions list", content: { "application/json": { schema: { type: "object", properties: { success: { type: "boolean" }, accountId: { type: "string" }, positions: { type: "array", items: { type: "object", properties: { ticket: { type: "integer", example: 16370193 }, symbol: { type: "string", example: "BTCUSD" }, type: { type: "string", enum: ["buy", "sell"] }, volume: { type: "number" }, openPrice: { type: "number" }, priceCurrent: { type: "number" }, pnl: { type: "number" } } } } } } } } },
+                "400": { description: "Missing accountId" },
+                "401": { description: "Unauthorized" },
+                "423": { description: "Terminal session locked; unlock with terminal-session POST" },
+                "502": { description: "Terminal WebSocket or session failed" },
+                "504": { description: "Terminal WebSocket action timed out" }
+              }
+            }
+          },
+
+          "/api/trading/orders": {
+            get: {
+              tags: ["Trading Data"],
+              summary: "Pending orders",
+              description: "REST bridge to the MT5 terminal WebSocket `request_orders` action.",
+              parameters: [
+                { name: "accountId", in: "query", required: true, schema: { type: "string" }, example: "mt5-303108" }
+              ],
+              responses: {
+                "200": { description: "Orders list", content: { "application/json": { schema: { type: "object", properties: { success: { type: "boolean" }, accountId: { type: "string" }, orders: { type: "array", items: { type: "object" } } } } } } },
+                "400": { description: "Missing accountId" },
+                "401": { description: "Unauthorized" },
+                "502": { description: "Terminal WebSocket or session failed" },
+                "504": { description: "Terminal WebSocket action timed out" }
+              }
+            }
+          },
+
+          "/api/trading/history": {
+            get: {
+              tags: ["Trading Data"],
+              summary: "Trade history",
+              description: "REST bridge to the MT5 terminal WebSocket `request_history` action. Filter by date range.",
+              parameters: [
+                { name: "accountId", in: "query", required: true, schema: { type: "string" }, example: "mt5-303108" },
+                { name: "from", in: "query", schema: { type: "string", example: "2026-01-01" }, description: "Start date (YYYY-MM-DD)" },
+                { name: "to", in: "query", schema: { type: "string", example: "2026-03-06" }, description: "End date (YYYY-MM-DD)" }
+              ],
+              responses: {
+                "200": { description: "Trade history" },
+                "400": { description: "Missing accountId or invalid date range" },
+                "401": { description: "Unauthorized" },
+                "502": { description: "Terminal WebSocket or session failed" },
+                "504": { description: "Terminal WebSocket action timed out" }
+              }
+            }
+          },
+
+          "/api/trading/symbols": {
+            get: {
+              tags: ["Trading Data"],
+              summary: "Market symbols",
+              description: "REST bridge to the MT5 terminal WebSocket `get_symbols` action. If the C++ realtime upstream does not acknowledge the broker symbol catalog request, this endpoint returns `200` with `degraded: true` and the terminal saved/default symbols so Swagger remains testable. Live positions/account/history can still work while the broker catalog is degraded.",
+              parameters: [
+                { name: "accountId", in: "query", required: true, schema: { type: "string" }, example: "mt5-303108" },
+                { name: "category", in: "query", required: false, schema: { type: "string" }, example: "forex" }
+              ],
+              responses: {
+                "200": { description: "Symbols or degraded fallback symbols", content: { "application/json": { schema: { type: "object", properties: { success: { type: "boolean" }, accountId: { type: "string" }, degraded: { type: "boolean", example: true }, warning: { type: "string", example: "get_symbols timed out; returned terminal saved/default symbols instead." }, symbols: { type: "array", items: { type: "object", properties: { name: { type: "string", example: "EURUSD" }, symbol: { type: "string", example: "EURUSD" }, category: { type: "string", example: "forex" }, bid: { type: "number", example: 1.0841 }, ask: { type: "number", example: 1.0843 }, digits: { type: "integer", example: 5 } } } } } } } } },
+                "400": { description: "Missing accountId or invalid category" },
+                "401": { description: "Unauthorized" },
+                "502": { description: "Terminal WebSocket or session failed" },
+                "504": { description: "Terminal session failed before fallback could run" }
+              }
+            }
+          },
+
+          "/api/trading/account": {
+            get: {
+              tags: ["Trading Data"],
+              summary: "Trading account info",
+              description: "REST bridge to the MT5 terminal WebSocket `request_account_info` action.",
+              parameters: [
+                { name: "accountId", in: "query", required: true, schema: { type: "string" }, example: "mt5-303108" }
+              ],
+              responses: {
+                "200": { description: "Account info" },
+                "400": { description: "Missing accountId" },
+                "401": { description: "Unauthorized" },
+                "502": { description: "Terminal WebSocket or session failed" },
+                "504": { description: "Terminal WebSocket action timed out" }
+              }
+            }
+          }
+
+        }
+      };
+
+      SwaggerUIBundle({
+        spec: spec,
+        dom_id: '#swagger-ui',
+        deepLinking: true,
+        presets: [
+          SwaggerUIBundle.presets.apis,
+          SwaggerUIStandalonePreset
+        ],
+        plugins: [
+          SwaggerUIBundle.plugins.DownloadUrl
+        ],
+        layout: "StandaloneLayout",
+        persistAuthorization: true,
+        displayRequestDuration: true,
+        filter: true,
+        withCredentials: true
+      });
+    });
+  </script>
+</body>
+
+</html>

@@ -1,0 +1,43 @@
+# ── Node / Next.js ────────────────────────────────────────────────────────────
+/node_modules/
+/.next/
+/out/
+/build/
+/.data/
+
+# ── Environment & secrets (NEVER commit) ──────────────────────────────────────
+.env*
+
+# ── TypeScript build cache ────────────────────────────────────────────────────
+*.tsbuildinfo
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+/logs/
+*.log
+
+# ── OS files ──────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.pem
+
+# ── IDE files ─────────────────────────────────────────────────────────────────
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# ── Test / temp artifacts ─────────────────────────────────────────────────────
+/tmp-headless-profile/
+/tmp-headless-profile-2/
+test-artifacts-*
+
+# ── Codex logs (CI/subagent artefacts, not source) ───────────────────────────
+/.codex-logs/

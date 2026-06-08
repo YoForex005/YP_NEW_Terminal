@@ -1,0 +1,189 @@
+{
+  "version": 1,
+  "users": [
+    {
+      "createdAt": "2026-01-01T00:00:00.000Z",
+      "email": "user@example.test",
+      "id": "user-1",
+      "name": "canonical:outgoing",
+      "passwordHash": "hash",
+      "phone": "",
+      "role": "user"
+    },
+    {
+      "country": "",
+      "createdAt": "2026-05-18T12:49:11.594Z",
+      "email": "admin@dominionmarkets.local",
+      "id": "352de138-701c-4cd4-9565-b6ef5f7d252e",
+      "name": "admin",
+      "passwordHash": "dd1f83d9b2351168a756ed37849cdee4:0da67ec461ca06fa24edeb9c7431ec2e140b3f54292f1e03f78a851aa6755c36bad03613fd0f787f42e844e7b2caa7c057ba5baef71bb91aa6965f8b1b69fe8a",
+      "phone": "",
+      "role": "user"
+    },
+    {
+      "country": "",
+      "createdAt": "2026-05-18T12:51:34.103Z",
+      "email": "fxtrusts.demo+20260421140451@gmail.com",
+      "id": "cc4a075e-d6fc-42b8-b9c5-9732b8659ddf",
+      "name": "fxtrusts demo 20260421140451",
+      "passwordHash": "",
+      "phone": "",
+      "role": "user"
+    },
+    {
+      "country": "India",
+      "createdAt": "2026-05-19T10:41:07.856Z",
+      "email": "broker@gmail.com",
+      "id": "7b3181d4-1663-440f-939b-a999b6e8c0fd",
+      "name": "Raj Halder",
+      "passwordHash": "5fc8fde70fee700bc3f78b374e491ba5:1259bc6871c77879c2ba7653daf8a1d38aa7004eccda27628cb355dc9e1b6b2275b75769ea42327557a7f66ca27cf025caeee9934fd82fa5dc6a0026ce66bbbc",
+      "phone": "+91 9563991540",
+      "role": "user"
+    }
+  ],
+  "sessions": [
+    {
+      "createdAt": "2026-05-19T13:47:54.588Z",
+      "expiresAt": "2026-05-20T13:47:54.588Z",
+      "token": "77fcc9d321fb42c3b36caf75c7ee81cd88bbaab8cd5870437ebb62e09f1dfe0f",
+      "userId": "7b3181d4-1663-440f-939b-a999b6e8c0fd"
+    }
+  ],
+  "snapshotsByUserId": {
+    "352de138-701c-4cd4-9565-b6ef5f7d252e": {
+      "marketInstruments": [],
+      "pnlSeries": [],
+      "positions": [],
+      "tradingAccounts": [],
+      "tradingSessions": [],
+      "transactions": [],
+      "wallets": {
+        "EUR": 0,
+        "USD": 0
+      }
+    },
+    "7b3181d4-1663-440f-939b-a999b6e8c0fd": {
+      "accountPnlSeries": {},
+      "marketInstruments": [],
+      "pnlSeries": [],
+      "positions": [],
+      "tradingAccounts": [
+        {
+          "accountNumber": "303129",
+          "balance": 25000,
+          "brokerId": null,
+          "credentials": {
+            "generatedAt": "2026-05-19T10:44:12.011Z",
+            "investorPassword": "FxT!492d776a9d77aA",
+            "login": "303129",
+            "server": "57.128.141.65",
+            "source": "broker",
+            "tradingPassword": "YoForex@101"
+          },
+          "currency": "USD",
+          "equity": 25000,
+          "freeMargin": 25000,
+          "id": "mt5-303129",
+          "leverage": 2000,
+          "margin": 0,
+          "name": "Standard",
+          "ownerId": "7b3181d4-1663-440f-939b-a999b6e8c0fd",
+          "platform": "mt5",
+          "serverIp": "57.128.141.65",
+          "stats": {
+            "averageLoss": 0,
+            "averageWin": 0,
+            "consecutiveLosses": 0,
+            "consecutiveWins": 0,
+            "largestLoss": 0,
+            "largestWin": 0,
+            "losingTrades": 0,
+            "profitFactor": 0,
+            "totalTrades": 0,
+            "totalVolume": 0,
+            "winRate": 0,
+            "winningTrades": 0
+          },
+          "status": "Active",
+          "transactions": [],
+          "type": "Live"
+        }
+      ],
+      "tradingSessions": [],
+      "transactions": [],
+      "wallets": {
+        "EUR": 0,
+        "USD": 0
+      }
+    },
+    "cc4a075e-d6fc-42b8-b9c5-9732b8659ddf": {
+      "marketInstruments": [],
+      "pnlSeries": [],
+      "positions": [],
+      "tradingAccounts": [
+        {
+          "accountNumber": "303108",
+          "balance": 14981.98,
+          "brokerId": null,
+          "credentials": {
+            "login": "303108",
+            "server": "127.0.0.1:62487",
+            "source": "broker"
+          },
+          "currency": "USD",
+          "equity": 14936.12,
+          "freeMargin": 14778.51,
+          "id": "mt5-303108",
+          "leverage": 2000,
+          "margin": 0,
+          "name": "Raj ji",
+          "ownerId": "cc4a075e-d6fc-42b8-b9c5-9732b8659ddf",
+          "platform": "mt5",
+          "serverIp": "127.0.0.1",
+          "stats": {
+            "averageLoss": 0,
+            "averageWin": 0,
+            "consecutiveLosses": 0,
+            "consecutiveWins": 0,
+            "largestLoss": 0,
+            "largestWin": 0,
+            "losingTrades": 0,
+            "profitFactor": 0,
+            "totalTrades": 0,
+            "totalVolume": 0,
+            "winRate": 0,
+            "winningTrades": 0
+          },
+          "status": "Active",
+          "transactions": [],
+          "type": "Demo"
+        }
+      ],
+      "tradingSessions": [],
+      "transactions": [],
+      "wallets": {
+        "EUR": 0,
+        "USD": 0
+      }
+    },
+    "user-1": {
+      "marketInstruments": [],
+      "pnlSeries": [],
+      "positions": [],
+      "tradingAccounts": [],
+      "tradingSessions": [],
+      "transactions": [],
+      "wallets": {
+        "EUR": 0,
+        "USD": 0
+      }
+    }
+  },
+  "socialStrategies": [],
+  "notificationsByUserId": {
+    "352de138-701c-4cd4-9565-b6ef5f7d252e": [],
+    "7b3181d4-1663-440f-939b-a999b6e8c0fd": [],
+    "cc4a075e-d6fc-42b8-b9c5-9732b8659ddf": [],
+    "user-1": []
+  }
+}
