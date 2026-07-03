@@ -46,7 +46,7 @@ export const DEFAULT_REQUESTED_TERMINAL_WARM_SYMBOLS = [
 ] as const;
 
 const DEFAULT_TERMINAL_SYMBOL_METADATA: Record<
-  (typeof DEFAULT_FIRST_RUN_TERMINAL_SYMBOLS)[number],
+  string,
   {
     category: TerminalMarketCategory;
     calcMode: SymbolInfo['calcMode'];
@@ -93,16 +93,32 @@ const DEFAULT_TERMINAL_SYMBOL_METADATA: Record<
 };
 
 export const createDefaultTerminalSymbolInfo = (
-  symbol: (typeof DEFAULT_FIRST_RUN_TERMINAL_SYMBOLS)[number],
+  symbol: string,
 ): SymbolInfo => {
-  const metadata = DEFAULT_TERMINAL_SYMBOL_METADATA[symbol];
+  const normalizedSymbol = normalizeText(symbol).toUpperCase();
+  const fallbackCategory = getTerminalFallbackSymbolCategory(normalizedSymbol);
+  const metadata = DEFAULT_TERMINAL_SYMBOL_METADATA[normalizedSymbol] ?? {
+    category: fallbackCategory,
+    calcMode: fallbackCategory === 'forex'
+      ? 'forex'
+      : fallbackCategory === 'index'
+        ? 'cfdindex'
+        : 'cfdleverage',
+    contractSize: fallbackCategory === 'forex'
+      ? 100_000
+      : fallbackCategory === 'commodity'
+        ? 100
+        : 1,
+    description: normalizedSymbol,
+    digits: normalizedSymbol.includes('JPY') ? 3 : fallbackCategory === 'forex' ? 5 : 2,
+  };
   const point = 10 ** -metadata.digits;
 
   return {
-    name: symbol,
+    name: normalizedSymbol,
     description: metadata.description,
-    baseCurrency: symbol.slice(0, 3),
-    quoteCurrency: symbol.slice(3, 6),
+    baseCurrency: normalizedSymbol.slice(0, 3),
+    quoteCurrency: normalizedSymbol.slice(3, 6),
     digits: metadata.digits,
     point,
     tickSize: point,
@@ -684,7 +700,7 @@ export const getTerminalFallbackSeedSymbols = (
 
   return persistedSymbols.length > 0
     ? persistedSymbols
-    : [...DEFAULT_FIRST_RUN_TERMINAL_SYMBOLS];
+    : [...DEFAULT_REQUESTED_TERMINAL_WARM_SYMBOLS];
 };
 
 export const getTerminalFallbackSymbolInfos = (

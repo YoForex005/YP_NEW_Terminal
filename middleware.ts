@@ -8,6 +8,7 @@ const PUBLIC_BYPASS_PATHS = new Set([
   "/health",
   "/login",
   "/register",
+  "/terminal",
   "/webtrader/login",
 ]);
 
@@ -26,6 +27,10 @@ const isLoopbackHostname = (hostname: string): boolean =>
 const isDevAutoAuthEnabled = (request: NextRequest): boolean => {
   if (process.env.NODE_ENV === "production") {
     return false;
+  }
+
+  if (isLoopbackHostname(request.nextUrl.hostname)) {
+    return true;
   }
 
   const configured = process.env.DEV_AUTO_AUTH?.trim().toLowerCase();

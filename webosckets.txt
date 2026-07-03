@@ -1,0 +1,685 @@
+# MT5 Web Terminal Frontend Integration Guide
+ 
+## 1. Purpose
+ 
+This guide describes how any frontend integrates with the backend MT5 web-terminal. It is framework-agnostic: React, Vue, Angular, plain JavaScript, mobile WebView, native mobile shells, and other clients should follow the same REST and WebSocket contracts.
+ 
+This file does not include frontend source code. It also does not approve production real-trade rollout. Frontends must default to read-only plus explicitly approved dry-run behavior; `dry_run=false` remains production-gated and requires a separate operator decision.
+ 
+## 2. Current Backend Status
+ 
+| Capability | Status | Frontend Meaning |
+|---|---|---|
+| REST lifecycle | Verified | Session create, launch exchange, ticket refresh, revoke, and refresh-after-revoke behavior have backend proof. |
+| Feed WebSocket | Verified | Missing, fake, valid, consumed, and cross-ticket feed paths have backend proof. |
+| Trade WebSocket | Verified | Missing, fake, valid, consumed, and cross-ticket trade paths have backend proof. |
+| `account.summary` | Verified | Trade socket emits a canonical snapshot after connect and after resume/reconciliation. |
+| Outbox replay | Verified | Trade reliable frames can be replayed with `resume.last_seen_seq`. |
+| Protocol hardening | Verified | Malformed JSON, unknown message types, unknown ops, and ticket misuse return safe errors. |
+| Live WS functional pass | Verified | Feed and trade functional passes exist for the tested backend/environment. |
+| Legacy collection retry | Verified | Legacy collection subscribe/ping examples were corrected and retried. |
+| Singular session alias | Supported | `POST /api/terminal/session` is an alias for canonical `POST /api/terminal/sessions`. |
+| Mutation examples | Dry-run-safe | Collection examples include `payload.dry_run=true`. |
+| Production real trading | Gated | `dry_run=false` is not approved by this guide. |
+ 
+## 3. Integration Architecture
+ 
+The frontend talks to the backend only. The backend owns MT5 credentials, terminal sessions, launch-code hashing, terminal tokens, one-time WebSocket tickets, MT5 state reads, trade command routing, and outbox persistence.
+ 
+The frontend should not store, log, print, or commit user JWTs, launch codes, terminal tokens, feed tickets, trade tickets, MT5 passwords, investor passwords, or account credentials.
+ 
+```text
+User JWT
+  -> POST /api/terminal/sessions
+  -> launch_url containing a short-lived launch code
+ 
+Launch code + Origin
+  -> POST /api/terminal/sessions/exchange
+  -> terminal_token + feed_ticket + trade_ticket
+ 
+feed_ticket
+  -> GET /ws/terminal/feed?ticket=<feed_ticket>
+  -> quotes, quote_gap, chart.history, heartbeat
+ 
+trade_ticket
+  -> GET /ws/terminal/trade?ticket=<trade_ticket>
+  -> connected, account.summary, result/error, outbox replay
+ 
+terminal_token
+  -> POST /api/terminal/sessions/refresh-ws-tickets
+  -> fresh one-time feed/trade tickets
+ 
+terminal_token
+  -> POST /api/terminal/sessions/revoke
+  -> revoked terminal session
+```
+ 
+## 4. REST Endpoint Reference
+ 
+| Method | Path | Auth | Request Body | Success Response | Common Errors | Frontend Purpose | DB/Session Mutation |
+|---|---|---|---|---|---|---|---|
+| POST | `/api/terminal/sessions` | Normal app user JWT through `AuthFilter`; backend reads `X-User-Id` after auth. | `{ "login": <mt5_login> }` | `{ "success": true, "launch_url": ".../#launch=<launch_code>", "expires_in": <seconds>, "session_expires_in": <seconds> }` | `UNAUTHORIZED`, `LOGIN_REQUIRED`, `ACCOUNT_NOT_FOUND`, `ACCOUNT_STATE_INVALID`, `CHALLENGE_NOT_FOUND`, `CHALLENGE_STATE_INVALID`, `TERMINAL_STORAGE_UNAVAILABLE`, `SESSION_CREATE_FAILED`, `INVALID_JSON` | Canonical way to start a terminal launch for an owned MT5 account. | Yes. Inserts a pending `terminal_sessions` row and stores a launch-code hash only. |
+| POST | `/api/terminal/session` | Same as canonical route. | Same as canonical route. | Same as canonical route. | Same as canonical route. | Compatibility alias for clients expecting singular `session`. | Yes. Same handler as plural route. |
+| POST | `/api/terminal/sessions/exchange` | No bearer token. Backend may enforce configured `Origin`. | `{ "launch_code": "<launch_code_from_url_fragment>" }` | `{ "success": true, "terminal_token": "<terminal_token>", "expires_in": <seconds>, "feed_ticket": "<feed_ticket>", "trade_ticket": "<trade_ticket>", "ws_ticket_expires_in": <seconds>, "account_context": {...}, "initial_state_transport": "trade_socket.account.summary" }` | `LAUNCH_CODE_REQUIRED`, `TERMINAL_ORIGIN_FORBIDDEN`, `TERMINAL_JWT_UNCONFIGURED`, `TERMINAL_STORAGE_UNAVAILABLE`, `LAUNCH_CODE_INVALID`, `LAUNCH_CODE_CONSUMED`, `LAUNCH_CODE_EXPIRED`, `SESSION_REVOKED`, `SESSION_NOT_ACTIVE`, `WS_TICKET_CREATE_FAILED`, account/challenge gate errors | Terminal client exchanges the one-time launch code for in-memory terminal auth and one-time WS tickets. | Yes. Consumes launch code, activates session, creates feed/trade ticket rows. |
+| POST | `/api/terminal/sessions/refresh-ws-tickets` | `Authorization: Bearer <terminal_token>` | Empty body is fine. | `{ "success": true, "feed_ticket": "<feed_ticket>", "trade_ticket": "<trade_ticket>", "expires_in": <seconds> }` | `UNAUTHORIZED`, `INVALID_TERMINAL_TOKEN`, `INVALID_TOKEN_AUDIENCE`, `TERMINAL_TOKEN_INVALIDATED`, `SESSION_NOT_FOUND`, `SESSION_MISMATCH`, `SESSION_REVOKED`, `SESSION_EXPIRED`, `SESSION_NOT_ACTIVE` | Get fresh one-time tickets before reconnecting either socket. | Yes. Revokes unused issued tickets for the session and inserts fresh tickets. |
+| POST | `/api/terminal/sessions/revoke` | `Authorization: Bearer <terminal_token>` | Empty body is fine. | `{ "success": true, "revoked": true }` | Same terminal-token/session validation errors, plus `SESSION_REVOKE_FAILED` | Logout, close terminal, or operator/session cleanup. | Yes. Marks session revoked and revokes unused issued tickets. |
+ 
+The plural route is canonical. The singular route is only an alias and should not be treated as a separate lifecycle.
+ 
+## 5. WebSocket Endpoint Reference
+ 
+| Socket | URL | Ticket Type | Auth Source | First Events | Frontend Use | Notes |
+|---|---|---|---|---|---|---|
+| Feed | `/ws/terminal/feed?ticket=<feed_ticket>` | `feed` | Query parameter `ticket`; ticket is consumed at connect. | `connected`, then subscribed quote snapshots after subscription, plus periodic `heartbeat`. | Live bid/ask quote stream and historical chart reads. | Read-only. Wrong socket ticket returns `WS_TICKET_TYPE_MISMATCH`. Reusing a consumed ticket returns `WS_TICKET_CONSUMED`. |
+| Trade | `/ws/terminal/trade?ticket=<trade_ticket>` | `trade` | Query parameter `ticket`; ticket is consumed at connect. | `connected`, then `account.summary` or `state_refresh_pending`/`STATE_REFRESH_FAILED`. | Account state, read-only refresh/history, outbox replay, dry-run-safe trade commands. | Reliable frames include `seq` and are persisted before send. Wrong socket ticket returns `WS_TICKET_TYPE_MISMATCH`. |
+ 
+Tickets are one-time, short-lived credentials. A successful connection consumes the ticket. Do not reuse the same ticket across reconnects, browser tabs, or feed/trade sockets. Before reconnect, call `POST /api/terminal/sessions/refresh-ws-tickets` with the terminal token and use the returned ticket for the target socket.
+ 
+If the socket rejects a ticket, discard that ticket. Do not retry the same ticket in a loop.
+ 
+## 6. Recommended Frontend Flow
+ 
+1. User logs into the normal application and receives a normal app user JWT.
+2. User selects an owned MT5 account.
+3. App calls `POST /api/terminal/sessions` with `{ "login": <mt5_login> }`.
+4. App opens the terminal view using the returned `launch_url`, or passes the launch fragment to the terminal shell.
+5. Terminal app extracts the launch code from the URL fragment.
+6. Terminal app calls `POST /api/terminal/sessions/exchange` with the launch code and the browser/WebView `Origin`.
+7. Terminal stores `terminal_token`, `feed_ticket`, and `trade_ticket` in memory where possible.
+8. Terminal opens `/ws/terminal/feed?ticket=<feed_ticket>` and subscribes to quote symbols.
+9. Terminal opens `/ws/terminal/trade?ticket=<trade_ticket>` and waits for `connected` followed by `account.summary`.
+10. Terminal tracks the highest trade `seq` it has processed.
+11. Before reconnect, terminal refreshes WS tickets with `POST /api/terminal/sessions/refresh-ws-tickets`.
+12. After reconnecting trade socket with a fresh ticket, terminal sends `resume` with `last_seen_seq`.
+13. On logout, close, or account switch, terminal calls `POST /api/terminal/sessions/revoke`.
+ 
+## 7. Feed WebSocket Protocol
+ 
+Feed server frames are JSON objects stamped by the backend as `{ "v": 1, "type": "...", "seq": <number>, "server_time_msc": <epoch_ms>, ... }`. Feed is read-only and does not execute trades.
+ 
+### Connect
+ 
+```text
+GET <WS_BASE_URL>/ws/terminal/feed?ticket=<feed_ticket>
+```
+ 
+Expected first frame:
+ 
+```json
+{
+  "v": 1,
+  "type": "connected",
+  "seq": 1,
+  "session_id": "<terminal_session_id>",
+  "login": 123456,
+  "server_time_msc": 1780000000012
+}
+```
+ 
+### Subscribe
+ 
+```json
+{
+  "type": "subscribe",
+  "symbols": ["EURUSD", "XAUUSD"]
+}
+```
+ 
+Server returns:
+ 
+```json
+{
+  "v": 1,
+  "type": "subscribed",
+  "seq": 2,
+  "symbols": ["EURUSD", "XAUUSD"],
+  "server_time_msc": 1780000000013
+}
+```
+ 
+The backend may immediately send cached quote snapshots for accepted symbols.
+ 
+### Unsubscribe
+ 
+```json
+{
+  "type": "unsubscribe",
+  "symbols": ["XAUUSD"]
+}
+```
+ 
+Server returns `unsubscribed` with the removed symbols.
+ 
+### Ping
+ 
+```json
+{
+  "type": "ping",
+  "id": "client-ping-1"
+}
+```
+ 
+Server returns `pong` and echoes `id` when present.
+ 
+### Chart Request
+ 
+```json
+{
+  "type": "chart.request",
+  "symbol": "EURUSD",
+  "timeframe": "M1",
+  "from": 1780000000,
+  "to": 1780086400,
+  "limit": 500
+}
+```
+ 
+Server returns `chart.history` with `bars[]`, or an error such as `CHART_BAD_REQUEST` or `CHART_UNAVAILABLE`.
+ 
+### Feed State Handling
+ 
+Maintain a per-socket highest `seq`, per-symbol subscription set, and latest quote cache. If a `quote_gap` frame arrives, keep the latest visible prices but mark the stream stale enough to refresh or resubscribe. Feed messages are read-only; there is no order, position, or account mutation on this socket.
+ 
+## 8. Trade WebSocket Protocol
+ 
+Trade socket reliable server frames are stamped as `{ "v": 1, "type": "...", "seq": <number>, "server_time_msc": <epoch_ms>, ... }` and persisted to the terminal outbox before being sent. `pong` and accepted `ack` receipts are transient frames and may not carry `seq`.
+ 
+### Connect
+ 
+```text
+GET <WS_BASE_URL>/ws/terminal/trade?ticket=<trade_ticket>
+```
+ 
+Expected first reliable frame:
+ 
+```json
+{
+  "v": 1,
+  "type": "connected",
+  "seq": 1,
+  "login": 123456,
+  "session_id": "<terminal_session_id>",
+  "server_time_msc": 1780000000012
+}
+```
+ 
+The backend immediately follows with a fresh `account.summary`, or with `state_refresh_pending` / `STATE_REFRESH_FAILED` if it cannot build a clean snapshot.
+ 
+### Account Summary
+ 
+`account.summary` is the canonical full state message for account metrics, open positions, and open/pending orders. It is sent after connect, after resume replay, and as the result of `state.refresh`.
+ 
+```json
+{
+  "v": 1,
+  "type": "account.summary",
+  "seq": 2,
+  "login": 123456,
+  "source": "mt5",
+  "account": {
+    "balance": 100000.0,
+    "equity": 100000.0,
+    "margin": 0.0,
+    "margin_free": 100000.0,
+    "profit": 0.0,
+    "currency": "USD",
+    "leverage": 100
+  },
+  "totals": {
+    "position_count": 0,
+    "order_count": 0,
+    "floating_profit": 0.0
+  },
+  "positions": [],
+  "orders": [],
+  "server_time_msc": 1780000000040
+}
+```
+ 
+The backend does not return MT5 passwords, investor passwords, JWTs, launch codes, terminal tokens, or WS tickets in account summaries.
+ 
+### Ping
+ 
+```json
+{
+  "type": "ping",
+  "request_id": "ping-1"
+}
+```
+ 
+Server returns transient `pong` and echoes `request_id` when present.
+ 
+### State Refresh
+ 
+```json
+{
+  "type": "command",
+  "op": "state.refresh",
+  "request_id": "state-refresh-1",
+  "payload": {
+    "sections": ["account", "positions", "orders"]
+  }
+}
+```
+ 
+`state.refresh` is read-only. It does not require `idempotency_key`. Server returns `ack` followed by `result` carrying the state envelope, or an `account.summary` style response path when invoked by resume/connect internals. Treat the freshest `account.summary` as canonical.
+ 
+### Closed History
+ 
+```json
+{
+  "type": "command",
+  "op": "history.closed",
+  "request_id": "history-1",
+  "payload": {
+    "from": 1780000000,
+    "to": 1780086400,
+    "limit": 100
+  }
+}
+```
+ 
+`history.closed` is read-only. It does not require `idempotency_key`. It returns closed deal/history data through a `result` frame. The backend accepts seconds or millisecond epoch values and normalizes clearly millisecond-looking timestamps.
+ 
+### Resume and Outbox Replay
+ 
+Track the highest reliable trade `seq` processed by the frontend. After reconnecting with a fresh trade ticket, send:
+ 
+```json
+{
+  "type": "resume",
+  "request_id": "resume-1",
+  "last_seen_seq": 88
+}
+```
+ 
+The backend replays reliable frames with `seq > last_seen_seq` in ascending order, preserving their original sequence numbers, then sends a fresh account summary for reconciliation. Deduplicate by `seq`; do not apply the same reliable frame twice.
+ 
+### Command Envelope
+ 
+All trade commands use:
+ 
+```json
+{
+  "type": "command",
+  "op": "<operation>",
+  "request_id": "<client_request_id>",
+  "idempotency_key": "<required_for_mutating_ops>",
+  "payload": {}
+}
+```
+ 
+Mutating operations are `order.place`, `order.modify`, `order.cancel`, `position.modify`, and `position.close`. They require `idempotency_key`. Read-only operations are `state.refresh` and `history.closed`; they do not require `idempotency_key`.
+ 
+Result and error pattern:
+ 
+```json
+{
+  "v": 1,
+  "type": "result",
+  "seq": 10,
+  "op": "order.place",
+  "request_id": "market-buy-1",
+  "result": {
+    "success": true,
+    "status": "dry_run"
+  },
+  "server_time_msc": 1780000000040
+}
+```
+ 
+```json
+{
+  "v": 1,
+  "type": "error",
+  "seq": 11,
+  "op": "order.place",
+  "request_id": "market-buy-1",
+  "error": {
+    "code": "TRADE_VALIDATION_FAILED",
+    "message": "Trade blocked by challenge rules"
+  },
+  "server_time_msc": 1780000000041
+}
+```
+ 
+## 9. Dry-Run Trade Command Examples
+ 
+These examples are safe examples only because every mutation payload includes `dry_run: true`. Do not send `dry_run=false`. Do not use production or funded IDs. ID-dependent commands require safe demo/free-trial IDs supplied by an operator.
+ 
+### Market Buy
+ 
+```json
+{
+  "type": "command",
+  "op": "order.place",
+  "request_id": "market-buy-1",
+  "idempotency_key": "{{idempotency_key_market_buy}}",
+  "payload": {
+    "dry_run": true,
+    "order_type": "market",
+    "side": "buy",
+    "symbol": "EURUSD",
+    "volume": 0.01,
+    "stop_loss": 1.0700,
+    "take_profit": 1.0900
+  }
+}
+```
+ 
+### Market Sell
+ 
+```json
+{
+  "type": "command",
+  "op": "order.place",
+  "request_id": "market-sell-1",
+  "idempotency_key": "{{idempotency_key_market_sell}}",
+  "payload": {
+    "dry_run": true,
+    "order_type": "market",
+    "side": "sell",
+    "symbol": "EURUSD",
+    "volume": 0.01,
+    "stop_loss": 1.0900,
+    "take_profit": 1.0700
+  }
+}
+```
+ 
+### Pending Buy Limit
+ 
+```json
+{
+  "type": "command",
+  "op": "order.place",
+  "request_id": "pending-buy-limit-1",
+  "idempotency_key": "{{idempotency_key_pending_buy_limit}}",
+  "payload": {
+    "dry_run": true,
+    "order_type": "pending",
+    "pending_type": "buy_limit",
+    "symbol": "EURUSD",
+    "volume": 0.01,
+    "price": 1.0800,
+    "stop_loss": 1.0700,
+    "take_profit": 1.1000,
+    "expiration": "2026-06-30T20:00:00Z"
+  }
+}
+```
+ 
+### Modify Order
+ 
+Blocked until a safe demo/free-trial pending order ID is supplied.
+ 
+```json
+{
+  "type": "command",
+  "op": "order.modify",
+  "request_id": "modify-order-1",
+  "idempotency_key": "{{idempotency_key_modify_order}}",
+  "payload": {
+    "dry_run": true,
+    "order_id": "{{safe_pending_order_id}}",
+    "price": 1.0810,
+    "stop_loss": 1.0700,
+    "take_profit": 1.1000
+  }
+}
+```
+ 
+### Cancel Order
+ 
+Blocked until a safe demo/free-trial pending order ID is supplied.
+ 
+```json
+{
+  "type": "command",
+  "op": "order.cancel",
+  "request_id": "cancel-order-1",
+  "idempotency_key": "{{idempotency_key_cancel_order}}",
+  "payload": {
+    "dry_run": true,
+    "order_id": "{{safe_pending_order_id}}"
+  }
+}
+```
+ 
+### Modify Position
+ 
+Blocked until a safe demo/free-trial position ID is supplied.
+ 
+```json
+{
+  "type": "command",
+  "op": "position.modify",
+  "request_id": "modify-position-1",
+  "idempotency_key": "{{idempotency_key_modify_position}}",
+  "payload": {
+    "dry_run": true,
+    "position_id": "{{safe_position_id}}",
+    "stop_loss": 1.0700,
+    "take_profit": 1.1000
+  }
+}
+```
+ 
+### Close Position
+ 
+Blocked until a safe demo/free-trial position ID is supplied.
+ 
+```json
+{
+  "type": "command",
+  "op": "position.close",
+  "request_id": "close-position-1",
+  "idempotency_key": "{{idempotency_key_close_position}}",
+  "payload": {
+    "dry_run": true,
+    "position_id": "{{safe_position_id}}",
+    "volume": 0.01
+  }
+}
+```
+ 
+Frontend guardrails:
+ 
+- Hide or disable mutation controls unless `ENABLE_DRY_RUN_COMMANDS=true`.
+- Keep `ENABLE_REAL_TRADING=false` by default.
+- Never send `dry_run=false` unless a separate production or sandbox rollout decision explicitly approves it.
+- Do not run ID-dependent examples without safe demo/free-trial IDs.
+ 
+## 10. Error Handling
+ 
+| Code | Meaning | Frontend Response | Retry Allowed? |
+|---|---|---|---|
+| `UNAUTHORIZED` | Missing or invalid normal app auth, or missing terminal bearer token on refresh/revoke. | Return to login or terminal bootstrap. Do not retry blindly. | After acquiring valid auth. |
+| `INVALID_JSON` | REST body is not valid JSON. | Fix client serializer. | Yes after fix. |
+| `LOGIN_REQUIRED` | Session create missing valid MT5 login. | Ask user to select a valid account. | Yes after fix. |
+| `ACCOUNT_NOT_FOUND` | Account does not exist or is not owned by user. | Stop launch and show account access error. | No, unless account selection changes. |
+| `ACCOUNT_STATE_INVALID` | Account is disabled, deleted, breached, or not tradeable. | Disable terminal launch/trading for that account. | No until account state changes. |
+| `CHALLENGE_NOT_FOUND` | No challenge row found for the login/user. | Stop launch and surface account setup issue. | No until backend/account setup changes. |
+| `CHALLENGE_STATE_INVALID` | Challenge is not active/funded/live/running. | Disable terminal launch/trading for that account. | No until challenge state changes. |
+| `LAUNCH_CODE_REQUIRED` | Exchange request missing launch code. | Reopen terminal from a fresh launch URL. | Yes with fresh code. |
+| `LAUNCH_CODE_INVALID` | Launch code is unknown or expired. | Create a new terminal session. | Yes with new session. |
+| `LAUNCH_CODE_CONSUMED` | Launch code was already used. | Do not reuse old launch URL; refresh launch. | Yes with new session. |
+| `LAUNCH_CODE_EXPIRED` | Launch or session expired before exchange. | Create a new terminal session. | Yes with new session. |
+| `TERMINAL_ORIGIN_FORBIDDEN` | Exchange `Origin` is not allowed. | Fix deployment origin/config. | No until config changes. |
+| `SESSION_REVOKED` | Terminal session has been revoked. | Close terminal and return to launch flow. | No for same session. |
+| `SESSION_EXPIRED` | Terminal session TTL expired. | Create a new terminal session. | Yes with new session. |
+| `SESSION_NOT_ACTIVE` | Session is not active for the attempted operation. | Re-bootstrap terminal. | Usually with new session. |
+| `WS_TICKET_REQUIRED` / `TICKET_REQUIRED` | WS connect did not include a ticket. | Refresh tickets and reconnect with query param. | Yes with fresh ticket. |
+| `WS_TICKET_INVALID` | Ticket is unknown or expired. | Discard ticket, refresh, reconnect. | Yes with fresh ticket. |
+| `WS_TICKET_CONSUMED` | Ticket was already used. | Discard ticket, refresh, reconnect. | Yes with fresh ticket. |
+| `WS_TICKET_TYPE_MISMATCH` | Feed ticket used on trade socket, or trade ticket used on feed socket. | Fix socket-ticket routing. | Yes with correct fresh ticket. |
+| `WS_TICKET_REVOKED` | Ticket was revoked, usually after session revoke or refresh. | Refresh if session still valid; otherwise close. | Maybe. |
+| `BAD_REQUEST` | Trade WS message was malformed JSON. | Fix client serializer. | Yes after fix. |
+| `UNKNOWN_MESSAGE_TYPE` | Trade WS `type` is unsupported or missing. | Fix client message envelope. | Yes after fix. |
+| `UNKNOWN_TYPE` | Feed WS `type` is unsupported. | Fix feed message envelope. | Yes after fix. |
+| `UNKNOWN_OP` | Trade command `op` is unsupported or missing. | Fix operation name. | Yes after fix. |
+| `IDEMPOTENCY_KEY_REQUIRED` | Mutating command missing idempotency key. | Generate one key per logical mutation. | Yes with key. |
+| `ORDER_ID_REQUIRED` | Order modify/cancel missing order ID. | Require a safe pending-order ID. | Yes with safe ID. |
+| `POSITION_ID_REQUIRED` | Position modify/close missing position ID. | Require a safe position ID. | Yes with safe ID. |
+| `QUEUE_OVERFLOW` | Too many in-flight commands for the login. | Back off and retry later. | Yes with backoff. |
+| `SHUTTING_DOWN` | Backend is shutting down. | Stop sending commands and reconnect later. | Yes later. |
+| `RESUME_REPLAY_FAILED` | Outbox replay failed. | Refresh state, warn user, and consider full relaunch. | Maybe. |
+| `STATE_REFRESH_FAILED` | Backend could not build a clean account snapshot. | Keep last known state marked stale and retry refresh later. | Yes with backoff. |
+| `CHART_BAD_REQUEST` | Feed chart request missing symbol. | Fix request. | Yes after fix. |
+| `CHART_UNAVAILABLE` | Chart provider unavailable or returned no data. | Show unavailable state. | Yes later. |
+ 
+## 11. Token / Ticket Security
+ 
+- User JWT is normal app authentication and is used only for protected app REST endpoints such as session creation.
+- Launch code is short-lived and one-time. It appears in the launch URL fragment and is exchanged once.
+- Terminal token is short-lived session auth for refresh/revoke. Prefer memory storage over localStorage.
+- Feed and trade tickets are one-time WS credentials. Each is tied to one socket type.
+- Never log, print, persist, or commit tokens, launch codes, tickets, JWTs, MT5 passwords, or account credentials.
+- Never send tokens or tickets inside WS message bodies.
+- Refresh WS tickets through the backend before reconnect.
+- Revoke the terminal session on logout, close, account switch, or suspicious state.
+ 
+## 12. Account Credentials Boundary
+ 
+MT5 passwords and investor passwords are not part of the terminal session API or the terminal WS payloads. The frontend must not expect credentials from `POST /api/terminal/sessions`, exchange, refresh, revoke, feed WS, trade WS, `account.summary`, history, or command responses.
+ 
+If separate MT5 credential management endpoints exist elsewhere in the product, treat them as a separate account UX and protect them independently. Do not mix credential handling into terminal WS auth.
+ 
+## 13. Frontend State Model
+ 
+Recommended generic state machine:
+ 
+| State | Meaning | Exit |
+|---|---|---|
+| `idle` | Terminal not started. | User selects account. |
+| `creating_session` | Calling canonical create-session endpoint. | `launch_ready` or `error`. |
+| `launch_ready` | Launch URL/code available. | `exchanging`. |
+| `exchanging` | Exchanging launch code. | `connecting_feed` and `connecting_trade`, or `error`. |
+| `connecting_feed` | Opening feed socket with fresh feed ticket. | Feed connected or error. |
+| `connecting_trade` | Opening trade socket with fresh trade ticket. | Trade connected or error. |
+| `connected` | Both sockets healthy enough for current view. | `refreshing_tickets`, `revoked`, or `error`. |
+| `refreshing_tickets` | Refreshing one-time WS credentials. | Reconnect sockets or `error`. |
+| `revoked` | Terminal session was revoked or user closed terminal. | `idle`. |
+| `error` | Recoverable or terminal failure. | Backoff, relaunch, or logout depending on code. |
+ 
+Use exponential backoff for network failures. Do not reconnect with a consumed ticket. For trade socket, keep `last_seen_seq` in memory and resume after reconnect; if state is uncertain, request `state.refresh`.
+ 
+## 14. Environment Configuration for Frontend
+ 
+Use placeholders/config values like:
+ 
+| Key | Purpose |
+|---|---|
+| `API_BASE_URL` | Base HTTPS URL for REST calls. |
+| `WS_BASE_URL` | Base WS/WSS URL for WebSocket connections. |
+| `TERMINAL_ALLOWED_ORIGIN` | Expected frontend terminal origin when backend origin enforcement is configured. |
+| `ENABLE_DRY_RUN_COMMANDS` | Enables UI controls for dry-run mutation commands only. |
+| `ENABLE_REAL_TRADING` | Must default to `false`; do not enable without separate approval for `dry_run=false`. |
+ 
+Do not commit real environment exports. Do not place secrets in frontend bundles.
+ 
+## 15. Testing Checklist for Frontend
+ 
+| Check | Expected |
+|---|---|
+| Create session success | Returns launch URL and TTLs; no credentials. |
+| Exchange success | Returns terminal token, feed ticket, trade ticket, account context; no credentials. |
+| Refresh success | Returns new feed/trade tickets. |
+| Revoke success | Returns `revoked: true`; later refresh fails with session error. |
+| Feed missing/fake/reused ticket | Rejected cleanly. |
+| Trade missing/fake/reused ticket | Rejected cleanly. |
+| Cross-ticket misuse | Feed ticket on trade socket and trade ticket on feed socket are rejected. |
+| Feed subscribe/ping/chart | `subscribed`, `pong`, and `chart.history` or clean chart error. |
+| Trade connect | `connected` then `account.summary` or clean pending/error state. |
+| Trade read-only commands | `ping`, `state.refresh`, `history.closed`, and `resume` behave as expected. |
+| Account summary | Contains account/positions/orders state and no credentials. |
+| Dry-run commands | Every mutation payload includes `dry_run: true`. |
+| ID-dependent commands | Disabled until safe IDs are available. |
+| Real trading | UI cannot send `dry_run=false` unless separately approved and configured. |
+| Logs | Console, network logs, crash reports, analytics, and persisted state do not expose tokens/tickets/JWTs/credentials. |
+ 
+## 16. Production Readiness Boundary
+ 
+Live functional proof exists for the tested backend/environment. This guide does not approve production real-trade rollout. `dry_run=false` requires separate operator approval, controlled rollout planning, and environment-specific risk acceptance.
+ 
+Artifact retention/scrubbing is separate from frontend integration. Frontends should default to read-only plus dry-run-safe behavior and should hide or disable real mutation controls unless explicitly enabled by approved configuration.
+ 
+## 17. Endpoint and Purpose Summary
+ 
+### REST
+ 
+| Method | Endpoint | Purpose | Mutation Risk | Frontend Action |
+|---|---|---|---|---|
+| POST | `/api/terminal/sessions` | Canonical terminal launch session create. | Session DB mutation only. | Call after account selection with user JWT. |
+| POST | `/api/terminal/session` | Singular alias for session create. | Session DB mutation only. | Use only for compatibility. Prefer plural route. |
+| POST | `/api/terminal/sessions/exchange` | Exchange one-time launch code for terminal token and WS tickets. | Activates session and creates tickets. | Call from terminal view with launch code. |
+| POST | `/api/terminal/sessions/refresh-ws-tickets` | Refresh one-time feed/trade tickets. | Revokes unused issued tickets and creates new ones. | Call before reconnect. |
+| POST | `/api/terminal/sessions/revoke` | Revoke terminal session. | Revokes session and unused tickets. | Call on close/logout/account switch. |
+ 
+### WebSocket Endpoints
+ 
+| Socket | Path | Purpose | Mutation Risk | Frontend Action |
+|---|---|---|---|---|
+| Feed | `/ws/terminal/feed?ticket=<feed_ticket>` | Quotes, quote gaps, heartbeat, chart history. | No trade mutation; consumes ticket. | Connect with fresh feed ticket, subscribe to symbols. |
+| Trade | `/ws/terminal/trade?ticket=<trade_ticket>` | Account summary, read-only commands, outbox replay, dry-run trade commands. | Commands can mutate if `dry_run=false`; this guide permits dry-run examples only. Ticket is consumed. | Connect with fresh trade ticket, track `seq`, resume on reconnect. |
+ 
+### Client Messages
+ 
+| Channel | Message / Operation | Purpose | Mutation Risk | Frontend Action |
+|---|---|---|---|---|
+| Feed | `subscribe` | Subscribe to one or more quote symbols. | None. | Maintain local subscription set. |
+| Feed | `unsubscribe` | Remove one or more quote subscriptions. | None. | Update subscription set after ack. |
+| Feed | `ping` | Feed heartbeat. | None. | Use for liveness if needed. |
+| Feed | `chart.request` | Request historical bars. | None, read-only MT5 chart read. | Show chart or clean unavailable state. |
+| Trade | `ping` | Trade heartbeat. | None. | Use for liveness if needed. |
+| Trade | `resume` | Replay reliable frames with `seq > last_seen_seq`. | None. | Send after reconnect with fresh trade ticket. |
+| Trade | `state.refresh` | Fresh account/positions/orders snapshot. | None. | Use after reconnect or stale state. |
+| Trade | `history.closed` | Closed deal/history query. | None. | Use for history panels and reconciliation. |
+| Trade | `order.place` market | Dry-run market order validation/routing. | Mutating if `dry_run=false`; dry-run only here. | Require `idempotency_key` and `payload.dry_run=true`. |
+| Trade | `order.place` pending | Dry-run pending order validation/routing. | Mutating if `dry_run=false`; dry-run only here. | Require `idempotency_key` and `payload.dry_run=true`. |
+| Trade | `order.modify` | Modify a pending order. | ID-dependent mutation if not dry-run. | Block unless safe pending order ID and `dry_run=true`. |
+| Trade | `order.cancel` | Cancel a pending order. | ID-dependent mutation if not dry-run. | Block unless safe pending order ID and `dry_run=true`. |
+| Trade | `position.modify` | Modify SL/TP on a position. | ID-dependent mutation if not dry-run. | Block unless safe position ID and `dry_run=true`. |
+| Trade | `position.close` | Close all or part of a position. | ID-dependent mutation if not dry-run. | Block unless safe position ID and `dry_run=true`. |
+ 
+ 
+6. Endpoint and Purpose Summary
+REST:
+Method	Endpoint	Purpose
+POST	
+/api/terminal/sessions
+	Canonical authenticated terminal session launch.
+POST	
+/api/terminal/session
+	Singular alias for canonical create session.
+POST	
+/api/terminal/sessions/exchange
+	Exchange one-time launch code for terminal token and WS tickets.
+POST	
+/api/terminal/sessions/refresh-ws-tickets
+	Refresh one-time feed/trade WS tickets using terminal token.
+POST	
+/api/terminal/sessions/revoke
+	Revoke terminal session and unused issued tickets.
+WS:
+Socket	Path	Purpose
+Feed	
+/ws/terminal/feed?ticket=...
+	Read-only quotes, chart history, heartbeat.
+Trade	
+/ws/terminal/trade?ticket=...
+	Account summary, read-only commands, outbox replay, dry-run command routing.
+Messages:
+ 
+Channel	Message / Operation	Purpose	Mutation Risk
+Feed	
+subscribe, unsubscribe, ping, chart.request
+	Quote subscription, liveness, chart reads	None 
+Trade	
+ping, resume, state.refresh, history.closed
+	Liveness, replay, account refresh, history	None
+Trade	
+order.place, order.modify, order.cancel, position.modify, position.close
+	Trade command path	Dry-run-safe only in guide; dry_run=false gated
+ 
+ 

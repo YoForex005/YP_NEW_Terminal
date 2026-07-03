@@ -79,6 +79,14 @@ export interface PriceTick {
   last?: number;
   volume?: number;
   time: Date;
+  mt5_time_msc?: number;
+  mt5TimeMsc?: number;
+  mt5_time?: number;
+  mt5Time?: number;
+  server_time_msc?: number;
+  serverTimeMsc?: number;
+  server_received_msc?: number;
+  serverReceivedMsc?: number;
   spread?: number;
   receivedAtMs?: number;
   receivedSequence?: number;

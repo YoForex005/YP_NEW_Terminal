@@ -1,5 +1,7 @@
 import { GLOBAL_CHART_SPACING } from './chart-visual-config';
 
+const DEFAULT_TERMINAL_TIMEFRAME_MINUTES = 1;
+
 export interface TerminalPreferences {
   accountId: string;
   selectedSymbol: string | null;
@@ -624,8 +626,8 @@ const buildTerminalStatePayload = (
   open_tabs: input.openTabs,
   watchlistSymbols: input.watchlistSymbols,
   watchlist_symbols: input.watchlistSymbols,
-  timeframeMinutes: input.timeframeMinutes ?? 1,
-  timeframe_minutes: input.timeframeMinutes ?? 1,
+  timeframeMinutes: input.timeframeMinutes ?? DEFAULT_TERMINAL_TIMEFRAME_MINUTES,
+  timeframe_minutes: input.timeframeMinutes ?? DEFAULT_TERMINAL_TIMEFRAME_MINUTES,
   chartType: input.chartType,
   chart_type: input.chartType,
   chartLayoutPanes: input.chartLayoutPanes,
@@ -651,11 +653,11 @@ const buildTerminalPreferencesFromInput = (
 
 const normalizeTimeframeMinutes = (value: unknown): number => {
   if (value === null || value === undefined) {
-    return 1;
+    return DEFAULT_TERMINAL_TIMEFRAME_MINUTES;
   }
 
   const parsed = typeof value === 'number' ? value : Number(value);
-  return Number.isFinite(parsed) ? Math.trunc(parsed) : 1;
+  return Number.isFinite(parsed) ? Math.trunc(parsed) : DEFAULT_TERMINAL_TIMEFRAME_MINUTES;
 };
 
 const normalizePositiveNumber = (value: unknown): number | undefined => {

@@ -3,10 +3,7 @@ import { NextResponse } from "next/server";
 
 import { authenticateRequest } from "@/lib/server/auth";
 import { getUserById } from "@/lib/server/database";
-import {
-  buildSettingsBackendErrorResponse,
-  requestSettingsBackend,
-} from "@/lib/server/settings-backend";
+import { requestSettingsBackend } from "@/lib/server/settings-backend";
 
 interface SettingsPayload {
   settings?: Record<string, string>;
@@ -72,6 +69,22 @@ export async function GET(request: NextRequest) {
       { status: 200 },
     );
   } catch (error) {
-    return buildSettingsBackendErrorResponse(error);
+    console.warn(
+      "[settings/security] backend unavailable; using local fallback:",
+      error instanceof Error ? error.message : error,
+    );
+    return NextResponse.json(
+      {
+        ok: true,
+        data: {
+          emailMasked: maskEmail(auth.user.email),
+          phoneMasked: maskPhone(undefined),
+          twoFactorEnabled: false,
+        },
+        degraded: true,
+        fallbackSource: "auth_context",
+      },
+      { status: 200 },
+    );
   }
 }

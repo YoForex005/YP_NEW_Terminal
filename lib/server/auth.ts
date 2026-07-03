@@ -432,22 +432,36 @@ const authenticateDevelopmentRequest = async (
 
   const adminEmail =
     process.env.APP_ADMIN_EMAIL?.trim().toLowerCase() || "admin@dominionmarkets.local";
-  const user = (await getUserByEmail(adminEmail)) ?? (await getFirstUser());
-  if (!user) {
-    return null;
+  let user: AppUser | null = null;
+  try {
+    user = (await getUserByEmail(adminEmail)) ?? (await getFirstUser());
+  } catch (err) {
+    console.warn(
+      "[auth] dev auto-auth DB lookup failed; using local fallback user:",
+      err instanceof Error ? err.message : err,
+    );
   }
 
   const now = Date.now();
+  const fallbackUser: AuthUser = {
+    id: "dev-auto-user",
+    email: adminEmail,
+    name: "Local Developer",
+    role: "admin",
+    emailVerified: "verified",
+    mobileVerified: "verified",
+    profileVerified: "verified",
+  };
   const session: AppSession = {
     token: "dev-auto-auth",
-    userId: user.id,
-    brokerId: user.brokerId,
+    userId: user?.id ?? fallbackUser.id,
+    brokerId: user?.brokerId,
     createdAt: new Date(now).toISOString(),
     expiresAt: new Date(now + SESSION_TTL_MS).toISOString(),
   };
 
   return {
-    user: toAuthUser(user),
+    user: user ? toAuthUser(user) : fallbackUser,
     session,
     token: session.token,
   };

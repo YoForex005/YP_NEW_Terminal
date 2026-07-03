@@ -29,8 +29,14 @@ export async function GET(request: NextRequest) {
         });
     } catch (error: any) {
         return NextResponse.json({ 
-            ok: false, 
-            error: error.message || "Failed to fetch PAMM transactions" 
-        }, { status: 502 });
+            ok: true,
+            data: {
+                transactions: [],
+                total: 0,
+            },
+            degraded: true,
+            fallbackSource: "local_empty",
+            error: error.message || "Failed to fetch PAMM transactions",
+        }, { status: 200 });
     }
 }

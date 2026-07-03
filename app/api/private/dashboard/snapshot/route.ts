@@ -10,9 +10,16 @@ import {
 } from "@/lib/server/database";
 import { mergeFullPgAccounts } from "@/lib/server/dashboard-snapshot-merge";
 import { normalizeSnapshotTransactions } from "@/lib/server/snapshot-format";
+import {
+  fetchPropfirmDashboardData,
+  isForwardableToken,
+  overlayPropfirmSnapshot,
+} from "@/lib/server/propfirm-backend";
 import type { DashboardSnapshot } from "@/types/dashboard";
 
 export const dynamic = "force-dynamic";
+
+const DASHBOARD_SNAPSHOT_PROPFIRM_TIMEOUT_MS = 4_000;
 
 const DASHBOARD_SNAPSHOT_AUTH_TIMEOUT_MS = 5_000;
 const DASHBOARD_SNAPSHOT_LOCAL_TIMEOUT_MS = 1_500;
@@ -144,6 +151,42 @@ export async function GET(request: NextRequest) {
       { error: "Data backend unavailable. Please ensure the backend services are running." },
       { status: 503 },
     );
+  }
+
+  // Preferred source for a separate-subdomain deployment: fetch accounts,
+  // wallet, positions and transactions from the PropFirm C++ Backend over HTTP
+  // using the caller's forwarded JWT. Market instruments / sessions / pnl come
+  // from the local snapshot, so overlay onto it. Any failure (no forwardable
+  // token, auth/transport error) falls through to the Postgres/local path below.
+  if (isForwardableToken(auth.token)) {
+    try {
+      const backendData = await withPhaseTimeout(
+        "fetchPropfirmDashboardData",
+        fetchPropfirmDashboardData(auth.token, {
+          timeoutMs: DASHBOARD_SNAPSHOT_PROPFIRM_TIMEOUT_MS,
+        }),
+        DASHBOARD_SNAPSHOT_PROPFIRM_TIMEOUT_MS + 500,
+      );
+      if (backendData && backendData.tradingAccounts.length > 0) {
+        return NextResponse.json(
+          normalizeSnapshotTransactions(
+            overlayPropfirmSnapshot(localSnapshot, backendData),
+          ),
+          {
+            status: 200,
+            headers: {
+              "Cache-Control": "no-store",
+              "X-Dashboard-Snapshot-Source": "propfirm-backend",
+            },
+          },
+        );
+      }
+    } catch (err) {
+      console.warn(
+        "[snapshot] PropFirm backend fetch failed; using local/PG path:",
+        err instanceof Error ? err.message : err,
+      );
+    }
   }
 
   const forceRefresh = request.nextUrl.searchParams.get("refresh") === "1";

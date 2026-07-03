@@ -2,7 +2,7 @@ export default function TerminalLoading() {
     return (
         <div
             aria-hidden="true"
-            className="bg-background"
+            className="bg-[#0e0f11]"
             style={{
                 position: "fixed",
                 inset: 0,
@@ -13,24 +13,52 @@ export default function TerminalLoading() {
             }}
         >
             <style>{`
-                .tpls-dot-loader { display: flex; gap: 8px; }
-                .tpls-dot {
-                    width: 8px; height: 8px;
-                    background-color: #ffffff;
-                    border-radius: 50%;
-                    animation: tplsDotFade 1.4s infinite ease-in-out both;
+                .terminal-loading-dots {
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    gap: 10px;
+                    width: min(220px, 52vw);
+                    height: 72px;
                 }
-                .tpls-dot:nth-child(1) { animation-delay: -0.32s; }
-                .tpls-dot:nth-child(2) { animation-delay: -0.16s; }
-                @keyframes tplsDotFade {
-                    0%, 80%, 100% { opacity: 0.3; }
-                    40% { opacity: 1; }
+                .terminal-loading-dot {
+                    width: 12px;
+                    height: 12px;
+                    border-radius: 999px;
+                    background: #ffffff;
+                    opacity: 0.28;
+                    transform: translateY(0) scale(0.72);
+                    animation: terminalDotWave 1.15s ease-in-out infinite;
+                }
+                .terminal-loading-dot:nth-child(2) {
+                    animation-delay: 0.12s;
+                }
+                .terminal-loading-dot:nth-child(3) {
+                    animation-delay: 0.24s;
+                }
+                .terminal-loading-dot:nth-child(4) {
+                    animation-delay: 0.36s;
+                }
+                .terminal-loading-dot:nth-child(5) {
+                    animation-delay: 0.48s;
+                }
+                @keyframes terminalDotWave {
+                    0%, 72%, 100% {
+                        opacity: 0.28;
+                        transform: translateY(0) scale(0.72);
+                    }
+                    28% {
+                        opacity: 1;
+                        transform: translateY(-2px) scale(1.45);
+                    }
                 }
             `}</style>
-            <div className="tpls-dot-loader">
-                <div className="tpls-dot" />
-                <div className="tpls-dot" />
-                <div className="tpls-dot" />
+            <div className="terminal-loading-dots">
+                <span className="terminal-loading-dot" />
+                <span className="terminal-loading-dot" />
+                <span className="terminal-loading-dot" />
+                <span className="terminal-loading-dot" />
+                <span className="terminal-loading-dot" />
             </div>
         </div>
     );

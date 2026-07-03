@@ -130,9 +130,13 @@ export const DEFAULT_CHART_RESOLUTIONS: ChartResolutionOption[] = [
   { label: '1m', minutes: 1 },
   { label: '5m', minutes: 5 },
   { label: '15m', minutes: 15 },
+  { label: '30m', minutes: 30 },
   { label: '1h', minutes: 60 },
   { label: '4h', minutes: 240 },
   { label: '1D', minutes: 1440 },
+  { label: '1W', minutes: 10080 },
+  { label: '1M', minutes: 43200 },
+  { label: '1Y', minutes: 525600 },
 ];
 
 export function getGlobalChartBarSpacing(timeframeMinutes: number): number {

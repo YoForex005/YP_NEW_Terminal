@@ -20,7 +20,8 @@ const normalizeBrokerId = (brokerId: string | null | undefined): string | undefi
 };
 
 const DEFAULT_BACKEND_BASE_URL = "http://127.0.0.1:3002";
-const DEFAULT_BACKEND_TIMEOUT_MS = 15000;
+const DEFAULT_BACKEND_TIMEOUT_MS =
+  process.env.NODE_ENV === "production" ? 15000 : 1500;
 
 const trimTrailingSlash = (value: string): string => value.replace(/\/+$/, "");
 

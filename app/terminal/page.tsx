@@ -30,7 +30,7 @@ import { getLivePriceSnapshotBySymbol, usePriceBySymbol, useWebtraderStore } fro
 import { buildOhlcSessionScopeId, useAutoConnectTrading } from '@/lib/trading/use-auto-connect';
 import type { WebSocketTradingClient } from '@/lib/trading/websocket-client';
 import type { TradingAccount as DashboardTradingAccount } from '@/types/dashboard';
-import type { OrderType as WebtraderOrderType, Position as WebtraderPosition, SymbolInfo, TradeRequest, TradeResult, TradingAccountInfo } from '@/types/webtrader';
+import type { Order as WebtraderOrder, OrderType as WebtraderOrderType, Position as WebtraderPosition, SymbolInfo, TradeRequest, TradeResult, TradingAccountInfo } from '@/types/webtrader';
 import {
     isContinuityBar,
     ohlcService,
@@ -42,6 +42,12 @@ import {
     saveTerminalPreferences,
     type TerminalPreferences,
 } from '@/lib/terminal/terminal-preferences';
+import { useTerminalLaunchSession } from '@/lib/terminal/use-terminal-launch-session';
+import {
+    readTerminalFrontendLaunchSnapshot,
+    reviveTerminalLaunchPositions,
+    writeTerminalFrontendLaunchSnapshot,
+} from '@/lib/terminal/terminal-launch-cache';
 import { DEFAULT_CHART_TYPES, type ChartType as TerminalChartType } from '@/lib/terminal/chart-visual-config';
 import { getMt5ServerTimeMs, toMt5IsoString } from '@/lib/mt5-time';
 
@@ -121,7 +127,8 @@ const LEFT_PANEL_STORAGE_KEY = 'term_left_w';
 const RIGHT_PANEL_STORAGE_KEY = 'term_right_w';
 const POSITIONS_HEIGHT_STORAGE_KEY = 'term_positions_h';
 const LIVE_QUOTE_INITIAL_WAIT_MS = 6000;
-const INITIAL_TERMINAL_CHART_GATE_TIMEOUT_MS = 3_000;
+const INITIAL_TERMINAL_CHART_GATE_TIMEOUT_MS = 450;
+const INITIAL_TERMINAL_ACCOUNT_DATA_GATE_TIMEOUT_MS = 600;
 const FIRST_TICK_NOTICE_MESSAGE =
     'Waiting for the first MT5 tick. Chart history can load independently while bid/ask prices initialize.';
 const DEFAULT_HOT_QUOTE_SUBSCRIPTION_LIMIT = DEFAULT_FIRST_RUN_TERMINAL_SYMBOLS.length;
@@ -141,18 +148,24 @@ const TERMINAL_POST_TRADE_FAST_RECONCILE_TIMEOUT_MS = 4_000;
 const TERMINAL_POST_TRADE_FAST_RECONCILE_REFRESH_DELAYS_MS = [0, 300, 800, 1_600, 3_000] as const;
 const TERMINAL_POST_CLOSE_RECONCILE_TIMEOUT_MS = 5_000;
 const TERMINAL_POST_TRADE_RECONCILE_REFRESH_DELAYS_MS = [0, 500, 1_200, 2_500, 5_000, 9_000] as const;
+const TERMINAL_OPTIMISTIC_POSITION_TTL_MS = 30_000;
 const TERMINAL_CLOSED_HISTORY_LOOKBACK_DAYS = 30;
 const TERMINAL_CLOSED_HISTORY_MAX_ROWS = 500;
 const TERMINAL_SELECTED_OHLC_HISTORY_PRIME_LIMIT = 500;   // 500 bars Γëê 8h of M1 ΓÇö fills chart instantly
 const TERMINAL_SELECTED_OHLC_HISTORY_BACKFILL_LIMIT = 5000;
 const TERMINAL_BOOTSTRAP_OHLC_HISTORY_PRIME_LIMIT = 1500;
 const TERMINAL_BOOTSTRAP_OHLC_HISTORY_SYMBOL_LIMIT = DEFAULT_FIRST_RUN_TERMINAL_SYMBOLS.length + 1;
-const TERMINAL_SELECTED_OHLC_HISTORY_BACKFILL_DELAY_MS = 50;
+const TERMINAL_SELECTED_OHLC_HISTORY_BACKFILL_DELAY_MS = 700;
 const TERMINAL_OHLC_HISTORY_WARMUP_STAGGER_MS = 1_200;
+const TERMINAL_BOOTSTRAP_QUOTE_PREWARM_DELAY_MS = 250;
+const TERMINAL_BOOTSTRAP_OHLC_HISTORY_PREWARM_DELAY_MS = 1_500;
+const TERMINAL_REACTIVE_OHLC_HISTORY_PREWARM_DELAY_MS = 2_500;
+const TERMINAL_SWITCH_TIMEFRAME_PREFETCH_DELAY_MS = 1_200;
+const TERMINAL_DEFAULT_TIMEFRAME_MINUTES = 1;
 // Predictive prefetch on hover: start loading before user clicks
 const TERMINAL_HOVER_PREFETCH_LIMIT = 300;                  // lightweight hover prime, fills fast
 // Timeframes pre-warmed on every symbol switch (common chart resolutions)
-const TERMINAL_SWITCH_PREFETCH_TIMEFRAMES = [1, 5, 15, 60] as const; // M1 M5 M15 H1
+const TERMINAL_SWITCH_PREFETCH_TIMEFRAMES = [1, 5, 15, 30, 60, 240, 1440, 10080] as const; // M1 M5 M15 M30 H1 H4 D1 W1
 // Minimum cached bars considered "warm enough" to show instantly without fresh fetch
 // If cache has ΓëÑ this many bars, skip the fresh fetch and show instantly
 const TERMINAL_SWITCH_MIN_CACHE_BARS = 200;
@@ -166,8 +179,16 @@ const TERMINAL_OHLC_REPAIR_MAX_FAILURES = 4;            // ~4 tries, then auto-r
 const TERMINAL_OHLC_REPAIR_FAILURE_RESET_MS = 5 * 60_000; // reset failures after 5 min of quiet
 const TERMINAL_PREFERENCES_PERSIST_DEBOUNCE_MS = 600;
 const TERMINAL_LAST_ACCOUNT_STORAGE_KEY_PREFIX = 'terminal:last-account';
+const TERMINAL_LAST_ACCOUNT_GLOBAL_STORAGE_KEY = `${TERMINAL_LAST_ACCOUNT_STORAGE_KEY_PREFIX}:global`;
+const TERMINAL_LAUNCH_ACCOUNT_HINT_STORAGE_KEY = 'terminal:launch-account-hint:v1';
+const TERMINAL_BOOT_DEBUG_STORAGE_KEY = 'terminal:boot-debug';
 const TERMINAL_OHLC_HISTORY_DEBUG_STORAGE_KEY = 'terminal:ohlc-history-debug';
 const TERMINAL_OHLC_HISTORY_CONSOLE_DEBUG_STORAGE_KEY = 'terminal:ohlc-history-console-debug';
+const TERMINAL_BOOT_DEBUG_QUERY_FLAGS = [
+    'terminalBootDebug',
+    'terminalDebug',
+    'bootDebug',
+] as const;
 const TERMINAL_OHLC_HISTORY_DEBUG_QUERY_FLAGS = [
     'ohlcHistoryDebug',
     'terminalHistoryDebug',
@@ -365,12 +386,115 @@ function readLastTerminalAccountId(storageKey: string | null) {
     return window.localStorage.getItem(storageKey);
 }
 
+function readFirstLastTerminalAccountId(...storageKeys: Array<string | null | undefined>) {
+    if (typeof window === 'undefined') {
+        return null;
+    }
+
+    for (const storageKey of storageKeys) {
+        const value = readLastTerminalAccountId(storageKey ?? null);
+        if (value?.trim()) {
+            return value.trim();
+        }
+    }
+
+    return null;
+}
+
 function writeLastTerminalAccountId(storageKey: string | null, accountId: string) {
     if (!storageKey || typeof window === 'undefined' || !accountId.trim()) {
         return;
     }
 
     window.localStorage.setItem(storageKey, accountId.trim());
+}
+
+function normalizeTerminalLaunchHintLookup(value: string | null | undefined): string {
+    return value?.trim().replace(/^mt5-/i, '') ?? '';
+}
+
+function terminalLaunchHintMatchesAccount(
+    account: DashboardTradingAccount,
+    accountId: string | null | undefined,
+) {
+    const normalizedAccountId = normalizeTerminalLaunchHintLookup(accountId);
+    if (!normalizedAccountId) {
+        return true;
+    }
+
+    return [
+        account.id,
+        account.accountNumber,
+        account.credentials?.login,
+    ].some((value) => normalizeTerminalLaunchHintLookup(value) === normalizedAccountId);
+}
+
+function mapTerminalLaunchHintAccount(value: unknown): DashboardTradingAccount | null {
+    const source = asTerminalRecord(value);
+    if (!source) {
+        return null;
+    }
+
+    const id = normalizeTerminalString(source.id);
+    const accountNumber = normalizeTerminalString(source.accountNumber);
+    if (!id || !accountNumber) {
+        return null;
+    }
+
+    const platformValue = normalizeTerminalString(source.platform)?.toLowerCase();
+    const typeValue = normalizeTerminalString(source.type);
+    const statusValue = normalizeTerminalString(source.status);
+
+    return {
+        id,
+        accountNumber,
+        name: normalizeTerminalString(source.name) ?? 'MT5 Account',
+        platform: platformValue === 'ctrader' ? 'ctrader' : 'mt5',
+        type: typeValue === 'Live' ? 'Live' : 'Demo',
+        leverage: toFiniteNumber(source.leverage),
+        serverIp: normalizeTerminalString(source.serverIp) ?? '',
+        currency: normalizeTerminalString(source.currency) ?? 'USD',
+        balance: toFiniteNumber(source.balance),
+        equity: toFiniteNumber(source.equity, toFiniteNumber(source.balance)),
+        freeMargin: toFiniteNumber(source.freeMargin),
+        margin: toFiniteNumber(source.margin),
+        status: statusValue === 'Archived' ? 'Archived' : 'Active',
+        createdAt: normalizeTerminalString(source.createdAt) ?? undefined,
+    };
+}
+
+function readTerminalLaunchAccountHint(accountId: string | null | undefined): DashboardTradingAccount | null {
+    if (typeof window === 'undefined') {
+        return null;
+    }
+
+    try {
+        const raw = window.localStorage.getItem(TERMINAL_LAUNCH_ACCOUNT_HINT_STORAGE_KEY);
+        if (!raw) {
+            return null;
+        }
+
+        const payload = JSON.parse(raw) as unknown;
+        const record = asTerminalRecord(payload);
+        if (!record) {
+            return null;
+        }
+
+        const expiresAtMs = toFiniteNumber(record.expiresAtMs);
+        if (expiresAtMs > 0 && expiresAtMs < Date.now()) {
+            window.localStorage.removeItem(TERMINAL_LAUNCH_ACCOUNT_HINT_STORAGE_KEY);
+            return null;
+        }
+
+        const account = mapTerminalLaunchHintAccount(record.account);
+        if (!account || !terminalLaunchHintMatchesAccount(account, accountId)) {
+            return null;
+        }
+
+        return account;
+    } catch {
+        return null;
+    }
 }
 
 function isRestorableTerminalAccount(account: DashboardTradingAccount | null | undefined) {
@@ -462,7 +586,7 @@ function formatHistoryDiagnosticUpdateTime(value: number | undefined) {
 
 function normalizeTerminalTimeframeMinutes(value: number | null | undefined) {
     const parsed = Number(value);
-    return Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : 1;
+    return Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : TERMINAL_DEFAULT_TIMEFRAME_MINUTES;
 }
 
 function isMatchingTerminalChartHistoryStatus(
@@ -720,6 +844,13 @@ function getRemovedSubscriptionSymbols(
     );
 }
 
+function getUncoveredSubscriptionSymbols(
+    symbols: string[],
+    coveredSymbols: string[],
+) {
+    return symbols.filter((symbol) => !symbolListIncludes(coveredSymbols, symbol));
+}
+
 function areSymbolListsEqual(left: string[], right: string[]) {
     return left.length === right.length && left.every((symbol, index) => symbol === right[index]);
 }
@@ -751,7 +882,7 @@ function upsertUniqueTerminalSymbol(symbols: string[], symbol: string) {
     return symbols.map((entry, index) => index === existingIndex ? normalized : entry);
 }
 
-function uniqueTerminalSymbols(symbols: string[]) {
+function uniqueTerminalSymbols(symbols: readonly string[]) {
     return symbols.reduce<string[]>((accumulator, symbol) => (
         appendUniqueTerminalSymbol(accumulator, symbol)
     ), []);
@@ -1214,6 +1345,14 @@ type TerminalPositionsLoadState = {
     warning?: string | null;
 };
 
+type TerminalFrontendLaunchRestoreState = {
+    accountId: string | null;
+    hasAccountInfo: boolean;
+    hasPositions: boolean;
+    hasSymbols: boolean;
+    hasSelectedSymbol: boolean;
+};
+
 type TerminalPositionsRefreshOptions = {
     showPositionsLoading?: boolean;
     forcePositionsRefresh?: boolean;
@@ -1221,6 +1360,12 @@ type TerminalPositionsRefreshOptions = {
 };
 
 type TerminalOrderSide = 'buy' | 'sell';
+
+type OptimisticTerminalPosition = Position & {
+    isOptimistic: true;
+    createdAtMs: number;
+    expiresAtMs: number;
+};
 
 type PendingTerminalOrderCorrelation = {
     symbol: string;
@@ -1241,6 +1386,71 @@ type PendingTerminalOrderConfirmation = {
     confirmed: boolean;
     correlation: PendingTerminalOrderCorrelation;
 };
+
+function getTerminalPositionPriceTolerance(price: number, digits?: number) {
+    const point = typeof digits === 'number' && Number.isFinite(digits)
+        ? 1 / Math.pow(10, Math.max(0, digits))
+        : 0.00001;
+    return Math.max(point * 50, Math.abs(price) * 0.0005, 1e-8);
+}
+
+function nullablePositionPricesMatch(
+    left: number | null | undefined,
+    right: number | null | undefined,
+    tolerance: number,
+) {
+    const leftIsSet = typeof left === 'number' && Number.isFinite(left) && left > 0;
+    const rightIsSet = typeof right === 'number' && Number.isFinite(right) && right > 0;
+
+    if (!leftIsSet && !rightIsSet) {
+        return true;
+    }
+
+    if (!leftIsSet || !rightIsSet) {
+        return false;
+    }
+
+    return Math.abs(left - right) <= tolerance;
+}
+
+function optimisticTerminalPositionMatchesReal(
+    optimisticPosition: OptimisticTerminalPosition,
+    realPosition: Position,
+) {
+    if (
+        !symbolsMatch(optimisticPosition.symbol, realPosition.symbol) ||
+        optimisticPosition.type !== realPosition.type ||
+        Math.abs(optimisticPosition.volume - realPosition.volume) > 1e-9
+    ) {
+        return false;
+    }
+
+    const tolerance = getTerminalPositionPriceTolerance(
+        optimisticPosition.openPrice,
+        optimisticPosition.digits ?? realPosition.digits,
+    );
+
+    return (
+        Math.abs(optimisticPosition.openPrice - realPosition.openPrice) <= tolerance &&
+        nullablePositionPricesMatch(optimisticPosition.sl, realPosition.sl, tolerance) &&
+        nullablePositionPricesMatch(optimisticPosition.tp, realPosition.tp, tolerance)
+    );
+}
+
+function mergeTerminalPositionsWithOptimistic(
+    realPositions: Position[],
+    optimisticPositions: OptimisticTerminalPosition[],
+) {
+    const now = Date.now();
+    const activeOptimisticPositions = optimisticPositions.filter((optimisticPosition) =>
+        optimisticPosition.expiresAtMs > now &&
+        !realPositions.some((realPosition) =>
+            optimisticTerminalPositionMatchesReal(optimisticPosition, realPosition),
+        ),
+    );
+
+    return [...realPositions, ...activeOptimisticPositions];
+}
 
 function getTerminalPositionsTransientSettledState(): TerminalPositionsLoadState {
     return {
@@ -1847,8 +2057,22 @@ function getTerminalTradeResultRetcode(payload: unknown): unknown {
         return undefined;
     }
 
-    const source = payload as { retcode?: unknown; result?: { retcode?: unknown } };
-    return source.result?.retcode ?? source.retcode;
+    const source = payload as { retcode?: unknown; success?: unknown; result?: { retcode?: unknown; success?: unknown; status?: unknown } };
+    const retcode = source.result?.retcode ?? source.retcode;
+    if (retcode !== undefined && retcode !== null) {
+        return retcode;
+    }
+
+    const success = source.result?.success ?? source.success;
+    if (success === true) {
+        return 10009;
+    }
+
+    if (success === false) {
+        return 10006;
+    }
+
+    return undefined;
 }
 
 function getTerminalTradeResultRecord(payload: unknown): Record<string, unknown> | null {
@@ -1911,7 +2135,15 @@ function getTerminalTradeResultNumber(payload: unknown, key: string): number | n
         return null;
     }
 
-    const parsed = toFiniteNumber(result[key], Number.NaN);
+    const aliases = key === 'order'
+        ? [result.order, result.mt5_order_id, result.order_id]
+        : key === 'deal'
+            ? [result.deal, result.mt5_deal_id, result.deal_id]
+            : [result[key]];
+    const parsed = toFiniteNumber(
+        aliases.find((value) => value !== undefined && value !== null),
+        Number.NaN,
+    );
     return Number.isFinite(parsed) ? parsed : null;
 }
 
@@ -2181,6 +2413,28 @@ function resolveOrderType(
     return side;
 }
 
+function formatNetworkStatusAccountLabel(account: DashboardTradingAccount | null): string {
+    if (!account) {
+        return 'No account selected';
+    }
+
+    const accountName = account.name?.trim() ?? '';
+    const accountNumber = account.accountNumber?.trim() ?? '';
+
+    if (!accountNumber) {
+        return accountName || 'No account selected';
+    }
+
+    const accountNameDigits = accountName.replace(/\D/g, '');
+    const accountNumberDigits = accountNumber.replace(/\D/g, '');
+
+    if (accountName && accountNumberDigits && accountNameDigits.includes(accountNumberDigits)) {
+        return accountName;
+    }
+
+    return accountName ? `${accountName} #${accountNumber}` : `#${accountNumber}`;
+}
+
 function NetworkStatusMenu({
     status,
     error,
@@ -2209,6 +2463,7 @@ function NetworkStatusMenu({
         activeAccount?.credentials?.server?.trim() ||
         activeAccount?.serverIp?.trim() ||
         'No live server';
+    const accountLabel = formatNetworkStatusAccountLabel(activeAccount);
     const statusLabel = status.replace(/_/g, ' ');
     const statusDotClass = isConnected
         ? 'bg-emerald-400'
@@ -2247,7 +2502,7 @@ function NetworkStatusMenu({
                     <div className="px-3 py-2">
                         <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-muted-foreground">Account</p>
                         <p className="mt-1 text-[12px] font-semibold text-foreground">
-                            {activeAccount ? `${activeAccount.name} #${activeAccount.accountNumber}` : 'No account selected'}
+                            {accountLabel}
                         </p>
                     </div>
                     <div className="px-3 py-2">
@@ -2351,6 +2606,87 @@ function TerminalPageLoadingShell() {
                     </div>
                 </div>
             </div>
+        </div>
+    );
+}
+
+function TerminalLaunchLoadingOverlay({ error }: { error?: string | null }) {
+    const hasError = Boolean(error);
+
+    return (
+        <div
+            className="fixed inset-0 z-[10000] flex items-center justify-center bg-[#0e0f11]"
+            role={hasError ? 'alert' : 'status'}
+            aria-label={hasError ? 'Terminal launch failed' : 'Opening terminal'}
+        >
+            <style>{`
+                .terminal-launch-loading-dots {
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    gap: 10px;
+                    width: min(220px, 52vw);
+                    height: 72px;
+                }
+                .terminal-launch-loading-dot {
+                    width: 12px;
+                    height: 12px;
+                    border-radius: 999px;
+                    background: #ffffff;
+                    opacity: 0.28;
+                    transform: translateY(0) scale(0.72);
+                    animation: terminalLaunchDotWave 1.15s ease-in-out infinite;
+                }
+                .terminal-launch-loading-dot:nth-child(2) {
+                    animation-delay: 0.12s;
+                }
+                .terminal-launch-loading-dot:nth-child(3) {
+                    animation-delay: 0.24s;
+                }
+                .terminal-launch-loading-dot:nth-child(4) {
+                    animation-delay: 0.36s;
+                }
+                .terminal-launch-loading-dot:nth-child(5) {
+                    animation-delay: 0.48s;
+                }
+                @keyframes terminalLaunchDotWave {
+                    0%, 72%, 100% {
+                        opacity: 0.28;
+                        transform: translateY(0) scale(0.72);
+                    }
+                    28% {
+                        opacity: 1;
+                        transform: translateY(-2px) scale(1.45);
+                    }
+                }
+            `}</style>
+
+            {hasError ? (
+                <div className="mx-6 flex max-w-[420px] flex-col items-center text-center">
+                    <div className="mb-5 flex h-14 w-14 items-center justify-center rounded-full bg-destructive/10 ring-8 ring-destructive/5">
+                        <X className="h-6 w-6 text-destructive" strokeWidth={2.5} />
+                    </div>
+                    <p className="text-[17px] font-bold tracking-tight text-white">Terminal Connection Error</p>
+                    <p className="mt-3 text-[14px] leading-relaxed text-white/70">
+                        {error || 'The terminal connection failed to establish.'}
+                    </p>
+                    <button
+                        type="button"
+                        onClick={() => window.location.reload()}
+                        className="mt-8 rounded-[8px] bg-white px-6 py-2.5 text-[13px] font-bold tracking-wide text-[#0e0f11] shadow-sm transition-all hover:scale-[1.02] hover:bg-white/90 active:scale-[0.98]"
+                    >
+                        Reload Terminal
+                    </button>
+                </div>
+            ) : (
+                <div className="terminal-launch-loading-dots" aria-hidden="true">
+                    <span className="terminal-launch-loading-dot" />
+                    <span className="terminal-launch-loading-dot" />
+                    <span className="terminal-launch-loading-dot" />
+                    <span className="terminal-launch-loading-dot" />
+                    <span className="terminal-launch-loading-dot" />
+                </div>
+            )}
         </div>
     );
 }
@@ -2488,6 +2824,39 @@ function TradingDashboardInner() {
         }),
         [searchParams],
     );
+    const isTerminalBootDebugEnabled = useMemo(() => {
+        const enabledByQuery = TERMINAL_BOOT_DEBUG_QUERY_FLAGS.some((flag) => {
+            if (!searchParams.has(flag)) {
+                return false;
+            }
+
+            return isTruthyTerminalDebugFlag(searchParams.get(flag));
+        });
+
+        if (enabledByQuery || isTruthyTerminalDebugFlag(process.env.NEXT_PUBLIC_TERMINAL_BOOT_DEBUG)) {
+            return true;
+        }
+
+        if (typeof window === 'undefined') {
+            return false;
+        }
+
+        return isTruthyTerminalDebugFlag(window.localStorage.getItem(TERMINAL_BOOT_DEBUG_STORAGE_KEY));
+    }, [searchParams]);
+    const terminalBootStartedAtRef = useRef(Date.now());
+    const terminalBootMilestonesRef = useRef<Set<string>>(new Set());
+    const markTerminalBootMilestone = useCallback((key: string, details?: Record<string, unknown>) => {
+        if (!isTerminalBootDebugEnabled || terminalBootMilestonesRef.current.has(key)) {
+            return;
+        }
+
+        terminalBootMilestonesRef.current.add(key);
+        console.info('[Terminal boot]', {
+            milestone: key,
+            elapsedMs: Date.now() - terminalBootStartedAtRef.current,
+            ...(details ?? {}),
+        });
+    }, [isTerminalBootDebugEnabled]);
 
     const hydrateFromSnapshot = useTradingStore((state) => state.hydrateFromSnapshot);
     const tradingAccounts = useTradingStore((state) => state.tradingAccounts);
@@ -2496,6 +2865,7 @@ function TradingDashboardInner() {
     const storeSession = useWebtraderStore(state => state.session);
     const storeAccountInfo = useWebtraderStore(state => state.accountInfo);
     const storePositions = useWebtraderStore(state => state.positions);
+    const storeOrders = useWebtraderStore(state => state.orders);
     const storeConnectionStatus = useWebtraderStore(state => state.connectionStatus);
     const storeConnectionError = useWebtraderStore(state => state.connectionError);
     const storeWsClient = useWebtraderStore(state => state.wsClient);
@@ -2509,23 +2879,41 @@ function TradingDashboardInner() {
     const setStoreAccountInfo = useWebtraderStore(state => state.setAccountInfo);
     const setStoreConnectionError = useWebtraderStore(state => state.setConnectionError);
     const setStorePositions = useWebtraderStore(state => state.setPositions);
+    const setStoreOrders = useWebtraderStore(state => state.setOrders);
     const setStoreSymbols = useWebtraderStore(state => state.setSymbols);
     const setStoreIsLoadingSymbols = useWebtraderStore(state => state.setIsLoadingSymbols);
+    const terminalLaunchSession = useTerminalLaunchSession();
     const [isOhlcHistoryDebugPersistent, setIsOhlcHistoryDebugPersistent] = useState(false);
     const [isOhlcHistoryConsoleDebugPersistent, setIsOhlcHistoryConsoleDebugPersistent] = useState(false);
     const [isOhlcHistoryDebugPanelOpen, setIsOhlcHistoryDebugPanelOpen] = useState(false);
     const [selectedHistoryDiagnostics, setSelectedHistoryDiagnostics] =
         useState<OhlcHistoryDiagnosticsSnapshot | null>(null);
-    const [lastTerminalAccountId, setLastTerminalAccountId] = useState<string | null>(null);
-    const [isLastTerminalAccountLoaded, setIsLastTerminalAccountLoaded] = useState(false);
-    const [lastTerminalAccountLoadedKey, setLastTerminalAccountLoadedKey] = useState<string | null>(null);
+    const [lastTerminalAccountId, setLastTerminalAccountId] = useState<string | null>(
+        () => readLastTerminalAccountId(TERMINAL_LAST_ACCOUNT_GLOBAL_STORAGE_KEY),
+    );
+    const [isLastTerminalAccountLoaded, setIsLastTerminalAccountLoaded] = useState(
+        () => Boolean(readLastTerminalAccountId(TERMINAL_LAST_ACCOUNT_GLOBAL_STORAGE_KEY)),
+    );
+    const [lastTerminalAccountLoadedKey, setLastTerminalAccountLoadedKey] = useState<string | null>(
+        () => (
+            readLastTerminalAccountId(TERMINAL_LAST_ACCOUNT_GLOBAL_STORAGE_KEY)
+                ? TERMINAL_LAST_ACCOUNT_GLOBAL_STORAGE_KEY
+                : null
+        ),
+    );
+    const [terminalLaunchAccountHint, setTerminalLaunchAccountHint] = useState<DashboardTradingAccount | null>(
+        () => readTerminalLaunchAccountHint(accountIdFromUrl),
+    );
     const lastTerminalAccountStorageKey = useMemo(
         () => getTerminalLastAccountStorageKey(user?.id),
         [user?.id],
     );
     const isLastTerminalAccountReady =
         isLastTerminalAccountLoaded &&
-        lastTerminalAccountLoadedKey === lastTerminalAccountStorageKey;
+        (
+            lastTerminalAccountLoadedKey === lastTerminalAccountStorageKey ||
+            lastTerminalAccountLoadedKey === TERMINAL_LAST_ACCOUNT_GLOBAL_STORAGE_KEY
+        );
 
     const normalizeAccountLookup = useCallback((value: string | null | undefined): string => {
         const trimmed = value?.trim() ?? '';
@@ -2561,8 +2949,17 @@ function TradingDashboardInner() {
             if (mt5Match) return mt5Match;
         }
 
-        return tradingAccounts.find(matchesLookup) ?? null;
-    }, [normalizeAccountLookup, tradingAccounts]);
+        const storeMatch = tradingAccounts.find(matchesLookup);
+        if (storeMatch) {
+            return storeMatch;
+        }
+
+        if (terminalLaunchAccountHint && matchesLookup(terminalLaunchAccountHint)) {
+            return terminalLaunchAccountHint;
+        }
+
+        return null;
+    }, [normalizeAccountLookup, terminalLaunchAccountHint, tradingAccounts]);
 
     const getTerminalSessionAccountId = useCallback((account: DashboardTradingAccount): string => {
         const login = normalizeAccountLookup(account.accountNumber || account.credentials?.login);
@@ -2571,6 +2968,21 @@ function TradingDashboardInner() {
         }
 
         return account.id;
+    }, [normalizeAccountLookup]);
+    const normalizeTerminalSessionAccountId = useCallback((value: string | null | undefined): string | null => {
+        const trimmed = value?.trim() ?? '';
+        if (!trimmed) {
+            return null;
+        }
+
+        const normalizedLogin = normalizeAccountLookup(trimmed);
+        if (/^\d+$/.test(normalizedLogin)) {
+            return `mt5-${normalizedLogin}`;
+        }
+
+        // Account DB ids can still be resolved by the terminal-session API once
+        // the backend snapshot is available. Keep only URL/path-safe values here.
+        return /^[A-Za-z0-9._:-]+$/.test(trimmed) ? trimmed : null;
     }, [normalizeAccountLookup]);
 
     const defaultMt5Account = useMemo<DashboardTradingAccount | null>(() => {
@@ -2600,22 +3012,51 @@ function TradingDashboardInner() {
     }, [normalizeAccountLookup, tradingAccounts]);
 
     useEffect(() => {
+        const rememberedAccountId = readLastTerminalAccountId(TERMINAL_LAST_ACCOUNT_GLOBAL_STORAGE_KEY);
+        if (rememberedAccountId?.trim()) {
+            setLastTerminalAccountId(rememberedAccountId.trim());
+        }
+        setLastTerminalAccountLoadedKey(TERMINAL_LAST_ACCOUNT_GLOBAL_STORAGE_KEY);
+        setIsLastTerminalAccountLoaded(true);
+    }, []);
+
+    useEffect(() => {
+        setTerminalLaunchAccountHint(readTerminalLaunchAccountHint(accountIdFromUrl));
+    }, [accountIdFromUrl]);
+
+    useEffect(() => {
         if (isAuthLoading) {
             return;
         }
 
-        setLastTerminalAccountId(readLastTerminalAccountId(lastTerminalAccountStorageKey));
-        setLastTerminalAccountLoadedKey(lastTerminalAccountStorageKey);
+        const scopedAccountId = readLastTerminalAccountId(lastTerminalAccountStorageKey);
+        const rememberedAccountId = readFirstLastTerminalAccountId(
+            lastTerminalAccountStorageKey,
+            TERMINAL_LAST_ACCOUNT_GLOBAL_STORAGE_KEY,
+        );
+
+        setLastTerminalAccountId(rememberedAccountId);
+        setLastTerminalAccountLoadedKey(
+            scopedAccountId?.trim()
+                ? lastTerminalAccountStorageKey
+                : TERMINAL_LAST_ACCOUNT_GLOBAL_STORAGE_KEY,
+        );
         setIsLastTerminalAccountLoaded(true);
     }, [isAuthLoading, lastTerminalAccountStorageKey]);
 
     const activeTradingAccount = useMemo<DashboardTradingAccount | null>(() => {
-        if (tradingAccounts.length === 0) {
-            return null;
+        if (terminalLaunchSession.account) {
+            return terminalLaunchSession.account;
         }
 
         if (accountIdFromUrl) {
             return findTradingAccountByLookup(accountIdFromUrl);
+        }
+
+        if (tradingAccounts.length === 0) {
+            return isRestorableTerminalAccount(terminalLaunchAccountHint)
+                ? terminalLaunchAccountHint
+                : null;
         }
 
         if (!isLastTerminalAccountReady) {
@@ -2634,16 +3075,25 @@ function TradingDashboardInner() {
         findTradingAccountByLookup,
         isLastTerminalAccountReady,
         lastTerminalAccountId,
+        terminalLaunchAccountHint,
+        terminalLaunchSession.account,
         tradingAccounts.length,
     ]);
 
     const activeAccountId = activeTradingAccount?.id ?? '';
     const connectAccountId =
-        activeTradingAccount &&
+        terminalLaunchSession.accountId ??
+        (activeTradingAccount &&
         (activeTradingAccount.platform === 'mt5' || !activeTradingAccount.platform) &&
         activeTradingAccount.status !== 'Archived'
             ? getTerminalSessionAccountId(activeTradingAccount)
-            : null;
+            : null) ??
+        (!terminalLaunchSession.isActive
+            ? normalizeTerminalSessionAccountId(accountIdFromUrl) ??
+                (isLastTerminalAccountReady
+                    ? normalizeTerminalSessionAccountId(lastTerminalAccountId)
+                    : null)
+            : null);
     const persistLastTerminalAccount = useCallback((account: DashboardTradingAccount | null | undefined) => {
         if (!account || !isRestorableTerminalAccount(account)) {
             return;
@@ -2651,16 +3101,34 @@ function TradingDashboardInner() {
 
         const terminalAccountId = getTerminalSessionAccountId(account);
         writeLastTerminalAccountId(lastTerminalAccountStorageKey, terminalAccountId);
+        writeLastTerminalAccountId(TERMINAL_LAST_ACCOUNT_GLOBAL_STORAGE_KEY, terminalAccountId);
         setLastTerminalAccountId(terminalAccountId);
         setLastTerminalAccountLoadedKey(lastTerminalAccountStorageKey);
         setIsLastTerminalAccountLoaded(true);
     }, [getTerminalSessionAccountId, lastTerminalAccountStorageKey]);
 
     useEffect(() => {
+        if (terminalLaunchSession.isActive) {
+            return;
+        }
+
         persistLastTerminalAccount(activeTradingAccount);
-    }, [activeTradingAccount, persistLastTerminalAccount]);
+    }, [activeTradingAccount, persistLastTerminalAccount, terminalLaunchSession.isActive]);
 
     useEffect(() => {
+        if (terminalLaunchSession.isActive || !connectAccountId) {
+            return;
+        }
+
+        writeLastTerminalAccountId(lastTerminalAccountStorageKey, connectAccountId);
+        writeLastTerminalAccountId(TERMINAL_LAST_ACCOUNT_GLOBAL_STORAGE_KEY, connectAccountId);
+    }, [connectAccountId, lastTerminalAccountStorageKey, terminalLaunchSession.isActive]);
+
+    useEffect(() => {
+        if (terminalLaunchSession.isActive) {
+            return;
+        }
+
         if (!accountIdFromUrl || !connectAccountId) {
             return;
         }
@@ -2670,12 +3138,19 @@ function TradingDashboardInner() {
         }
 
         router.replace(`/terminal?accountId=${encodeURIComponent(connectAccountId)}`);
-    }, [accountIdFromUrl, connectAccountId, normalizeAccountLookup, router]);
+    }, [accountIdFromUrl, connectAccountId, normalizeAccountLookup, router, terminalLaunchSession.isActive]);
 
     const {
-        status: connectStatus,
-        error: connectError,
-    } = useAutoConnectTrading(connectAccountId);
+        status: legacyConnectStatus,
+        error: legacyConnectError,
+    } = useAutoConnectTrading(terminalLaunchSession.isActive ? null : connectAccountId);
+    const connectStatus = terminalLaunchSession.isActive
+        ? terminalLaunchSession.status
+        : legacyConnectStatus;
+    const connectError = terminalLaunchSession.isActive
+        ? terminalLaunchSession.error
+        : legacyConnectError;
+    const shouldUseTerminalRestPositions = !terminalLaunchSession.isActive;
     const accountSessionScopeId = useMemo(
         () => (
             connectAccountId && storeSession
@@ -2753,7 +3228,7 @@ function TradingDashboardInner() {
     ]);
 
     const activeGroupSymbolsState = useGroupActiveSymbols(connectAccountId, {
-        disabled: !connectAccountId || terminalConnectionStatus !== 'ready',
+        disabled: terminalLaunchSession.isActive || !connectAccountId || terminalConnectionStatus !== 'ready',
     });
     const activeGroupDisplaySymbols = useMemo(
         () => getTerminalDisplaySymbols(activeGroupSymbolsState.symbols),
@@ -2766,45 +3241,12 @@ function TradingDashboardInner() {
     const [selectedSymbol, setSelectedSymbol] = useState('');
     const [selectedSymbolAccountId, setSelectedSymbolAccountId] = useState<string | null>(null);
     const [openTabs, setOpenTabs] = useState<string[]>([]);
-    const [mountedTabs, setMountedTabs] = useState<Set<string>>(new Set());
-
-    // Immediately mount the active tab
-    useEffect(() => {
-        if (selectedSymbol) {
-            setMountedTabs(prev => {
-                if (prev.has(selectedSymbol)) return prev;
-                const next = new Set(prev);
-                next.add(selectedSymbol);
-                return next;
-            });
-        }
-    }, [selectedSymbol]);
-
-    // Progressively pre-load background tabs to make switching 100% instant without burst-crashing the gateway
-    useEffect(() => {
-        if (!selectedSymbol || openTabs.length === 0) return;
-        
-        const unmountedTabs = openTabs.filter(tab => !mountedTabs.has(tab));
-        if (unmountedTabs.length === 0) return;
-
-        // Wait 1.5s before mounting the next background tab to stagger the heavy OHLC requests
-        const timer = setTimeout(() => {
-            setMountedTabs(prev => {
-                if (prev.has(unmountedTabs[0])) return prev;
-                const next = new Set(prev);
-                next.add(unmountedTabs[0]);
-                return next;
-            });
-        }, 1500);
-
-        return () => clearTimeout(timer);
-    }, [openTabs, mountedTabs, selectedSymbol]);
 
     const [watchlistSymbols, setWatchlistSymbols] = useState<string[]>([]);
     const [visibleMarketSearchSymbols, setVisibleMarketSearchSymbols] = useState<string[]>([]);
     const [terminalPreferences, setTerminalPreferences] = useState<TerminalPreferences | null>(null);
     const [terminalPreferencesLoaded, setTerminalPreferencesLoaded] = useState(false);
-    const [chartTimeframeMinutes, setChartTimeframeMinutes] = useState(1);
+    const [chartTimeframeMinutes, setChartTimeframeMinutes] = useState(TERMINAL_DEFAULT_TIMEFRAME_MINUTES);
     const [chartType, setChartType] = useState<TerminalChartType>('Candles');
     const [chartLayoutPanes, setChartLayoutPanes] = useState<TerminalChartLayoutPanes>(1);
     const [chartBarSpacing, setChartBarSpacing] = useState<number | null>(null);
@@ -2831,12 +3273,98 @@ function TradingDashboardInner() {
         failures: number;
         retryAfterUntil?: number;
     }>>(new Map());
+    const ohlcHistoryWarmupRetryTimeoutsRef = useRef<Set<number>>(new Set());
     const selectedOhlcHistoryBackfillTimerRef = useRef<{
         key: string;
         timeoutId: number;
     } | null>(null);
+    const switchOhlcPrefetchTimerRef = useRef<number | null>(null);
     const symbolCatalogRefreshInFlightRef = useRef(false);
     const hasAnyLiveQuote = livePriceSymbolKey.length > 0;
+    const clearOhlcWarmupTimers = useCallback(() => {
+        ohlcHistoryWarmupRetryTimeoutsRef.current.forEach((timeoutId) => {
+            window.clearTimeout(timeoutId);
+        });
+        ohlcHistoryWarmupRetryTimeoutsRef.current.clear();
+
+        if (switchOhlcPrefetchTimerRef.current !== null) {
+            window.clearTimeout(switchOhlcPrefetchTimerRef.current);
+            switchOhlcPrefetchTimerRef.current = null;
+        }
+    }, []);
+    useEffect(() => {
+        markTerminalBootMilestone('mounted', {
+            accountIdFromUrl: accountIdFromUrl ?? null,
+            hasRememberedAccount: Boolean(lastTerminalAccountId),
+        });
+    }, [accountIdFromUrl, lastTerminalAccountId, markTerminalBootMilestone]);
+    useEffect(() => {
+        if (!isAuthLoading) {
+            markTerminalBootMilestone('auth-ready', {
+                hasUser: Boolean(user),
+                userScopedLastAccountKey: Boolean(lastTerminalAccountStorageKey),
+            });
+        }
+    }, [isAuthLoading, lastTerminalAccountStorageKey, markTerminalBootMilestone, user]);
+    useEffect(() => {
+        if (isLastTerminalAccountReady) {
+            markTerminalBootMilestone('last-account-ready', {
+                accountId: lastTerminalAccountId ?? null,
+                source: lastTerminalAccountLoadedKey,
+            });
+        }
+    }, [
+        isLastTerminalAccountReady,
+        lastTerminalAccountId,
+        lastTerminalAccountLoadedKey,
+        markTerminalBootMilestone,
+    ]);
+    useEffect(() => {
+        if (connectAccountId) {
+            markTerminalBootMilestone('connect-account-ready', {
+                accountId: connectAccountId,
+                hasHydratedAccount: Boolean(activeTradingAccount),
+            });
+        }
+    }, [activeTradingAccount, connectAccountId, markTerminalBootMilestone]);
+    useEffect(() => {
+        markTerminalBootMilestone(`terminal-status:${terminalConnectionStatus}`, {
+            connectStatus,
+            storeConnectionStatus,
+            storeSymbolCount,
+            storePriceCount,
+            storePositionCount,
+        });
+    }, [
+        connectStatus,
+        markTerminalBootMilestone,
+        storeConnectionStatus,
+        storePositionCount,
+        storePriceCount,
+        storeSymbolCount,
+        terminalConnectionStatus,
+    ]);
+    useEffect(() => {
+        if (storeSymbolCount > 0) {
+            markTerminalBootMilestone('symbols-ready', {
+                count: storeSymbolCount,
+            });
+        }
+    }, [markTerminalBootMilestone, storeSymbolCount]);
+    useEffect(() => {
+        if (hasAnyLiveQuote) {
+            markTerminalBootMilestone('quotes-ready', {
+                count: storePriceCount,
+            });
+        }
+    }, [hasAnyLiveQuote, markTerminalBootMilestone, storePriceCount]);
+    useEffect(() => {
+        if (storePositionCount > 0) {
+            markTerminalBootMilestone('positions-ready', {
+                count: storePositionCount,
+            });
+        }
+    }, [markTerminalBootMilestone, storePositionCount]);
     latestStorePricesRef.current = useWebtraderStore.getState().prices;
     const selectedBrokerSymbol = useMemo(
         () => resolveExactSymbolName(
@@ -3064,10 +3592,14 @@ function TradingDashboardInner() {
     const [isSnapshotLoading, setIsSnapshotLoading] = useState(
         () => useTradingStore.getState().tradingAccounts.length === 0,
     );
-    // Safety timeout: after 10 s always show the terminal even if not fully connected.
+    // Keep hard refreshes feeling instant: give snapshot/local account lookup a
+    // short grace period, then mount the terminal and let data hydrate in-panel.
     const [loadingTimedOut, setLoadingTimedOut] = useState(false);
     useEffect(() => {
-        const t = setTimeout(() => setLoadingTimedOut(true), 10_000);
+        const t = setTimeout(
+            () => setLoadingTimedOut(true),
+            INITIAL_TERMINAL_ACCOUNT_DATA_GATE_TIMEOUT_MS,
+        );
         return () => clearTimeout(t);
     }, []);
     const [releasedInitialTerminalGateKey, setReleasedInitialTerminalGateKey] = useState<string | null>(null);
@@ -3081,6 +3613,7 @@ function TradingDashboardInner() {
         error: null,
         warning: null,
     });
+    const [optimisticOpenPositions, setOptimisticOpenPositions] = useState<OptimisticTerminalPosition[]>([]);
     const hasResolvedOpenPositionsRef = useRef(false);
     const hasShownInitialPositionsLoadingRef = useRef(false);
     const positionsRefreshRequestSeqRef = useRef(0);
@@ -3115,14 +3648,44 @@ function TradingDashboardInner() {
         [connectAccountId],
     );
     const activePositionsAccountKeyRef = useRef<string | null>(activePositionsAccountKey);
+    const restoredFrontendLaunchCacheKeyRef = useRef<string | null>(null);
     const positionsByAccountRef = useRef<Map<string, WebtraderPosition[]>>(new Map());
     const suppressNextEmptyPositionsCacheRef = useRef(false);
+    const [frontendLaunchCacheRestoreState, setFrontendLaunchCacheRestoreState] = useState<TerminalFrontendLaunchRestoreState>({
+        accountId: null,
+        hasAccountInfo: false,
+        hasPositions: false,
+        hasSymbols: false,
+        hasSelectedSymbol: false,
+    });
     const applyPositionsForActiveAccount = useCallback((positions: WebtraderPosition[]) => {
         if (activePositionsAccountKey) {
             positionsByAccountRef.current.set(activePositionsAccountKey, positions);
         }
         setStorePositions(positions);
     }, [activePositionsAccountKey, setStorePositions]);
+    const removeClosedPositionsFromActiveAccount = useCallback((tickets: readonly number[]) => {
+        const ticketSet = new Set(
+            tickets.filter((ticket) => Number.isFinite(ticket) && ticket > 0),
+        );
+        if (ticketSet.size === 0) return;
+
+        for (const ticket of ticketSet) {
+            useWebtraderStore.getState().removePosition(ticket);
+        }
+
+        const nextPositions = useWebtraderStore
+            .getState()
+            .positions
+            .filter((position) => !ticketSet.has(position.ticket));
+
+        if (activePositionsAccountKey) {
+            positionsByAccountRef.current.set(activePositionsAccountKey, nextPositions);
+        }
+
+        hasResolvedOpenPositionsRef.current = true;
+        setPositionsLoadState({ isLoading: false, error: null, warning: null });
+    }, [activePositionsAccountKey]);
     const latestClosedHistoryAccountIdRef = useRef(connectAccountId);
     const latestClosedHistoryClientRef = useRef(storeWsClient);
     const closedHistoryRequestSeqRef = useRef(0);
@@ -3131,7 +3694,137 @@ function TradingDashboardInner() {
         activePositionsAccountKeyRef.current = activePositionsAccountKey;
     }, [activePositionsAccountKey]);
 
-    useLayoutEffect(() => {
+    useEffect(() => {
+        if (!connectAccountId) {
+            return;
+        }
+
+        const restoreKey = `${connectAccountId}:${activePositionsAccountKey ?? 'pending-login'}`;
+        if (restoredFrontendLaunchCacheKeyRef.current === restoreKey) {
+            return;
+        }
+
+        restoredFrontendLaunchCacheKeyRef.current = restoreKey;
+        const snapshot = readTerminalFrontendLaunchSnapshot(connectAccountId);
+        if (!snapshot) {
+            setFrontendLaunchCacheRestoreState({
+                accountId: connectAccountId,
+                hasAccountInfo: false,
+                hasPositions: false,
+                hasSymbols: false,
+                hasSelectedSymbol: false,
+            });
+            return;
+        }
+
+        const cachedSymbols = snapshot.symbols ?? [];
+        const cachedPositionsPayload = snapshot.positions ?? [];
+        const hasCachedSymbols = cachedSymbols.length > 0;
+        const hasCachedPositions = Array.isArray(snapshot.positions);
+        const hasCachedSelectedSymbol = Boolean(snapshot.selectedSymbol);
+
+        setFrontendLaunchCacheRestoreState({
+            accountId: connectAccountId,
+            hasAccountInfo: Boolean(snapshot.accountInfo),
+            hasPositions: hasCachedPositions,
+            hasSymbols: hasCachedSymbols,
+            hasSelectedSymbol: hasCachedSelectedSymbol,
+        });
+
+        if (snapshot.accountInfo) {
+            setStoreAccountInfo(snapshot.accountInfo);
+        }
+
+        if (hasCachedSymbols) {
+            setStoreSymbols(cachedSymbols);
+            setStoreIsLoadingSymbols(false);
+        }
+
+        if (hasCachedPositions) {
+            const cachedPositions = filterTerminalPositionsForAccount(
+                reviveTerminalLaunchPositions(cachedPositionsPayload),
+                connectAccountId,
+            );
+            if (activePositionsAccountKey) {
+                positionsByAccountRef.current.set(activePositionsAccountKey, cachedPositions);
+            }
+            setStorePositions(cachedPositions);
+            hasResolvedOpenPositionsRef.current = true;
+            setPositionsLoadState({ isLoading: false, error: null, warning: null });
+        }
+
+        if (
+            snapshot.selectedSymbol &&
+            !selectedSymbol &&
+            (!selectedSymbolAccountId || selectedSymbolAccountId === connectAccountId)
+        ) {
+            setSelectedSymbol(snapshot.selectedSymbol);
+            setSelectedSymbolAccountId(connectAccountId);
+            setOpenTabs((current) => upsertUniqueTerminalSymbol(current, snapshot.selectedSymbol ?? ''));
+            setWatchlistSymbols((current) => upsertUniqueTerminalSymbol(current, snapshot.selectedSymbol ?? ''));
+        }
+
+        markTerminalBootMilestone('frontend-launch-cache-restored', {
+            accountId: connectAccountId,
+            symbolCount: cachedSymbols.length,
+            positionCount: cachedPositionsPayload.length,
+            ageMs: Date.now() - snapshot.updatedAtMs,
+        });
+    }, [
+        activePositionsAccountKey,
+        connectAccountId,
+        markTerminalBootMilestone,
+        selectedSymbol,
+        selectedSymbolAccountId,
+        setStoreAccountInfo,
+        setStoreIsLoadingSymbols,
+        setStorePositions,
+        setStoreSymbols,
+    ]);
+
+    const frontendLaunchCachePositions = useMemo(
+        () => filterTerminalPositionsForAccount(storePositions, connectAccountId),
+        [connectAccountId, storePositions],
+    );
+    const frontendLaunchCachePositionSignature = useMemo(
+        () => getTerminalPositionExecutionSignature(frontendLaunchCachePositions),
+        [frontendLaunchCachePositions],
+    );
+    const frontendLaunchCacheAccountInfoSignature = useMemo(
+        () => getTerminalAccountInfoSignature(storeAccountInfo),
+        [storeAccountInfo],
+    );
+
+    useEffect(() => {
+        if (!connectAccountId) {
+            return;
+        }
+
+        const timeoutId = window.setTimeout(() => {
+            writeTerminalFrontendLaunchSnapshot(connectAccountId, {
+                source: 'terminal-runtime',
+                accountInfo: storeAccountInfo ?? undefined,
+                positions: hasResolvedOpenPositionsRef.current || frontendLaunchCachePositions.length > 0
+                    ? frontendLaunchCachePositions
+                    : undefined,
+                symbols: storeSymbols.length > 0 ? storeSymbols : undefined,
+                selectedSymbol: selectedSymbol || undefined,
+            });
+        }, 250);
+
+        return () => window.clearTimeout(timeoutId);
+    }, [
+        connectAccountId,
+        frontendLaunchCacheAccountInfoSignature,
+        frontendLaunchCachePositionSignature,
+        frontendLaunchCachePositions,
+        selectedSymbol,
+        storeAccountInfo,
+        storeSymbolCatalogKey,
+        storeSymbols,
+    ]);
+
+    useEffect(() => {
         const previousSource = latestPositionsRefreshSourceRef.current;
         const sourceChanged =
             previousSource.accountId !== connectAccountId ||
@@ -3175,7 +3868,7 @@ function TradingDashboardInner() {
     }, [activePositionsAccountKey, connectAccountId, setStorePositions, storeWsClient]);
 
     useEffect(() => {
-        if (!connectAccountId) {
+        if (!connectAccountId || !shouldUseTerminalRestPositions) {
             return;
         }
 
@@ -3227,7 +3920,7 @@ function TradingDashboardInner() {
                 window.clearTimeout(retryTimeoutId);
             }
         };
-    }, [applyPositionsForActiveAccount, connectAccountId]);
+    }, [applyPositionsForActiveAccount, connectAccountId, shouldUseTerminalRestPositions]);
 
     useEffect(() => {
         latestClosedHistoryAccountIdRef.current = connectAccountId;
@@ -3324,8 +4017,9 @@ function TradingDashboardInner() {
                 positionsRefreshSettleTimeoutRef.current = null;
             }
             positionsRefreshSettleDeadlineRef.current = null;
+            clearOhlcWarmupTimers();
         };
-    }, []);
+    }, [clearOhlcWarmupTimers]);
     const [quoteFeedWarning, setQuoteFeedWarning] = useState<string | null>(null);
     const [chartHistoryStatus, setChartHistoryStatus] = useState<ChartHistoryStatus | null>(null);
     const activeChartSymbolRef = useRef(selectedBrokerSymbol);
@@ -3549,11 +4243,12 @@ function TradingDashboardInner() {
         setQuoteFeedWarning(null);
     }, [connectAccountId]);
 
-    useLayoutEffect(() => {
+    useEffect(() => {
         hasInitializedTerminalSymbolsRef.current = false;
         isInitialOhlcPrimedRef.current = false;
         initializedTerminalStateKeyRef.current = null;
         persistedTerminalStateKeyRef.current = null;
+        clearOhlcWarmupTimers();
         requestedOhlcHistoryRef.current.clear();
         requestedOhlcRepairRef.current.clear();
         if (selectedOhlcHistoryBackfillTimerRef.current) {
@@ -3570,15 +4265,17 @@ function TradingDashboardInner() {
         setSelectedSymbolAccountId(null);
         setOpenTabs((current) => current.length === 0 ? current : []);
         setWatchlistSymbols((current) => current.length === 0 ? current : []);
+        setOptimisticOpenPositions((current) => current.length === 0 ? current : []);
         terminalBootstrapQuotePrewarmKeyRef.current = null;
         terminalBootstrapHistoryPrewarmKeyRef.current = null;
+        watchlistOhlcPrewarmKeyRef.current = null;
 
         if (terminalPreferencesPersistTimerRef.current !== null) {
             clearTimeout(terminalPreferencesPersistTimerRef.current);
             terminalPreferencesPersistTimerRef.current = null;
         }
 
-        if (!connectAccountId) {
+        if (!connectAccountId || terminalLaunchSession.isActive) {
             setTerminalPreferencesLoaded(true);
             return;
         }
@@ -3604,7 +4301,7 @@ function TradingDashboardInner() {
         return () => {
             isCancelled = true;
         };
-    }, [connectAccountId]);
+    }, [clearOhlcWarmupTimers, connectAccountId, terminalLaunchSession.isActive]);
 
     useEffect(() => {
         if (terminalConnectionStatus !== 'ready' || !hasAnyLiveQuote) {
@@ -3632,6 +4329,7 @@ function TradingDashboardInner() {
 
         const loadSnapshot = async () => {
             setIsSnapshotLoading(true);
+            const startedAt = Date.now();
 
             try {
                 const response = await fetch('/api/private/dashboard/snapshot', { cache: 'no-store' });
@@ -3644,9 +4342,19 @@ function TradingDashboardInner() {
                     const p = payload as Record<string, unknown>;
                     const safeSnapshot = Array.isArray(p.tradingAccounts) ? p : { tradingAccounts: [], ...p };
                     hydrateFromSnapshot(safeSnapshot as unknown as Parameters<typeof hydrateFromSnapshot>[0]);
+                    markTerminalBootMilestone('snapshot-ready', {
+                        elapsedMs: Date.now() - startedAt,
+                        accountCount: Array.isArray(safeSnapshot.tradingAccounts)
+                            ? safeSnapshot.tradingAccounts.length
+                            : 0,
+                    });
                 }
             } catch (error) {
                 if (!isCancelled) {
+                    markTerminalBootMilestone('snapshot-failed', {
+                        elapsedMs: Date.now() - startedAt,
+                        error: error instanceof Error ? error.message : String(error),
+                    });
                     handleShowToast(
                         'error',
                         'Snapshot unavailable',
@@ -3665,7 +4373,7 @@ function TradingDashboardInner() {
         return () => {
             isCancelled = true;
         };
-    }, [handleShowToast, hydrateFromSnapshot]);
+    }, [handleShowToast, hydrateFromSnapshot, markTerminalBootMilestone]);
 
     useEffect(() => {
         if (!connectAccountId) {
@@ -4137,7 +4845,7 @@ function TradingDashboardInner() {
     }, [applyPositionsHeight, commitPositionsHeight]);
 
     const subscribeRealtimeSymbols = useCallback((symbols: string[]) => {
-        const nextSymbols = resolveQuoteSubscriptionSymbolList(
+        const requestedSymbols = resolveQuoteSubscriptionSymbolList(
             storeSymbols,
             symbols,
             latestStorePricesRef.current,
@@ -4146,13 +4854,26 @@ function TradingDashboardInner() {
 
         if (
             !isQuoteClientReady ||
-            nextSymbols.length === 0
+            requestedSymbols.length === 0
         ) {
             return;
         }
 
         const client = quoteWsClient;
         if (!client) {
+            return;
+        }
+
+        const coveredSymbols = uniqueQuoteSubscriptionSymbols([
+            ...(marketQuoteSubscriptionsRef.current?.client === client
+                ? marketQuoteSubscriptionsRef.current.symbols
+                : []),
+            ...(selectedQuoteSubscriptionsRef.current?.client === client
+                ? selectedQuoteSubscriptionsRef.current.symbols
+                : []),
+        ]);
+        const nextSymbols = getUncoveredSubscriptionSymbols(requestedSymbols, coveredSymbols);
+        if (nextSymbols.length === 0) {
             return;
         }
 
@@ -4248,13 +4969,17 @@ function TradingDashboardInner() {
                     // needing the user to switch tabs or reconnect.
                     if (retryIndex < MAX_RETRIES) {
                         const delayMs = RETRY_DELAYS_MS[retryIndex];
-                        window.setTimeout(
-                            () => void runHistoryWarmupRequest(
-                                { symbol, requestKey },
-                                retryIndex + 1,
-                            ),
+                        const timeoutId = window.setTimeout(
+                            () => {
+                                ohlcHistoryWarmupRetryTimeoutsRef.current.delete(timeoutId);
+                                void runHistoryWarmupRequest(
+                                    { symbol, requestKey },
+                                    retryIndex + 1,
+                                );
+                            },
                             delayMs,
                         );
+                        ohlcHistoryWarmupRetryTimeoutsRef.current.add(timeoutId);
                     }
                 } else {
                     const currentLimit = requestedOhlcHistoryRef.current.get(requestKey) ?? 0;
@@ -4319,6 +5044,15 @@ function TradingDashboardInner() {
     useEffect(() => {
         requestOhlcHistoryForSymbolsRef.current = requestOhlcHistoryForSymbols;
     }, [requestOhlcHistoryForSymbols]);
+
+    useEffect(() => {
+        clearOhlcWarmupTimers();
+    }, [
+        clearOhlcWarmupTimers,
+        connectAccountId,
+        selectedBrokerSymbol,
+        selectedChartTimeframeMinutes,
+    ]);
 
     const requestSelectedOhlcHistory = useCallback((
         symbol: string,
@@ -5066,14 +5800,17 @@ function TradingDashboardInner() {
             hasAppliedNonEmptySnapshot = hasAppliedNonEmptySnapshot || scopedPositions.length > 0;
             return true;
         };
-        const restCachePositionsRequest = fetchTerminalRestPositions(connectAccountId)
-            .catch((error) => {
-                console.warn('[Terminal] Immediate REST positions cache lookup failed', {
-                    accountId: connectAccountId,
-                    error: error instanceof Error ? error.message : String(error),
-                });
-                return null;
-            });
+        const restCachePositionsRequest: Promise<WebtraderPosition[] | null> =
+            shouldUseTerminalRestPositions
+                ? fetchTerminalRestPositions(connectAccountId)
+                    .catch((error) => {
+                        console.warn('[Terminal] Immediate REST positions cache lookup failed', {
+                            accountId: connectAccountId,
+                            error: error instanceof Error ? error.message : String(error),
+                        });
+                        return null;
+                    })
+                : Promise.resolve(null);
 
         void restCachePositionsRequest.then((positions) => {
             if (positions) {
@@ -5096,6 +5833,10 @@ function TradingDashboardInner() {
                 }
 
                 if (hasAppliedSnapshot || positions.length > 0) {
+                    return;
+                }
+
+                if (!shouldUseTerminalRestPositions) {
                     return;
                 }
 
@@ -5137,6 +5878,10 @@ function TradingDashboardInner() {
                     return;
                 }
 
+                if (!shouldUseTerminalRestPositions) {
+                    return;
+                }
+
                 try {
                     const forcedPositions = await fetchTerminalRestPositions(connectAccountId, { force: true });
                     applyImmediatePositionsSnapshot(forcedPositions);
@@ -5158,10 +5903,20 @@ function TradingDashboardInner() {
         return () => {
             isCancelled = true;
         };
-    }, [applyPositionsForActiveAccount, connectAccountId, storeWsClient]);
+    }, [applyPositionsForActiveAccount, connectAccountId, shouldUseTerminalRestPositions, storeWsClient]);
 
     useEffect(() => {
         if (storeSymbols.length === 0) {
+            return;
+        }
+
+        if (
+            connectAccountId &&
+            terminalConnectionStatus === 'ready' &&
+            !terminalLaunchSession.isActive &&
+            currentIsFallback &&
+            !activeGroupCatalogSettled
+        ) {
             return;
         }
 
@@ -5200,49 +5955,73 @@ function TradingDashboardInner() {
         chartTimeframeMinutes,
         chartType,
         connectAccountId,
+        currentIsFallback,
+        activeGroupCatalogSettled,
         livePriceSymbolKey,
         terminalPreferences,
         terminalBootstrapState,
         terminalPreferencesBootstrapKey,
         storeSymbolCatalogKey,
         storeSymbols,
+        terminalConnectionStatus,
+        terminalLaunchSession.isActive,
         terminalPreferencesLoaded,
     ]);
 
     useEffect(() => {
-        const bootstrapPrewarmKey = `${connectAccountId ?? 'terminal'}:${storeSymbolCatalogKey}:${terminalPreferencesBootstrapKey}:${chartTimeframeMinutes}`;
+        const bootstrapQuotePrewarmKey = `${connectAccountId ?? 'terminal'}:${storeSymbolCatalogKey}:${terminalPreferencesBootstrapKey}`;
         if (
             isQuoteClientReady &&
             bootstrapQuotePrewarmSymbols.length > 0 &&
-            terminalBootstrapQuotePrewarmKeyRef.current !== bootstrapPrewarmKey
+            terminalBootstrapQuotePrewarmKeyRef.current !== bootstrapQuotePrewarmKey
         ) {
-            subscribeRealtimeSymbols(bootstrapQuotePrewarmSymbols);
-            terminalBootstrapQuotePrewarmKeyRef.current = bootstrapPrewarmKey;
+            const quoteTimer = window.setTimeout(() => {
+                subscribeRealtimeSymbols(bootstrapQuotePrewarmSymbols);
+                terminalBootstrapQuotePrewarmKeyRef.current = bootstrapQuotePrewarmKey;
+            }, TERMINAL_BOOTSTRAP_QUOTE_PREWARM_DELAY_MS);
+
+            return () => window.clearTimeout(quoteTimer);
         }
+    }, [
+        bootstrapQuotePrewarmSymbols,
+        connectAccountId,
+        isQuoteClientReady,
+        storeSymbolCatalogKey,
+        subscribeRealtimeSymbols,
+        terminalPreferencesBootstrapKey,
+    ]);
+
+    useEffect(() => {
+        const bootstrapHistoryPrewarmKey = `${connectAccountId ?? 'terminal'}:${storeSymbolCatalogKey}:${terminalPreferencesBootstrapKey}`;
+        const backgroundHistorySymbols = terminalBootstrapState.historyPrewarmSymbols.filter(
+            (symbol) => !selectedBrokerSymbol || !symbolsMatch(symbol, selectedBrokerSymbol),
+        );
 
         if (
             storeSymbols.length > 0 &&
             isOhlcHistoryClientReady &&
-            terminalBootstrapState.historyPrewarmSymbols.length > 0 &&
-            terminalBootstrapHistoryPrewarmKeyRef.current !== bootstrapPrewarmKey
+            backgroundHistorySymbols.length > 0 &&
+            terminalBootstrapHistoryPrewarmKeyRef.current !== bootstrapHistoryPrewarmKey
         ) {
-            requestOhlcHistoryForSymbols(
-                terminalBootstrapState.historyPrewarmSymbols,
-                TERMINAL_BOOTSTRAP_OHLC_HISTORY_PRIME_LIMIT,
-                chartTimeframeMinutes,
-            );
-            terminalBootstrapHistoryPrewarmKeyRef.current = bootstrapPrewarmKey;
+            const historyTimer = window.setTimeout(() => {
+                requestOhlcHistoryForSymbols(
+                    backgroundHistorySymbols,
+                    TERMINAL_SELECTED_OHLC_HISTORY_PRIME_LIMIT,
+                    chartTimeframeMinutes,
+                );
+                terminalBootstrapHistoryPrewarmKeyRef.current = bootstrapHistoryPrewarmKey;
+            }, TERMINAL_BOOTSTRAP_OHLC_HISTORY_PREWARM_DELAY_MS);
+
+            return () => window.clearTimeout(historyTimer);
         }
     }, [
         chartTimeframeMinutes,
         connectAccountId,
-        isQuoteClientReady,
         isOhlcHistoryClientReady,
         requestOhlcHistoryForSymbols,
+        selectedBrokerSymbol,
         storeSymbolCatalogKey,
         storeSymbols.length,
-        subscribeRealtimeSymbols,
-        bootstrapQuotePrewarmSymbols,
         terminalBootstrapState,
         terminalPreferencesBootstrapKey,
     ]);
@@ -5251,23 +6030,22 @@ function TradingDashboardInner() {
     // Persisted watchlists can contain broad catalogs/variants and must not fan out live OHLC.
     useEffect(() => {
         if (!isOhlcHistoryClientReady) return;
-        const boundedPrewarmSymbols = uniqueTerminalSymbols([
-            selectedBrokerSymbol,
-            ...DEFAULT_FIRST_RUN_TERMINAL_SYMBOLS,
-        ]);
+        const boundedPrewarmSymbols = uniqueTerminalSymbols(DEFAULT_FIRST_RUN_TERMINAL_SYMBOLS).filter(
+            (symbol) => !selectedBrokerSymbol || !symbolsMatch(symbol, selectedBrokerSymbol),
+        );
         if (boundedPrewarmSymbols.length === 0) return;
-        const prewarmKey = `${chartTimeframeMinutes}:${boundedPrewarmSymbols.join(',')}`;
+        const prewarmKey = `${connectAccountId ?? accountSessionScopeId ?? 'terminal'}:${selectedBrokerSymbol || 'none'}:${boundedPrewarmSymbols.join(',')}`;
         if (watchlistOhlcPrewarmKeyRef.current === prewarmKey) return;
         const timer = setTimeout(() => {
             watchlistOhlcPrewarmKeyRef.current = prewarmKey;
             requestOhlcHistoryForSymbolsRef.current(
                 boundedPrewarmSymbols,
-                TERMINAL_BOOTSTRAP_OHLC_HISTORY_PRIME_LIMIT,
+                TERMINAL_HOVER_PREFETCH_LIMIT,
                 chartTimeframeMinutes,
             );
-        }, 400);
+        }, TERMINAL_REACTIVE_OHLC_HISTORY_PREWARM_DELAY_MS);
         return () => clearTimeout(timer);
-    }, [chartTimeframeMinutes, isOhlcHistoryClientReady, selectedBrokerSymbol]);
+    }, [accountSessionScopeId, chartTimeframeMinutes, connectAccountId, isOhlcHistoryClientReady, selectedBrokerSymbol]);
 
     useEffect(() => {
         const client = quoteWsClient;
@@ -5282,7 +6060,7 @@ function TradingDashboardInner() {
                 ? selectedQuoteState.symbols
                 : [];
         const protectedSymbols = previousClient === client
-            ? selectedSubscriptionSymbols
+            ? getSymbolsFromListKey(selectedSubscriptionSymbolsKey)
             : [];
         const removedSymbols = getRemovedSubscriptionSymbols(
             previousSymbols,
@@ -5326,7 +6104,7 @@ function TradingDashboardInner() {
         activeLiveSubscriptionSymbolsKey,
         isQuoteClientReady,
         quoteWsClient,
-        selectedSubscriptionSymbols,
+        selectedSubscriptionSymbolsKey,
     ]);
 
     useEffect(() => {
@@ -5337,7 +6115,7 @@ function TradingDashboardInner() {
         const previousSymbols = previousState?.symbols ?? [];
         const nextSymbolsForPreviousClient = previousClient === client ? subscriptionSymbols : [];
         const protectedSymbols = previousClient === client
-            ? activeLiveSubscriptionSymbols
+            ? getSymbolsFromListKey(activeLiveSubscriptionSymbolsKey)
             : [];
         const removedSymbols = getRemovedSubscriptionSymbols(
             previousSymbols,
@@ -5379,7 +6157,7 @@ function TradingDashboardInner() {
             });
         });
     }, [
-        activeLiveSubscriptionSymbols,
+        activeLiveSubscriptionSymbolsKey,
         isQuoteClientReady,
         quoteWsClient,
         selectedBrokerSymbol,
@@ -5432,6 +6210,7 @@ function TradingDashboardInner() {
     useEffect(() => {
         if (
             !connectAccountId ||
+            terminalLaunchSession.isActive ||
             !terminalPreferencesLoaded ||
             !hasInitializedTerminalSymbolsRef.current ||
             storeSymbols.length === 0
@@ -5490,6 +6269,7 @@ function TradingDashboardInner() {
         };
     }, [
         connectAccountId,
+        terminalLaunchSession.isActive,
         chartBarSpacing,
         chartLayoutPanes,
         chartTimeframeMinutes,
@@ -5529,6 +6309,7 @@ function TradingDashboardInner() {
             return {
                 accountInfoUpdated: false,
                 positionsUpdated: false,
+                ordersUpdated: false,
             };
         }
 
@@ -5537,6 +6318,7 @@ function TradingDashboardInner() {
             return {
                 accountInfoUpdated: false,
                 positionsUpdated: false,
+                ordersUpdated: false,
             };
         }
 
@@ -5633,7 +6415,8 @@ function TradingDashboardInner() {
                 requestSeq: positionsRefreshRequestSeq,
             };
         }
-        const [nextPositions] = await Promise.allSettled([positionsRequest]);
+        const ordersRequest: Promise<WebtraderOrder[]> = storeWsClient.getOrders();
+        const [nextPositions, nextOrders] = await Promise.allSettled([positionsRequest, ordersRequest]);
         if (positionsRefreshInFlightRef.current?.promise === positionsRequest) {
             positionsRefreshInFlightRef.current = null;
         }
@@ -5642,13 +6425,16 @@ function TradingDashboardInner() {
             return {
                 accountInfoUpdated: false,
                 positionsUpdated: false,
+                ordersUpdated: false,
             };
         }
 
         let accountInfoUpdated = false;
         let positionsUpdated = false;
+        let ordersUpdated = false;
         let authoritativePositions = nextPositions;
         const shouldTryRestPositionsFallback =
+            shouldUseTerminalRestPositions &&
             Boolean(requestPositionsAccountId) &&
             isCurrentPositionsRefreshSource() &&
             (terminalConnectionStatus === 'ready' || terminalConnectionStatus === 'locked') &&
@@ -5680,7 +6466,13 @@ function TradingDashboardInner() {
             return {
                 accountInfoUpdated,
                 positionsUpdated,
+                ordersUpdated,
             };
+        }
+
+        if (nextOrders.status === 'fulfilled') {
+            setStoreOrders(nextOrders.value);
+            ordersUpdated = true;
         }
 
         if (authoritativePositions.status === 'fulfilled') {
@@ -5717,6 +6509,7 @@ function TradingDashboardInner() {
             return {
                 accountInfoUpdated,
                 positionsUpdated,
+                ordersUpdated,
             };
         }
 
@@ -5731,8 +6524,9 @@ function TradingDashboardInner() {
         return {
             accountInfoUpdated,
             positionsUpdated,
+            ordersUpdated,
         };
-    }, [activeTradingAccount, applyPositionsForActiveAccount, connectAccountId, setStoreAccountInfo, storeWsClient, terminalConnectionStatus]);
+    }, [activeTradingAccount, applyPositionsForActiveAccount, connectAccountId, setStoreAccountInfo, setStoreOrders, shouldUseTerminalRestPositions, storeWsClient, terminalConnectionStatus]);
 
     const schedulePostTradeRefresh = useCallback((
         delayMs: number,
@@ -5970,7 +6764,7 @@ function TradingDashboardInner() {
                     }
                 }
 
-                if (!appliedPositions && requestAccountId) {
+                if (!appliedPositions && requestAccountId && shouldUseTerminalRestPositions) {
                     try {
                         const restPositions = await fetchTerminalRestPositions(requestAccountId, { force: true });
                         if (resolved || !isCurrentAccount()) {
@@ -6025,6 +6819,7 @@ function TradingDashboardInner() {
         applyPositionsForActiveAccount,
         connectAccountId,
         setStoreAccountInfo,
+        shouldUseTerminalRestPositions,
         storeWsClient,
     ]);
 
@@ -6357,6 +7152,40 @@ function TradingDashboardInner() {
         });
     }, [getInstrumentForSymbol, storePositions]);
 
+    useEffect(() => {
+        setOptimisticOpenPositions((current) => {
+            const next = current.filter((optimisticPosition) =>
+                optimisticPosition.expiresAtMs > Date.now() &&
+                !liveTerminalPositions.some((realPosition) =>
+                    optimisticTerminalPositionMatchesReal(optimisticPosition, realPosition),
+                ),
+            );
+
+            return next.length === current.length ? current : next;
+        });
+    }, [liveTerminalPositions]);
+
+    useEffect(() => {
+        if (optimisticOpenPositions.length === 0) {
+            return;
+        }
+
+        const timeoutId = window.setTimeout(() => {
+            setOptimisticOpenPositions((current) => {
+                const now = Date.now();
+                const next = current.filter((position) => position.expiresAtMs > now);
+                return next.length === current.length ? current : next;
+            });
+        }, 1_000);
+
+        return () => window.clearTimeout(timeoutId);
+    }, [optimisticOpenPositions]);
+
+    const terminalPositions = useMemo(
+        () => mergeTerminalPositionsWithOptimistic(liveTerminalPositions, optimisticOpenPositions),
+        [liveTerminalPositions, optimisticOpenPositions],
+    );
+
     const hasAuthenticatedManualWebtraderSession = Boolean(
         !activeTradingAccount &&
         storeSession &&
@@ -6382,18 +7211,6 @@ function TradingDashboardInner() {
         [createTerminalInstrument, getSymbolInfoForInstrumentSymbol, selectedBrokerSymbol],
     );
 
-    const openTabBrokerSymbols = useMemo(() => {
-        const map = new Map<string, string>();
-        for (const tabSymbol of openTabs) {
-            map.set(tabSymbol, resolveExactSymbolName(
-                storeSymbols,
-                latestStorePricesRef.current,
-                tabSymbol
-            ));
-        }
-        return map;
-    }, [openTabs, storeSymbols, livePriceSymbolKey]);
-
     const selectedSymbolBelongsToActiveAccount = selectedSymbolAccountId === (connectAccountId ?? null);
     const tradePanelHeaderSymbol = useMemo(() => {
         const symbol = selectedInstrument?.symbol || selectedBrokerSymbol || selectedSymbol;
@@ -6409,14 +7226,30 @@ function TradingDashboardInner() {
     const selectedSymbolPositions = useMemo(
         () => {
             if (!selectedInstrument) return [];
-            const positionsToRender = liveTerminalPositions.filter((position) => symbolsMatch(position.symbol, selectedInstrument.symbol));
+            const positionsToRender = terminalPositions.filter((position) => symbolsMatch(position.symbol, selectedInstrument.symbol));
             if (activeAction) {
-                positionsToRender.push({
+                const draftVolume = orderForm.volume > 0 ? orderForm.volume : 0.01;
+                const priceTolerance = Math.max(1e-8, 1 / Math.pow(10, selectedInstrument.digits) / 2);
+                const pricesMatch = (left: number | null | undefined, right: number | null | undefined) => {
+                    const leftIsSet = typeof left === 'number' && Number.isFinite(left);
+                    const rightIsSet = typeof right === 'number' && Number.isFinite(right);
+                    if (!leftIsSet && !rightIsSet) return true;
+                    if (!leftIsSet || !rightIsSet) return false;
+                    return Math.abs(left - right) <= priceTolerance;
+                };
+                const hasMatchingLivePosition = positionsToRender.some((position) =>
+                    position.type === activeAction &&
+                    Math.abs(position.volume - draftVolume) <= 1e-9 &&
+                    pricesMatch(position.sl, orderForm.sl) &&
+                    pricesMatch(position.tp, orderForm.tp)
+                );
+
+                if (!hasMatchingLivePosition) positionsToRender.push({
                     id: 'draft-order',
                     ticket: 'draft-order',
                     symbol: selectedInstrument.symbol,
                     type: activeAction,
-                    volume: orderForm.volume > 0 ? orderForm.volume : 0.01,
+                    volume: draftVolume,
                     openPrice: activeAction === 'buy' ? selectedInstrument.ask : selectedInstrument.bid,
                     currentPrice: activeAction === 'buy' ? selectedInstrument.ask : selectedInstrument.bid,
                     profit: 0,
@@ -6431,9 +7264,8 @@ function TradingDashboardInner() {
             }
             return positionsToRender;
         },
-        [liveTerminalPositions, selectedInstrument, activeAction, orderForm],
+        [terminalPositions, selectedInstrument, activeAction, orderForm],
     );
-    const terminalPositions = liveTerminalPositions;
     const positionPriceSeedsBySymbol = useMemo(() => {
         const seeds: Record<string, number> = {};
         for (const position of terminalPositions) {
@@ -6446,6 +7278,59 @@ function TradingDashboardInner() {
         return seeds;
     }, [terminalPositions]);
     const priceDigits = selectedInstrument?.digits ?? 5;
+    const addOptimisticOpenPosition = useCallback((
+        order: {
+            symbol: string;
+            type: 'buy' | 'sell';
+            volume: number;
+            sl: number | null;
+            tp: number | null;
+        },
+        openPrice: number,
+    ) => {
+        if (!connectAccountId || openPrice <= 0 || !Number.isFinite(openPrice)) {
+            return;
+        }
+
+        const instrument = getInstrumentForSymbol(order.symbol);
+        const canonicalSymbol = instrument?.symbol ?? order.symbol;
+        const nowMs = Date.now();
+        const optimisticPosition: OptimisticTerminalPosition = {
+            accountId: connectAccountId,
+            id: `optimistic-${nowMs}-${Math.random().toString(36).slice(2, 8)}`,
+            ticket: 'Syncing',
+            symbol: canonicalSymbol,
+            type: order.type,
+            volume: order.volume,
+            openPrice,
+            currentPrice: openPrice,
+            profit: 0,
+            swap: 0,
+            commission: 0,
+            openTime: toMt5IsoString(getMt5ServerTimeMs()),
+            sl: order.sl,
+            tp: order.tp,
+            digits: instrument?.digits,
+            contractSize: instrument?.contractSize,
+            isOptimistic: true,
+            createdAtMs: nowMs,
+            expiresAtMs: nowMs + TERMINAL_OPTIMISTIC_POSITION_TTL_MS,
+        };
+
+        setOptimisticOpenPositions((current) => {
+            const withoutMatched = current.filter((existing) =>
+                existing.expiresAtMs > nowMs &&
+                !optimisticTerminalPositionMatchesReal(existing, optimisticPosition),
+            );
+
+            return [...withoutMatched, optimisticPosition];
+        });
+        setPositionsLoadState((current) => ({
+            isLoading: false,
+            error: null,
+            warning: current.warning,
+        }));
+    }, [connectAccountId, getInstrumentForSymbol]);
     useEffect(() => {
         if (terminalConnectionStatus !== 'ready' || !connectAccountId || storeSymbols.length === 0) {
             setQuoteFeedWarning(null);
@@ -6498,7 +7383,7 @@ function TradingDashboardInner() {
     }, [setStoreConnectionError, storeConnectionError, terminalConnectionStatus]);
 
     const headerAccounts = useMemo(() => {
-        return tradingAccounts.map((accountItem) => ({
+        const accounts = tradingAccounts.map((accountItem) => ({
             id: accountItem.id,
             label: accountItem.accountNumber,
             isReal: accountItem.type === 'Live',
@@ -6507,7 +7392,24 @@ function TradingDashboardInner() {
             balance: toFiniteNumber(accountItem.balance),
             currency: accountItem.currency || 'USD',
         }));
-    }, [tradingAccounts]);
+
+        if (
+            terminalLaunchSession.account &&
+            !accounts.some((accountItem) => accountItem.id === terminalLaunchSession.account?.id)
+        ) {
+            accounts.unshift({
+                id: terminalLaunchSession.account.id,
+                label: terminalLaunchSession.account.accountNumber,
+                isReal: terminalLaunchSession.account.type === 'Live',
+                isMT5: true,
+                type: 'Standard',
+                balance: toFiniteNumber(terminalLaunchSession.account.balance),
+                currency: terminalLaunchSession.account.currency || 'USD',
+            });
+        }
+
+        return accounts;
+    }, [terminalLaunchSession.account, tradingAccounts]);
 
     const userProfile = useMemo(() => {
         if (activeTradingAccount) {
@@ -6573,22 +7475,85 @@ function TradingDashboardInner() {
                 (isSymbolRefreshWarningMessage(storeConnectionError) ? storeConnectionError : null)
             : connectError || storeConnectionError || visibleQuoteFeedWarning;
     const networkConnectionError = accountConnectionWarning || activeConnectionProblem;
-    // Block the terminal UI until account/session data is settled enough to mount.
-    // The chart reveal has its own timeout that starts only after this phase.
+    const frontendLaunchCacheMatchesActiveAccount =
+        Boolean(connectAccountId) &&
+        frontendLaunchCacheRestoreState.accountId === connectAccountId;
+    const hasFrontendLaunchCacheDataForInitialRender = Boolean(
+        frontendLaunchCacheMatchesActiveAccount &&
+        (
+            frontendLaunchCacheRestoreState.hasAccountInfo ||
+            frontendLaunchCacheRestoreState.hasPositions ||
+            frontendLaunchCacheRestoreState.hasSymbols
+        )
+    );
+    const hasFrontendLaunchCachePositionsForInitialRender = Boolean(
+        frontendLaunchCacheMatchesActiveAccount &&
+        frontendLaunchCacheRestoreState.hasPositions
+    );
+    // Block only for local account discovery. Once an account candidate is known,
+    // mount the terminal shell and let websocket/session recovery hydrate in-panel.
+    const isResolvingInitialTerminalAccount =
+        !terminalLaunchSession.isActive &&
+        !accountIdFromUrl &&
+        !connectAccountId &&
+        !activeTradingAccount &&
+        !isLastTerminalAccountReady;
     const isLoadingTerminalAccountData =
+        !hasFrontendLaunchCacheDataForInitialRender &&
         !loadingTimedOut &&
         (
-            isSnapshotLoading ||
-            // Still reading localStorage ΓÇö connectAccountId not yet determined
-            (!accountIdFromUrl && !isLastTerminalAccountReady) ||
-            // Account identified but WS not ready yet
-            (
-                Boolean(connectAccountId) &&
-                terminalConnectionStatus !== 'error' &&
-                terminalConnectionStatus !== 'ready' &&
-                terminalConnectionStatus !== 'locked'
-            )
+            isResolvingInitialTerminalAccount ||
+            (isSnapshotLoading && !connectAccountId && !activeTradingAccount && !terminalLaunchSession.isActive)
         );
+    const hasTerminalAccountRestoreCandidate = Boolean(
+        connectAccountId ||
+        activeTradingAccount ||
+        terminalLaunchSession.isActive ||
+        hasAuthenticatedManualWebtraderSession ||
+        accountIdFromUrl ||
+        lastTerminalAccountId,
+    );
+    const isTerminalConnectionRestoring = Boolean(
+        hasTerminalAccountRestoreCandidate &&
+        !accountConnectionWarning &&
+        terminalConnectionStatus !== 'ready' &&
+        terminalConnectionStatus !== 'error' &&
+        terminalConnectionStatus !== 'locked'
+    );
+    const isTerminalSymbolCatalogRestoring = Boolean(
+        connectAccountId &&
+        terminalConnectionStatus === 'ready' &&
+        !accountConnectionWarning &&
+        (
+            !terminalPreferencesLoaded ||
+            storeSymbols.length === 0 ||
+            (!terminalLaunchSession.isActive && currentIsFallback && !activeGroupCatalogSettled)
+        )
+    );
+    const isTerminalSelectedInstrumentRestoring = Boolean(
+        connectAccountId &&
+        terminalConnectionStatus === 'ready' &&
+        !accountConnectionWarning &&
+        terminalPreferencesLoaded &&
+        storeSymbols.length > 0 &&
+        (
+            !hasInitializedTerminalSymbolsRef.current ||
+            (
+                selectedSymbol.trim().length > 0 &&
+                (!selectedSymbolBelongsToActiveAccount || !selectedInstrument)
+            )
+        )
+    );
+    const isTerminalRestoreInProgress = Boolean(
+        !hasFrontendLaunchCacheDataForInitialRender &&
+        (
+            isLoadingTerminalAccountData ||
+            terminalLaunchSession.isRestoring ||
+            isTerminalConnectionRestoring ||
+            isTerminalSymbolCatalogRestoring ||
+            isTerminalSelectedInstrumentRestoring
+        )
+    );
     const selectedChartReadyForInitialTerminalRender = Boolean(
         selectedSymbolBelongsToActiveAccount &&
         selectedInstrument &&
@@ -6612,12 +7577,17 @@ function TradingDashboardInner() {
     const isInitialTerminalGateReleased = releasedInitialTerminalGateKey === terminalInitialGateKey;
     const isInitialTerminalGateTimedOut = timedOutInitialTerminalGateKey === terminalInitialGateKey;
     const shouldReleaseInitialTerminalGate = Boolean(
-        isInitialTerminalGateTimedOut ||
+        (
+            isInitialTerminalGateTimedOut &&
+            !isLoadingTerminalAccountData &&
+            hasTerminalAccountRestoreCandidate
+        ) ||
         !connectAccountId ||
         terminalConnectionStatus === 'error' ||
         terminalConnectionStatus === 'locked' ||
         accountConnectionWarning ||
         activeGroupSymbolsState.error ||
+        hasFrontendLaunchCacheDataForInitialRender ||
         terminalShellReadyForInitialRender ||
         selectedChartReadyForInitialTerminalRender
     );
@@ -6635,10 +7605,17 @@ function TradingDashboardInner() {
         shouldReleaseInitialTerminalGate,
         terminalInitialGateKey,
     ]);
+    const positionsTableLoading =
+        !hasFrontendLaunchCachePositionsForInitialRender &&
+        (positionsLoadState.isLoading || terminalLaunchSession.isRestoring);
     const initialTerminalGateActive =
         !isLoadingTerminalAccountData &&
         !isInitialTerminalGateReleased &&
         !shouldReleaseInitialTerminalGate;
+    const terminalLaunchBlockingOverlayActive = Boolean(
+        terminalLaunchSession.isActive &&
+        terminalLaunchSession.status !== 'ready',
+    );
     useEffect(() => {
         if (!initialTerminalGateActive || isInitialTerminalGateTimedOut) {
             return;
@@ -6706,18 +7683,28 @@ function TradingDashboardInner() {
                 normalizedTimeframeMinutes,
             );
         }
-        for (const tf of TERMINAL_SWITCH_PREFETCH_TIMEFRAMES) {
-            if (tf === normalizedTimeframeMinutes) {
-                continue;
-            }
-            const cachedCount = getUsableTerminalOhlcHistoryBarCount(
-                ohlcService.getSyncBars(exactSymbol, tf, accountSessionScopeId),
-            );
-            if (cachedCount >= TERMINAL_SWITCH_MIN_CACHE_BARS) {
-                continue;
-            }
-            requestOhlcHistoryForSymbols([exactSymbol], TERMINAL_HOVER_PREFETCH_LIMIT, tf);
+        if (switchOhlcPrefetchTimerRef.current !== null) {
+            window.clearTimeout(switchOhlcPrefetchTimerRef.current);
         }
+        switchOhlcPrefetchTimerRef.current = window.setTimeout(() => {
+            switchOhlcPrefetchTimerRef.current = null;
+            const activeSymbol = activeChartSymbolRef.current;
+            if (activeSymbol && !symbolsMatch(activeSymbol, exactSymbol)) {
+                return;
+            }
+            for (const tf of TERMINAL_SWITCH_PREFETCH_TIMEFRAMES) {
+                if (tf === normalizedTimeframeMinutes) {
+                    continue;
+                }
+                const cachedCount = getUsableTerminalOhlcHistoryBarCount(
+                    ohlcService.getSyncBars(exactSymbol, tf, accountSessionScopeId),
+                );
+                if (cachedCount >= TERMINAL_SWITCH_MIN_CACHE_BARS) {
+                    continue;
+                }
+                requestOhlcHistoryForSymbols([exactSymbol], TERMINAL_HOVER_PREFETCH_LIMIT, tf);
+            }
+        }, TERMINAL_SWITCH_TIMEFRAME_PREFETCH_DELAY_MS);
     }, [
         accountSessionScopeId,
         chartTimeframeMinutes,
@@ -6903,6 +7890,18 @@ function TradingDashboardInner() {
                     };
 
                     if (consumeConfirmedPendingOrder()?.confirmed) {
+                        if (order.orderType === 'market') {
+                            addOptimisticOpenPosition(
+                                {
+                                    symbol: order.symbol,
+                                    type: order.type,
+                                    volume: order.volume,
+                                    sl: order.sl,
+                                    tp: order.tp,
+                                },
+                                liveMarketPrice,
+                            );
+                        }
                         void refreshLiveTradingState({ forcePositionsRefresh: true });
                         schedulePostTradeRefresh(1500);
                         return;
@@ -6950,6 +7949,18 @@ function TradingDashboardInner() {
                     const pendingOrderConfirmation = consumePendingOrderConfirmation(pendingOrderConfirmationId);
 
                     if (pendingOrderConfirmation?.confirmed) {
+                        if (order.orderType === 'market') {
+                            addOptimisticOpenPosition(
+                                {
+                                    symbol: order.symbol,
+                                    type: order.type,
+                                    volume: order.volume,
+                                    sl: order.sl,
+                                    tp: order.tp,
+                                },
+                                liveMarketPrice,
+                            );
+                        }
                         void refreshLiveTradingState({ forcePositionsRefresh: true });
                         schedulePostTradeRefresh(1500);
                         return;
@@ -6959,6 +7970,18 @@ function TradingDashboardInner() {
                         reconciliation.positionsSettled ||
                         reconciliation.tradeResultSucceeded
                     ) {
+                        if (order.orderType === 'market' && !reconciliation.positionsSettled) {
+                            addOptimisticOpenPosition(
+                                {
+                                    symbol: order.symbol,
+                                    type: order.type,
+                                    volume: order.volume,
+                                    sl: order.sl,
+                                    tp: order.tp,
+                                },
+                                liveMarketPrice,
+                            );
+                        }
                         handleShowToast(
                             'success',
                             'Order placed',
@@ -6998,6 +8021,18 @@ function TradingDashboardInner() {
                 const pendingOrderConfirmation = consumePendingOrderConfirmation(pendingOrderConfirmationId);
 
                 if (pendingOrderConfirmation?.confirmed) {
+                    if (order.orderType === 'market') {
+                        addOptimisticOpenPosition(
+                            {
+                                symbol: order.symbol,
+                                type: order.type,
+                                volume: order.volume,
+                                sl: order.sl,
+                                tp: order.tp,
+                            },
+                            liveMarketPrice,
+                        );
+                    }
                     void refreshLiveTradingState({ forcePositionsRefresh: true });
                     schedulePostTradeRefresh(1500);
                     return;
@@ -7007,6 +8042,18 @@ function TradingDashboardInner() {
                     reconciliation.positionsSettled ||
                     reconciliation.tradeResultSucceeded
                 ) {
+                    if (order.orderType === 'market' && !reconciliation.positionsSettled) {
+                        addOptimisticOpenPosition(
+                            {
+                                symbol: order.symbol,
+                                type: order.type,
+                                volume: order.volume,
+                                sl: order.sl,
+                                tp: order.tp,
+                            },
+                            liveMarketPrice,
+                        );
+                    }
                     handleShowToast(
                         'success',
                         'Order placed',
@@ -7052,6 +8099,19 @@ function TradingDashboardInner() {
                 handleShowToast('error', 'Order rejected', reason);
                 setIsOrderPanelOpen(true);
                 return;
+            }
+
+            if (order.orderType === 'market') {
+                addOptimisticOpenPosition(
+                    {
+                        symbol: order.symbol,
+                        type: order.type,
+                        volume: order.volume,
+                        sl: order.sl,
+                        tp: order.tp,
+                    },
+                    liveMarketPrice,
+                );
             }
 
             const pendingOrderConfirmation = consumePendingOrderConfirmation(pendingOrderConfirmationId);
@@ -7112,6 +8172,7 @@ function TradingDashboardInner() {
         });
     }, [
         activeTradingAccount,
+        addOptimisticOpenPosition,
         clearPendingOrderConfirmation,
         connectAccountId,
         consumePendingOrderConfirmation,
@@ -7162,6 +8223,7 @@ function TradingDashboardInner() {
                     const result = await liveClient.modifyOrder(ticket, {
                         sl: updates.sl !== undefined ? (updates.sl === null ? 0 : updates.sl) : (existingPosition?.sl ?? undefined),
                         tp: updates.tp !== undefined ? (updates.tp === null ? 0 : updates.tp) : (existingPosition?.tp ?? undefined),
+                        isPosition: true,
                     });
                     if (result.retcode !== 10009 && result.retcode !== 10008 && result.retcode !== 10010) {
                         const MT5_REJECT_REASONS: Record<number, string> = {
@@ -7273,7 +8335,7 @@ function TradingDashboardInner() {
                     }
                     // Only remove AFTER server confirms success ΓÇö prevents permanently
                     // losing position from UI if the close fails or times out
-                    useWebtraderStore.getState().removePosition(ticket);
+                    removeClosedPositionsFromActiveAccount([ticket]);
                     // Instantly add to closed trades tab using live close price
                     if (closingPosition) {
                         const closingQuote = getSafeLiveQuoteSnapshotBySymbol(
@@ -7327,14 +8389,14 @@ function TradingDashboardInner() {
             const msg = error instanceof Error ? error.message : String(error);
             if (msg.includes('Position not found')) {
                 // Position no longer exists on MT5 (SL/TP hit or closed from another terminal).
-                useWebtraderStore.getState().removePosition(Number.parseInt(id, 10));
+                removeClosedPositionsFromActiveAccount([Number.parseInt(id, 10)]);
                 handleShowToast('success', 'Position closed', `Closed trade ${id}.`);
             } else {
                 // Server rejected close ΓÇö refreshLiveTradingState() in finally restores the position
                 handleShowToast('error', 'Close failed', msg);
             }
         });
-    }, [connectAccountId, handleShowToast, liveTerminalPositions, refreshLiveTradingState, schedulePostTradeRefresh, setClosedTrades, storeWsClient, pendingPositionActions]);
+    }, [connectAccountId, handleShowToast, liveTerminalPositions, refreshLiveTradingState, removeClosedPositionsFromActiveAccount, schedulePostTradeRefresh, setClosedTrades, storeWsClient, pendingPositionActions]);
 
     const handleCloseAll = useCallback((type: string = 'all') => {
         const run = async () => {
@@ -7378,12 +8440,9 @@ function TradingDashboardInner() {
                             if (result.retcode !== 10009 && result.retcode !== 10008 && result.retcode !== 10010) {
                                 throw new Error(result.comment || `Close rejected (code ${result.retcode}).`);
                             }
-                            // Only remove after confirmed success
-                            useWebtraderStore.getState().removePosition(ticket);
                             return result;
                         } catch (err: any) {
                             if (err.message && err.message.includes('Position not found')) {
-                                useWebtraderStore.getState().removePosition(ticket);
                                 return { retcode: 10009 };
                             }
                             throw err;
@@ -7392,6 +8451,14 @@ function TradingDashboardInner() {
                 );
 
                 await refreshLiveTradingState({ forcePositionsRefresh: true });
+                const closedTickets = positionsToClose
+                    .map((position, index) => ({
+                        ticket: Number.parseInt(position.ticket, 10),
+                        result: results[index],
+                    }))
+                    .filter(({ ticket, result }) => Number.isFinite(ticket) && result?.status === 'fulfilled')
+                    .map(({ ticket }) => ticket);
+                removeClosedPositionsFromActiveAccount(closedTickets);
 
                 const failed = results.filter((result) => result.status === 'rejected').length;
                 if (failed > 0) {
@@ -7427,6 +8494,7 @@ function TradingDashboardInner() {
         handleShowToast,
         liveTerminalPositions,
         refreshLiveTradingState,
+        removeClosedPositionsFromActiveAccount,
         storeWsClient,
     ]);
 
@@ -7526,8 +8594,11 @@ function TradingDashboardInner() {
 
     return (
         <>
+        {terminalLaunchBlockingOverlayActive && (
+            <TerminalLaunchLoadingOverlay error={terminalLaunchSession.error} />
+        )}
         <div
-            aria-hidden={initialTerminalGateActive ? true : undefined}
+            aria-hidden={initialTerminalGateActive || terminalLaunchBlockingOverlayActive ? true : undefined}
             className="flex h-[100dvh] w-full min-w-0 max-w-[100dvw] flex-col overflow-hidden bg-background p-0"
         >
             {/* Header */}
@@ -7668,89 +8739,36 @@ function TradingDashboardInner() {
                         >
                             {/* Main Chart Area */}
                             <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-none bg-card md:min-h-[240px]">
-                                {selectedSymbolBelongsToActiveAccount ? (
-                                    <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-                                        {openTabs.map((tabSymbol) => {
-                                            const isActive = tabSymbol === selectedSymbol;
-                                            if (!isActive && !mountedTabs.has(tabSymbol)) return null;
-
-                                            const brokerSymbol = openTabBrokerSymbols.get(tabSymbol) || tabSymbol;
-                                            const instrument = isActive
-                                                ? selectedInstrument
-                                                : (() => {
-                                                    const info = getSymbolInfoForInstrumentSymbol(brokerSymbol);
-                                                    return info ? createTerminalInstrument(info) : null;
-                                                })();
-
-                                            if (!instrument) return null;
-
-                                            const positions = isActive
-                                                ? selectedSymbolPositions
-                                                : liveTerminalPositions.filter(p => symbolsMatch(p.symbol, instrument.symbol));
-
-                                            return (
-                                                <div 
-                                                    key={tabSymbol} 
-                                                    className={isActive 
-                                                        ? "relative flex-1 flex flex-col z-10 bg-card" 
-                                                        : "hidden"}
-                                                >
-                                                    <TradingChart
-                                                        symbol={instrument.symbol}
-                                                        accountSessionScopeId={accountSessionScopeId}
-                                                        basePrice={instrument.bid}
-                                                        instrument={instrument}
-                                                        positions={positions}
-                                                        onClosePosition={handleClosePosition}
-                                                        onUpdatePosition={handleUpdatePosition}
-                                                        onSell={handleSelectedSell}
-                                                        onBuy={handleSelectedBuy}
-                                                        onOpenOrderPanel={handleOpenTradePanel}
-                                                        isOrderPanelOpen={isOrderPanelOpen}
-                                                        onToggleOrderPanel={() => setIsOrderPanelOpen(!isOrderPanelOpen)}
-                                                        onHistoryStatusChange={handleChartHistoryStatusChange}
-                                                        timeframeMinutes={chartTimeframeMinutes}
-                                                        onTimeframeChange={setChartTimeframeMinutes}
-                                                        chartType={chartType}
-                                                        onChartTypeChange={setChartType}
-                                                        layoutPanes={chartLayoutPanes}
-                                                        onLayoutPanesChange={setChartLayoutPanes}
-                                                        chartBarSpacing={chartBarSpacing}
-                                                        onChartBarSpacingChange={setChartBarSpacing}
-                                                    />
-                                                </div>
-                                            );
-                                        })}
-                                        {openTabs.length === 0 && selectedInstrument && (
-                                            <div className="relative flex-1 flex flex-col z-10 bg-card">
-                                                <TradingChart
-                                                    symbol={selectedInstrument.symbol}
-                                                    accountSessionScopeId={accountSessionScopeId}
-                                                    basePrice={selectedInstrument.bid}
-                                                    instrument={selectedInstrument}
-                                                    positions={selectedSymbolPositions}
-                                                    onClosePosition={handleClosePosition}
-                                                    onUpdatePosition={handleUpdatePosition}
-                                                    onSell={handleSelectedSell}
-                                                    onBuy={handleSelectedBuy}
-                                                    onOpenOrderPanel={handleOpenTradePanel}
-                                                    isOrderPanelOpen={isOrderPanelOpen}
-                                                    onToggleOrderPanel={() => setIsOrderPanelOpen(!isOrderPanelOpen)}
-                                                    onHistoryStatusChange={handleChartHistoryStatusChange}
-                                                    timeframeMinutes={chartTimeframeMinutes}
-                                                    onTimeframeChange={setChartTimeframeMinutes}
-                                                    chartType={chartType}
-                                                    onChartTypeChange={setChartType}
-                                                    layoutPanes={chartLayoutPanes}
-                                                    onLayoutPanesChange={setChartLayoutPanes}
-                                                    chartBarSpacing={chartBarSpacing}
-                                                    onChartBarSpacingChange={setChartBarSpacing}
-                                                />
-                                            </div>
-                                        )}
-                                    </div>
-                                ) : isLoadingTerminalAccountData ? (
+                                {isTerminalRestoreInProgress ? (
                                     <TerminalChartLoadingShell />
+                                ) : selectedSymbolBelongsToActiveAccount && selectedInstrument ? (
+                                    <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+                                        <div className="relative flex-1 flex flex-col z-10 bg-card">
+                                            <TradingChart
+                                                symbol={selectedInstrument.symbol}
+                                                accountSessionScopeId={accountSessionScopeId}
+                                                basePrice={selectedInstrument.bid}
+                                                instrument={selectedInstrument}
+                                                positions={selectedSymbolPositions}
+                                                onClosePosition={handleClosePosition}
+                                                onUpdatePosition={handleUpdatePosition}
+                                                onSell={handleSelectedSell}
+                                                onBuy={handleSelectedBuy}
+                                                onOpenOrderPanel={handleOpenTradePanel}
+                                                isOrderPanelOpen={isOrderPanelOpen}
+                                                onToggleOrderPanel={() => setIsOrderPanelOpen(!isOrderPanelOpen)}
+                                                onHistoryStatusChange={handleChartHistoryStatusChange}
+                                                timeframeMinutes={chartTimeframeMinutes}
+                                                onTimeframeChange={setChartTimeframeMinutes}
+                                                chartType={chartType}
+                                                onChartTypeChange={setChartType}
+                                                layoutPanes={chartLayoutPanes}
+                                                onLayoutPanesChange={setChartLayoutPanes}
+                                                chartBarSpacing={chartBarSpacing}
+                                                onChartBarSpacingChange={setChartBarSpacing}
+                                            />
+                                        </div>
+                                    </div>
                                 ) : (terminalConnectionStatus === 'error' || activeGroupSymbolsState.error) ? (
                                     <div className="flex h-full flex-col items-center justify-center px-6 py-8">
                                         <div className="flex max-w-[420px] flex-col items-center text-center">
@@ -7801,8 +8819,9 @@ function TradingDashboardInner() {
                                 )}
                                 <PositionsTable
                                     openPositions={terminalPositions}
+                                    pendingOrders={storeOrders}
                                     closedTrades={closedTrades}
-                                    positionsLoading={positionsLoadState.isLoading}
+                                    positionsLoading={positionsTableLoading}
                                     positionsError={positionsLoadState.error}
                                     positionsWarning={positionsLoadState.warning ?? null}
                                     closedHistoryLoading={closedHistoryState.isLoading}
@@ -7865,14 +8884,14 @@ function TradingDashboardInner() {
                                 </div>
 
                                 <div className="min-h-0 flex-1 overflow-hidden">
-                                    {selectedInstrument ? (
+                                    {isTerminalRestoreInProgress ? (
+                                        <TerminalOrderPanelLoadingShell />
+                                    ) : selectedInstrument ? (
                                         <OrderPanel
                                             instrument={selectedInstrument}
                                             onClose={handleCloseOrderPanel}
                                             onPlaceOrder={handlePlaceOrder}
                                         />
-                                    ) : isLoadingTerminalAccountData ? (
-                                        <TerminalOrderPanelLoadingShell />
                                     ) : (
                                         <div className="flex h-full items-center justify-center px-5 py-8">
                                             <div className="max-w-[240px] text-center">
@@ -8030,12 +9049,12 @@ export default function TerminalPage() {
     useEffect(() => { setMounted(true); }, []);
 
     if (!mounted) {
-        return <TerminalPageLoadingShell />;
+        return <TerminalLaunchLoadingOverlay />;
     }
 
     return (
         <Suspense
-            fallback={<TerminalPageLoadingShell />}
+            fallback={<TerminalLaunchLoadingOverlay />}
         >
             <TradingDashboardInner />
         </Suspense>

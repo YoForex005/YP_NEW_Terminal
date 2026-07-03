@@ -8,6 +8,7 @@ import type {
   PnlPoint,
   TradingAccount,
   TradingSession,
+  TradingStats,
   Transaction,
   WidgetId,
   SocialStrategy, // Added import
@@ -342,7 +343,111 @@ export const DASHBOARD_WIDGET_ORDER: WidgetId[] = [
   "entertainment",
 ];
 
-export const MOCK_TRADING_ACCOUNTS: TradingAccount[] = [];
+// Default MT5 server IP used by the local/standalone fallback accounts.
+const MOCK_SERVER_IP = "89.21.67.29";
+
+const buildMockStats = (overrides: Partial<TradingStats> = {}): TradingStats => ({
+  totalTrades: 0,
+  winRate: 0,
+  profitFactor: 0,
+  totalVolume: 0,
+  winningTrades: 0,
+  losingTrades: 0,
+  averageWin: 0,
+  averageLoss: 0,
+  largestWin: 0,
+  largestLoss: 0,
+  consecutiveWins: 0,
+  consecutiveLosses: 0,
+  totalCommission: 0,
+  totalSwap: 0,
+  ...overrides,
+});
+
+// Hardcoded sample accounts so the standalone terminal (mock data source) renders
+// a populated account switcher, account-overview and statistics widgets with no backend.
+export const MOCK_TRADING_ACCOUNTS: TradingAccount[] = [
+  {
+    id: "acc-live-900847",
+    accountNumber: "900847",
+    name: "FlexyMarkets Live",
+    platform: "mt5",
+    type: "Live",
+    leverage: 500,
+    serverIp: MOCK_SERVER_IP,
+    currency: "USD",
+    balance: 15280.45,
+    equity: 15412.10,
+    freeMargin: 14180.32,
+    margin: 1231.78,
+    status: "Active",
+    createdAt: "2026-03-12T09:24:00.000Z",
+    credentials: {
+      login: "900847",
+      server: "FlexyMarkets-Live",
+      tradingPassword: "Trade!2026Xk",
+      investorPassword: "View!2026Yz",
+      generatedAt: "2026-03-12T09:24:00.000Z",
+      source: "broker",
+    },
+    transactions: [],
+    stats: buildMockStats({
+      totalTrades: 148,
+      winRate: 61.5,
+      profitFactor: 1.84,
+      totalVolume: 312.4,
+      winningTrades: 91,
+      losingTrades: 57,
+      averageWin: 142.8,
+      averageLoss: -86.3,
+      largestWin: 980.5,
+      largestLoss: -512.2,
+      consecutiveWins: 7,
+      consecutiveLosses: 3,
+      totalCommission: -184.2,
+      totalSwap: -42.7,
+    }),
+  },
+  {
+    id: "acc-demo-5012334",
+    accountNumber: "5012334",
+    name: "MetaTrader 5 Demo",
+    platform: "mt5",
+    type: "Demo",
+    leverage: 100,
+    serverIp: MOCK_SERVER_IP,
+    currency: "USD",
+    balance: 10000,
+    equity: 10000,
+    freeMargin: 10000,
+    margin: 0,
+    status: "Active",
+    createdAt: "2026-05-28T14:10:00.000Z",
+    credentials: {
+      login: "5012334",
+      server: "FlexyMarkets-Demo",
+      tradingPassword: "Trade!2026Aa",
+      investorPassword: "View!2026Bb",
+      generatedAt: "2026-05-28T14:10:00.000Z",
+      source: "broker",
+    },
+    transactions: [],
+    stats: buildMockStats({
+      totalTrades: 32,
+      winRate: 53.1,
+      profitFactor: 1.32,
+      totalVolume: 58.2,
+      winningTrades: 17,
+      losingTrades: 15,
+      averageWin: 64.5,
+      averageLoss: -48.9,
+      largestWin: 210.0,
+      largestLoss: -132.4,
+      consecutiveWins: 4,
+      consecutiveLosses: 2,
+    }),
+  },
+];
 
 export const WIDGET_META: Record<WidgetId, { title: string; description: string; category: "account" | "market" | "trading" | "tools"; size: "small" | "medium" | "large" }> = {
   "account-overview": {
@@ -610,13 +715,67 @@ export const TRADING_SESSIONS: TradingSession[] = [
 ];
 
 export const INITIAL_WALLETS: Record<CurrencyCode, number> = {
-  USD: 0,
-  EUR: 0,
+  USD: 12500,
+  EUR: 3200,
 };
 
-export const INITIAL_TRANSACTIONS: Transaction[] = [];
+export const INITIAL_TRANSACTIONS: Transaction[] = [
+  {
+    id: "txn-1",
+    type: "Deposit",
+    amount: 10000,
+    currency: "USD",
+    method: "crypto",
+    status: "Completed",
+    createdAt: "2026-03-12T09:20:00.000Z",
+  },
+  {
+    id: "txn-2",
+    type: "Transfer to MT5",
+    amount: 5000,
+    currency: "USD",
+    method: "card",
+    status: "Completed",
+    createdAt: "2026-03-12T09:25:00.000Z",
+    targetAccount: "900847",
+  },
+  {
+    id: "txn-3",
+    type: "Deposit",
+    amount: 3200,
+    currency: "EUR",
+    method: "card",
+    status: "Completed",
+    createdAt: "2026-04-02T11:02:00.000Z",
+  },
+  {
+    id: "txn-4",
+    type: "Withdrawal",
+    amount: 1500,
+    currency: "USD",
+    method: "crypto",
+    status: "Processing",
+    createdAt: "2026-06-05T16:45:00.000Z",
+  },
+  {
+    id: "txn-5",
+    type: "Transfer from MT5",
+    amount: 750,
+    currency: "USD",
+    method: "card",
+    status: "Completed",
+    createdAt: "2026-06-08T10:15:00.000Z",
+    targetAccount: "900847",
+  },
+];
 
-export const INITIAL_POSITIONS: Position[] = [];
+export const INITIAL_POSITIONS: Position[] = [
+  { id: "pos-1", symbol: "EURUSD", side: "Buy", volume: 0.5, pnl: 84.2, accountLogin: "900847" },
+  { id: "pos-2", symbol: "XAUUSD", side: "Buy", volume: 0.1, pnl: 142.75, accountLogin: "900847" },
+  { id: "pos-3", symbol: "GBPJPY", side: "Sell", volume: 0.25, pnl: -38.4, accountLogin: "900847" },
+  { id: "pos-4", symbol: "BTCUSD", side: "Buy", volume: 0.05, pnl: 268.1, accountLogin: "900847" },
+  { id: "pos-5", symbol: "NAS100", side: "Sell", volume: 1.0, pnl: -52.9, accountLogin: "5012334" },
+];
 
 export const PNL_SPARKLINE: PnlPoint[] = [
   { t: "09:00", value: 0.2 },

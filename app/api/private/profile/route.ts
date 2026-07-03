@@ -53,15 +53,45 @@ const toProfilePayload = (user: AppUser): ProfilePayload => {
   };
 };
 
+const toAuthProfilePayload = (user: {
+  email: string;
+  name: string;
+  country?: string;
+}): ProfilePayload => {
+  const { firstName, lastName } = splitName(user.name);
+  return {
+    firstName,
+    lastName,
+    email: user.email,
+    phone: "",
+    country: user.country ?? "",
+  };
+};
+
 export async function GET(request: NextRequest) {
   const auth = await authenticateRequest(request);
   if (!auth) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const user = await getUserById(auth.user.id);
+  let user: AppUser | null = null;
+  try {
+    user = await getUserById(auth.user.id);
+  } catch (error) {
+    console.warn(
+      "[profile] DB unavailable; using auth profile fallback:",
+      error instanceof Error ? error.message : error,
+    );
+  }
   if (!user) {
-    return NextResponse.json({ error: "User not found." }, { status: 404 });
+    return NextResponse.json(
+      {
+        profile: toAuthProfilePayload(auth.user),
+        degraded: true,
+        fallbackSource: "auth_context",
+      },
+      { status: 200 },
+    );
   }
 
   return NextResponse.json(
@@ -117,14 +147,37 @@ export async function PATCH(request: NextRequest) {
   }
 
   const fullName = [firstName, lastName].filter(Boolean).join(" ");
-  const user = await updateUserProfile(auth.user.id, {
-    name: fullName,
-    phone,
-    country,
-  });
+  let user: AppUser | null = null;
+  try {
+    user = await updateUserProfile(auth.user.id, {
+      name: fullName,
+      phone,
+      country,
+    });
+  } catch (error) {
+    console.warn(
+      "[profile] DB unavailable; returning non-persistent fallback profile:",
+      error instanceof Error ? error.message : error,
+    );
+  }
 
   if (!user) {
-    return NextResponse.json({ error: "User not found." }, { status: 404 });
+    return NextResponse.json(
+      {
+        ok: true,
+        message: "Profile updated locally for this session.",
+        profile: {
+          firstName,
+          lastName,
+          email: auth.user.email,
+          phone,
+          country,
+        },
+        degraded: true,
+        fallbackSource: "local_echo",
+      },
+      { status: 200 },
+    );
   }
 
   return NextResponse.json(

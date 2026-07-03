@@ -6,7 +6,7 @@ import { useWebtraderStore, subscribeToLivePriceBySymbol, getLivePriceSnapshotBy
 
 type TradeSide = 'buy' | 'sell';
 type OrderTab = 'market' | 'pending';
-type FormType = 'regular' | 'one-click' | 'risk-calculator';
+type FormType = 'regular' | 'one-click';
 
 type QuoteSource = 'live' | 'ohlc' | 'none';
 
@@ -100,6 +100,31 @@ const formatVolume = (
     spec: { min: number; max: number; step: number; decimals: number },
 ) => normalizeVolumeToSpec(value, spec).toFixed(spec.decimals);
 
+const formatSignedNumber = (value: number, decimals = 2) => {
+    if (!Number.isFinite(value)) {
+        return '--';
+    }
+
+    const sign = value > 0 ? '+' : value < 0 ? '-' : '';
+    return `${sign}${Math.abs(value).toFixed(decimals)}`;
+};
+
+const formatMoney = (value: number, currency = 'USD', decimals = 2) => {
+    if (!Number.isFinite(value)) {
+        return '--';
+    }
+
+    return `${formatSignedNumber(value, decimals)} ${currency}`;
+};
+
+const formatUnsignedMoney = (value: number, currency = 'USD', decimals = 2) => {
+    if (!Number.isFinite(value)) {
+        return '--';
+    }
+
+    return `${value.toFixed(decimals)} ${currency}`;
+};
+
 function StepInput({
     label,
     value,
@@ -111,6 +136,7 @@ function StepInput({
     onChange,
     hint,
     icon,
+    tone = 'default',
 }: {
     label?: string;
     value: string;
@@ -122,6 +148,7 @@ function StepInput({
     onChange?: (v: string) => void;
     hint?: string;
     icon?: React.ReactNode;
+    tone?: 'default' | 'positive' | 'negative';
 }) {
     const [localSuffix, setLocalSuffix] = useState(suffix || '');
     const [showSuffixDrop, setShowSuffixDrop] = useState(false);
@@ -196,7 +223,17 @@ function StepInput({
                     </div>
                 </div>
             </div>
-            {hint && <div className="text-[10px] text-muted-foreground/60 pl-0.5">{hint}</div>}
+            {hint && (
+                <div className={`text-[10px] pl-0.5 tabular-nums ${
+                    tone === 'positive'
+                        ? 'text-success/85'
+                        : tone === 'negative'
+                            ? 'text-destructive/85'
+                            : 'text-muted-foreground/60'
+                }`}>
+                    {hint}
+                </div>
+            )}
         </div>
     );
 }
@@ -331,6 +368,7 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
     }, [instrument.symbol]);
 
     const isIndicativeQuote = !hasLiveQuote && instrument.quoteSource === 'ohlc';
+    const isOneClickForm = formType === 'one-click';
     const canSubmitSideOrder = (_side: TradeSide) => hasLiveQuote;
     const canSubmitOrder = canSubmitSideOrder(selectedSide);
     const formatQuote = (value: number) => (value > 0 ? `${isIndicativeQuote ? '~' : ''}${value.toFixed(instrument.digits)}` : '--');
@@ -341,18 +379,43 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
     const bidFlashClass = rawBidIsLive && bid > 0 ? getQuoteFlashClass(rawLivePrice?.bidDirection, 'bid') : '';
     const askFlashClass = rawAskIsLive && ask > 0 ? getQuoteFlashClass(rawLivePrice?.askDirection, 'ask') : '';
     const quoteFlashTickKey = rawLivePrice?.receivedSequence ?? rawLivePrice?.receivedAtMs ?? rawLivePrice?.time;
+    const midpointPrice = bid > 0 && ask > 0
+        ? (bid + ask) / 2
+        : ask > 0
+            ? ask
+            : bid;
+    const defaultLimitPrice = midpointPrice > 0 ? midpointPrice.toFixed(instrument.digits) : '';
+    const pendingPriceDisplay = pendingPrice
+        || (isOneClickForm && defaultLimitPrice
+            ? defaultLimitPrice
+            : ask > 0
+                ? ask.toFixed(instrument.digits)
+                : '');
 
     const spread = Math.abs(ask - bid);
-    const pointSize = symbolSpec?.point && symbolSpec.point > 0
-        ? symbolSpec.point
-        : instrument.pipSize > 0
-            ? instrument.pipSize
-            : 1 / Math.pow(10, instrument.digits);
-    const spreadPoints = pointSize > 0 ? spread / pointSize : 0;
-    const spreadLabel = Number.isFinite(spreadPoints)
-        ? `${spreadPoints.toFixed(spreadPoints >= 10 ? 1 : 2)} pts`
-        : spread.toFixed(Math.min(instrument.digits, 4));
     const leverageRatio = accountInfo?.leverage && accountInfo.leverage > 0 ? accountInfo.leverage : null;
+    const accountCurrency = accountInfo?.currency || symbolSpec?.quoteCurrency || 'USD';
+    const spreadLabel = spread > 0
+        ? `${spread.toFixed(Math.min(Math.max(instrument.digits, 2), 5))} ${accountCurrency}`
+        : '--';
+    const tradeVolume = normalizeVolumeToSpec(parseFloat(volume), volumeSpec);
+    const contractSize = toPositiveFinite(symbolSpec?.tradeContractSize, instrument.contractSize || 100000);
+    const entryPrice = selectedSide === 'buy' ? ask : bid;
+    const pendingEntryPrice = tab === 'pending'
+        ? parseFloat(pendingPriceDisplay) || entryPrice
+        : entryPrice;
+    const effectiveEntryPrice = pendingEntryPrice > 0 ? pendingEntryPrice : entryPrice;
+    const notionalValue = effectiveEntryPrice > 0
+        ? effectiveEntryPrice * tradeVolume * contractSize
+        : 0;
+    const estimatedMargin = symbolSpec?.marginInitial && symbolSpec.marginInitial > 0
+        ? symbolSpec.marginInitial * tradeVolume
+        : leverageRatio && notionalValue > 0
+            ? notionalValue / leverageRatio
+            : 0;
+    const estimatedFees = spread > 0
+        ? spread * tradeVolume * contractSize
+        : 0;
     const quoteStatusLabel = hasLiveQuote
         ? 'Live server quote'
         : isIndicativeQuote
@@ -381,6 +444,54 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
     };
 
     const pipStep = 1 / Math.pow(10, instrument.digits);
+    const pipSize = instrument.pipSize > 0
+        ? instrument.pipSize
+        : symbolSpec?.point && symbolSpec.point > 0
+            ? symbolSpec.point
+            : pipStep;
+
+    const getOrderPriceMetrics = (rawPrice: string) => {
+        const targetPrice = parseFloat(rawPrice);
+        if (
+            !Number.isFinite(targetPrice) ||
+            targetPrice <= 0 ||
+            !Number.isFinite(effectiveEntryPrice) ||
+            effectiveEntryPrice <= 0 ||
+            !Number.isFinite(tradeVolume) ||
+            tradeVolume <= 0
+        ) {
+            return {
+                hint: '',
+                tone: 'default' as const,
+            };
+        }
+
+        const priceDelta = selectedSide === 'buy'
+            ? targetPrice - effectiveEntryPrice
+            : effectiveEntryPrice - targetPrice;
+        const pips = pipSize > 0 ? priceDelta / pipSize : 0;
+        const estimatedProfit = priceDelta * tradeVolume * contractSize;
+        const percent = effectiveEntryPrice > 0 ? (priceDelta / effectiveEntryPrice) * 100 : 0;
+        const tone: 'default' | 'positive' | 'negative' =
+            estimatedProfit > 0 ? 'positive' : estimatedProfit < 0 ? 'negative' : 'default';
+
+        return {
+            hint: `${formatSignedNumber(pips, 1)} pips  |  ${formatMoney(estimatedProfit, accountCurrency)}  |  ${formatSignedNumber(percent, 2)} %`,
+            tone,
+        };
+    };
+
+    const tpMetrics = getOrderPriceMetrics(tp);
+    const slMetrics = getOrderPriceMetrics(sl);
+    const pendingDistance = useMemo(() => {
+        const targetPrice = parseFloat(pendingPriceDisplay);
+        if (!Number.isFinite(targetPrice) || targetPrice <= 0 || entryPrice <= 0) {
+            return '0.0 pips from market';
+        }
+
+        const pips = pipSize > 0 ? (targetPrice - entryPrice) / pipSize : 0;
+        return `${formatSignedNumber(pips, 1)} pips from market`;
+    }, [pendingPriceDisplay, entryPrice, pipSize]);
 
     // ── Listen for drag-set-sl-tp events dispatched by the chart live-price drag. ──
     useEffect(() => {
@@ -417,27 +528,45 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
         setters[type](next.toFixed(instrument.digits));
     };
 
-    const handlePlaceOrder = async (side: TradeSide) => {
+    const limitPrice = parseFloat(pendingPriceDisplay);
+    const canSubmitOneClickLimit = (side: TradeSide) => {
+        if (!hasLiveQuote || isPlacingOrder || !Number.isFinite(limitPrice) || limitPrice <= 0) {
+            return false;
+        }
+
+        return side === 'buy' ? limitPrice < ask : limitPrice > bid;
+    };
+
+    const handlePlaceOrder = async (
+        side: TradeSide,
+        options: { orderType?: 'market' | 'limit' | 'stop'; price?: number; tp?: number | null; sl?: number | null } = {},
+    ) => {
         if (!canSubmitSideOrder(side)) {
             return;
         }
-        if (formType !== 'one-click' && isPlacingOrder) {
+        if (isPlacingOrder) {
             return;
         }
 
         const vol = normalizeVolumeToSpec(parseFloat(volume), volumeSpec);
         if (!vol || vol <= 0) return;
-        const orderPrice = tab === 'market'
-            ? undefined
-            : (parseFloat(pendingPrice) || (side === 'buy' ? ask : bid));
+        const resolvedOrderType = options.orderType ?? (tab === 'market' ? 'market' : pendingType);
+        const resolvedPrice = options.price ?? parseFloat(pendingPriceDisplay);
+        if (
+            resolvedOrderType !== 'market' &&
+            (!Number.isFinite(resolvedPrice) || resolvedPrice <= 0)
+        ) {
+            return;
+        }
+
         const nextOrder: PlaceOrderRequest = {
             symbol: instrument.symbol,
             type: side,
-            orderType: tab === 'market' ? 'market' : pendingType,
+            orderType: resolvedOrderType,
             volume: vol,
-            tp: tp ? parseFloat(tp) : null,
-            sl: sl ? parseFloat(sl) : null,
-            ...(orderPrice !== undefined ? { price: orderPrice } : {}),
+            tp: options.tp ?? (tp ? parseFloat(tp) : null),
+            sl: options.sl ?? (sl ? parseFloat(sl) : null),
+            ...(resolvedOrderType !== 'market' ? { price: resolvedPrice } : {}),
         };
 
         setIsPlacingOrder(true);
@@ -451,8 +580,245 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
     const formLabels: Record<FormType, string> = {
         regular: 'Regular form',
         'one-click': 'One-click form',
-        'risk-calculator': 'Risk calculator',
     };
+
+    const renderFormTypeDropdown = () => (
+        <div className="relative z-[60]">
+            <button
+                onClick={() => setIsFormDropOpen(p => !p)}
+                className={`w-full flex items-center justify-between px-3 h-[30px] text-[12px] rounded-[3px] border transition-all duration-200
+                    ${isFormDropOpen
+                        ? 'bg-accent border-border text-foreground'
+                        : 'bg-card border-border text-foreground hover:border-border/80 hover:bg-accent/40'
+                    }`}
+            >
+                <span>{formLabels[formType]}</span>
+                <ChevronDown size={14} className={`text-muted-foreground transition-transform duration-200 ${isFormDropOpen ? 'rotate-180' : ''}`} />
+            </button>
+            {isFormDropOpen && (
+                <>
+                    <div className="fixed inset-0 z-[99]" onClick={() => setIsFormDropOpen(false)} />
+                    <div className="absolute top-full left-0 w-full mt-1 bg-popover border border-border rounded-[3px] shadow-lg z-[100] p-1 flex flex-col gap-0.5 animate-in fade-in slide-in-from-top-2 duration-150">
+                        {(Object.entries(formLabels) as [FormType, string][]).map(([key, label]) => (
+                            <button
+                                key={key}
+                                onClick={() => { setFormType(key); setIsFormDropOpen(false); }}
+                                className={`px-3 py-1.5 text-left text-[12px] rounded-[2px] transition-colors w-full
+                                    ${formType === key
+                                        ? 'bg-background text-foreground font-bold'
+                                        : 'text-muted-foreground hover:bg-background hover:text-foreground'
+                                    }`}
+                            >
+                                {label}
+                            </button>
+                        ))}
+                    </div>
+                </>
+            )}
+        </div>
+    );
+
+    const renderQuoteWarning = () => !hasLiveQuote ? (
+        <div className="rounded-[3px] border border-amber-500/30 bg-amber-500/5 px-3 py-1.5 text-[11px] text-amber-200 mt-1">
+            {isIndicativeQuote
+                ? 'Showing an indicative chart price while live bid/ask warms up. Market orders stay blocked until the MT5 quote feed sends a real tick.'
+                : 'No live bid/ask is available for this instrument yet. Market orders will stay blocked until the MT5 quote feed recovers.'}
+        </div>
+    ) : null;
+
+    const renderOrderTabs = () => (
+        <div className="flex h-[30px] bg-background rounded-[3px] border border-border p-[2px] gap-[2px] mt-1">
+            {(['market', 'pending'] as OrderTab[]).map(t => (
+                <button
+                    key={t}
+                    onClick={() => setTab(t)}
+                    className={`flex-1 rounded-[2px] transition-all duration-200 font-semibold text-[11px]
+                        ${tab === t
+                            ? 'bg-accent text-foreground font-bold'
+                            : 'bg-transparent text-muted-foreground hover:text-foreground'
+                        }`}
+                >
+                    {t === 'pending' && isOneClickForm ? 'Limit' : t.charAt(0).toUpperCase() + t.slice(1)}
+                </button>
+            ))}
+        </div>
+    );
+
+    const renderVolumeInput = () => (
+        <StepInput
+            label="Volume"
+            value={volume}
+            suffix="Lots"
+            onChange={setVolume}
+            onMinus={() => adjustVolume(-volumeSpec.step)}
+            onPlus={() => adjustVolume(volumeSpec.step)}
+        />
+    );
+
+    const renderSentimentBar = () => {
+        if (isOneClickForm) {
+            return (
+                <div className="mt-[-4px] flex items-center gap-2 text-[12px] font-bold leading-none">
+                    <span className="w-[32px] text-destructive">{sellSentiment}%</span>
+                    <div className="relative flex h-[8px] flex-1 items-center">
+                        <div className="flex h-[3px] w-full overflow-hidden rounded-full bg-accent">
+                            <div className="h-full bg-destructive transition-all duration-700" style={{ width: `${sellSentiment}%` }} />
+                            <div className="h-full bg-success transition-all duration-700" style={{ width: `${buySentiment}%` }} />
+                        </div>
+                        <div className="absolute left-1/2 top-[-2px] -translate-x-1/2 w-0 h-0 border-l-[4px] border-r-[4px] border-b-[6px] border-transparent border-b-success" />
+                    </div>
+                    <span className="w-[32px] text-right text-success">{buySentiment}%</span>
+                </div>
+            );
+        }
+
+        return (
+            <div className="flex flex-col gap-1 mt-1.5 mb-1">
+                <div className="flex items-center gap-2 text-[12px] font-medium relative h-[16px]">
+                    <span className="text-destructive font-bold text-[12px] w-[30px]">{sellSentiment}%</span>
+                    <div className="flex-1 h-[4px] rounded-full flex bg-accent relative items-center">
+                        <div className="h-full bg-destructive transition-all duration-700" style={{ width: `${sellSentiment}%` }} />
+                        <div className="h-full bg-success transition-all duration-700" style={{ width: `${buySentiment}%` }} />
+                        <div className="absolute top-[-4px] left-1/2 -translate-x-1/2 w-0 h-0 border-l-[4px] border-r-[4px] border-b-[5px] border-transparent border-b-success" />
+                    </div>
+                    <span className="text-success font-bold text-[12px] w-[30px] text-right">{buySentiment}%</span>
+                </div>
+            </div>
+        );
+    };
+
+    const renderTradeButtons = (mode: 'regular' | 'one-click-market' | 'one-click-limit') => {
+        const isFilled = mode !== 'regular';
+        const isLimit = mode === 'one-click-limit';
+        const sellDisabled = mode === 'one-click-market'
+            ? !hasLiveQuote || isPlacingOrder
+            : isLimit
+                ? !canSubmitOneClickLimit('sell')
+                : false;
+        const buyDisabled = mode === 'one-click-market'
+            ? !hasLiveQuote || isPlacingOrder
+            : isLimit
+                ? !canSubmitOneClickLimit('buy')
+                : false;
+        const sellAction = () => {
+            if (mode === 'regular') {
+                setSelectedSide('sell');
+                return;
+            }
+
+            void handlePlaceOrder('sell', {
+                orderType: isLimit ? 'limit' : 'market',
+                ...(isLimit ? { price: limitPrice } : {}),
+                tp: null,
+                sl: null,
+            });
+        };
+        const buyAction = () => {
+            if (mode === 'regular') {
+                setSelectedSide('buy');
+                return;
+            }
+
+            void handlePlaceOrder('buy', {
+                orderType: isLimit ? 'limit' : 'market',
+                ...(isLimit ? { price: limitPrice } : {}),
+                tp: null,
+                sl: null,
+            });
+        };
+        const sellClass = isFilled
+            ? `border-destructive/75 bg-card/15 text-destructive hover:border-destructive hover:bg-destructive/5 ${sellDisabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'}`
+            : `${selectedSide === 'sell'
+                ? 'border-destructive/80 bg-destructive/5'
+                : 'border-destructive/40 bg-transparent hover:border-destructive/60'} cursor-pointer`;
+        const buyClass = isFilled
+            ? `border-success/75 bg-card/15 text-success hover:border-success hover:bg-success/5 ${buyDisabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'}`
+            : `${selectedSide === 'buy'
+                ? 'border-success/80 bg-success/5'
+                : 'border-success/40 bg-transparent hover:border-success/60'} cursor-pointer`;
+        const buttonHeight = isFilled ? (isLimit ? 'h-[72px]' : 'h-[58px]') : 'h-[60px]';
+
+        return (
+            <div className="relative">
+                <div className={`flex gap-[2px] ${buttonHeight} min-w-0`}>
+                    <button
+                        type="button"
+                        disabled={sellDisabled}
+                        onClick={sellAction}
+                        className={`min-w-0 flex-1 flex flex-col items-start justify-between px-2 py-2 pb-[13px] rounded-[4px] transition-all group relative border text-left ${sellClass}`}
+                    >
+                        {bidFlashClass && (
+                            <span key={getQuoteFlashKey(instrument.symbol, 'bid', bid, quoteFlashTickKey)} className={`quote-flash-overlay ${bidFlashClass}`} />
+                        )}
+                        <span className={`quote-flash-content text-[10px] font-semibold leading-none tracking-[0.04em] ${isFilled ? 'text-destructive' : selectedSide === 'sell' ? 'text-destructive' : 'text-destructive/70'}`}>
+                            {isLimit ? 'Sell Limit' : 'SELL'}
+                        </span>
+                        <span ref={sellPriceRef} className={`quote-flash-content w-full text-[16px] tabular-nums leading-none font-bold tracking-tight ${isFilled ? 'text-destructive' : selectedSide === 'sell' ? 'text-destructive' : 'text-destructive/90'}`}>
+                            {formatQuote(bid)}
+                        </span>
+                        {isLimit && (
+                            <span className="text-[11px] font-semibold leading-none text-destructive/85 tabular-nums">
+                                {pendingPriceDisplay || '--'}
+                            </span>
+                        )}
+                    </button>
+
+                    <button
+                        type="button"
+                        disabled={buyDisabled}
+                        onClick={buyAction}
+                        className={`min-w-0 flex-1 flex flex-col items-end justify-between px-2 py-2 pb-[13px] rounded-[4px] transition-all group relative border text-right ${buyClass}`}
+                    >
+                        {askFlashClass && (
+                            <span key={getQuoteFlashKey(instrument.symbol, 'ask', ask, quoteFlashTickKey)} className={`quote-flash-overlay ${askFlashClass}`} />
+                        )}
+                        <span className={`quote-flash-content text-[10px] font-semibold leading-none tracking-[0.04em] ${isFilled ? 'text-success' : selectedSide === 'buy' ? 'text-success' : 'text-success/70'}`}>
+                            {isLimit ? 'Buy Limit' : 'BUY'}
+                        </span>
+                        <span ref={buyPriceRef} className={`quote-flash-content w-full text-right text-[16px] tabular-nums leading-none font-bold tracking-tight ${isFilled ? 'text-success' : selectedSide === 'buy' ? 'text-success' : 'text-success/90'}`}>
+                            {formatQuote(ask)}
+                        </span>
+                        {isLimit && (
+                            <span className="text-[11px] font-semibold leading-none text-success/85 tabular-nums">
+                                {pendingPriceDisplay || '--'}
+                            </span>
+                        )}
+                    </button>
+                </div>
+
+                <div className="absolute bottom-0 left-1/2 -translate-x-1/2 h-[18px] flex items-center justify-center z-10 px-1.5 min-w-[64px]" data-test="spread">
+                    <div className={`absolute left-0 top-0 bottom-0 w-1/2 rounded-tl-[4px] border-t border-l bg-background ${isFilled || selectedSide === 'sell' ? 'border-destructive/80' : 'border-destructive/40'}`} />
+                    <div className={`absolute right-0 top-0 bottom-0 w-1/2 rounded-tr-[4px] border-t border-r bg-background ${isFilled || selectedSide === 'buy' ? 'border-success/80' : 'border-success/40'}`} />
+                    <span className="relative z-10 rounded-[3px] border border-success/70 bg-background px-1 text-[9px] font-bold text-foreground whitespace-nowrap tracking-wide" data-test="spread-tooltip">
+                        {hasLiveQuote ? spreadLabel : '--'}
+                    </span>
+                </div>
+            </div>
+        );
+    };
+
+    const renderFooter = () => (
+        <div className="mt-[-2px] flex flex-col gap-[3px] border-t border-border/60 pt-2 font-mono text-[10px] leading-tight text-muted-foreground">
+            <div className="flex items-center justify-between gap-3">
+                <span>Fees:</span>
+                <span className="text-foreground/85 tabular-nums">~ {formatUnsignedMoney(estimatedFees, accountCurrency)}</span>
+            </div>
+            <div className="flex items-center justify-between gap-3">
+                <span>Leverage:</span>
+                <span className="text-foreground/85 tabular-nums">{leverageRatio ? `1:${leverageRatio}` : '--'}</span>
+            </div>
+            <div className="flex items-center justify-between gap-3">
+                <span>Margin:</span>
+                <span className="text-foreground/85 tabular-nums">{formatUnsignedMoney(estimatedMargin, accountCurrency)}</span>
+            </div>
+            <button
+                type="button"
+                className="mt-[1px] inline-flex w-fit items-center gap-0.5 text-[10px] font-semibold text-muted-foreground transition-colors hover:text-foreground"
+            >
+                More <ChevronDown size={10} />
+            </button>
+        </div>
+    );
 
     return (
         <div className="flex h-full min-h-0 flex-col overflow-hidden bg-background font-sans text-foreground select-none">
@@ -460,41 +826,30 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
             {/* ── Form Body ─────────────────────────────────────── */}
             <div className="no-scrollbar flex min-h-0 flex-1 flex-col gap-[14px] overflow-y-auto overscroll-contain px-4 py-4">
 
-                {/* ── Form Type Dropdown ─── */}
-                <div className="relative z-[60]">
-                    <button
-                        onClick={() => setIsFormDropOpen(p => !p)}
-                        className={`w-full flex items-center justify-between px-3 h-[30px] text-[12px] rounded-[3px] border transition-all duration-200
-                            ${isFormDropOpen
-                                ? 'bg-accent border-border text-foreground'
-                                : 'bg-card border-border text-foreground hover:border-border/80 hover:bg-accent/40'
-                            }`}
-                    >
-                        <span>{formLabels[formType]}</span>
-                        <ChevronDown size={14} className={`text-muted-foreground transition-transform duration-200 ${isFormDropOpen ? 'rotate-180' : ''}`} />
-                    </button>
-                    {isFormDropOpen && (
-                        <>
-                            <div className="fixed inset-0 z-[99]" onClick={() => setIsFormDropOpen(false)} />
-                            <div className="absolute top-full left-0 w-full mt-1 bg-popover border border-border rounded-[3px] shadow-lg z-[100] p-1 flex flex-col gap-0.5 animate-in fade-in slide-in-from-top-2 duration-150">
-                                {(Object.entries(formLabels) as [FormType, string][]).map(([key, label]) => (
-                                    <button
-                                        key={key}
-                                        onClick={() => { setFormType(key); setIsFormDropOpen(false); }}
-                                        className={`px-3 py-1.5 text-left text-[12px] rounded-[2px] transition-colors w-full
-                                            ${formType === key
-                                                ? 'bg-background text-foreground font-bold'
-                                                : 'text-muted-foreground hover:bg-background hover:text-foreground'
-                                            }`}
-                                    >
-                                        {label}
-                                    </button>
-                                ))}
-                            </div>
-                        </>
-                    )}
-                </div>
+                {renderFormTypeDropdown()}
 
+                {isOneClickForm ? (
+                    <>
+                        {renderOrderTabs()}
+                        {tab === 'pending' && (
+                            <StepInput
+                                label="Open price"
+                                value={pendingPriceDisplay}
+                                onChange={setPendingPrice}
+                                suffix="Price"
+                                onMinus={() => adjustPrice('pending', -1)}
+                                onPlus={() => adjustPrice('pending', 1)}
+                                hint={pendingDistance}
+                            />
+                        )}
+                        {renderVolumeInput()}
+                        {renderTradeButtons(tab === 'pending' ? 'one-click-limit' : 'one-click-market')}
+                        {renderQuoteWarning()}
+                        {renderSentimentBar()}
+                        {renderFooter()}
+                    </>
+                ) : (
+                    <>
                 {/* ── SELL / BUY Price Boxes (Exness-style transparent boxes) ─── */}
                 <div className="relative">
                     <div className="flex gap-[2px] h-[60px] min-w-0">
@@ -503,7 +858,7 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
                                 ${selectedSide === 'sell'
                                     ? 'border-destructive/80 bg-destructive/5'
                                     : 'border-destructive/40 bg-transparent hover:border-destructive/60'}`}
-                             onClick={() => formType === 'one-click' && canSubmitSideOrder('sell') ? handlePlaceOrder('sell') : setSelectedSide('sell')}>
+                             onClick={() => setSelectedSide('sell')}>
                             {bidFlashClass && (
                                 <span key={getQuoteFlashKey(instrument.symbol, 'bid', bid, quoteFlashTickKey)} className={`quote-flash-overlay ${bidFlashClass}`} />
                             )}
@@ -518,7 +873,7 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
                                 ${selectedSide === 'buy'
                                     ? 'border-success/80 bg-success/5'
                                     : 'border-success/40 bg-transparent hover:border-success/60'}`}
-                             onClick={() => formType === 'one-click' && canSubmitSideOrder('buy') ? handlePlaceOrder('buy') : setSelectedSide('buy')}>
+                             onClick={() => setSelectedSide('buy')}>
                             {askFlashClass && (
                                 <span key={getQuoteFlashKey(instrument.symbol, 'ask', ask, quoteFlashTickKey)} className={`quote-flash-overlay ${askFlashClass}`} />
                             )}
@@ -590,7 +945,7 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
                         suffix={pendingType.charAt(0).toUpperCase() + pendingType.slice(1)}
                         onMinus={() => adjustPrice('pending', -1)}
                         onPlus={() => adjustPrice('pending', 1)}
-                        hint={`-0.0 pips from market`}
+                        hint={pendingDistance}
                     />
                 )}
 
@@ -613,6 +968,8 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
                     onChange={setTp}
                     onMinus={() => adjustPrice('tp', -1)}
                     onPlus={() => adjustPrice('tp', 1)}
+                    hint={tpMetrics.hint}
+                    tone={tpMetrics.tone}
                     icon={<HelpCircle size={13} />}
                 />
 
@@ -625,12 +982,14 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
                     onChange={setSl}
                     onMinus={() => adjustPrice('sl', -1)}
                     onPlus={() => adjustPrice('sl', 1)}
+                    hint={slMetrics.hint}
+                    tone={slMetrics.tone}
                     icon={<HelpCircle size={13} />}
                 />
 
                 {/* ── Confirm button (Regular Form only) ─── */}
-                {(formType === 'regular' || formType === 'risk-calculator') && (
-                    <div className="pt-1 flex flex-col gap-[6px]">
+                {formType === 'regular' && (
+                    <div className="pt-1 flex flex-col gap-[8px]">
                         <button
                             onClick={() => handlePlaceOrder(selectedSide)}
                             disabled={!canSubmitOrder || isPlacingOrder}
@@ -642,7 +1001,36 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
                                 ? 'Placing order...'
                                 : `Confirm ${selectedSide === 'buy' ? 'Buy' : 'Sell'} ${volume} lots`}
                         </button>
+                        <button
+                            type="button"
+                            onClick={onClose}
+                            className="w-full h-[34px] rounded-[3px] border border-border bg-accent/45 text-[13px] font-semibold text-foreground transition-colors hover:bg-accent"
+                        >
+                            Cancel
+                        </button>
                     </div>
+                )}
+                <div className="mt-[-2px] flex flex-col gap-[3px] border-t border-border/60 pt-2 font-mono text-[10px] leading-tight text-muted-foreground">
+                    <div className="flex items-center justify-between gap-3">
+                        <span>Fees:</span>
+                        <span className="text-foreground/85 tabular-nums">~ {formatUnsignedMoney(estimatedFees, accountCurrency)}</span>
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                        <span>Leverage:</span>
+                        <span className="text-foreground/85 tabular-nums">{leverageRatio ? `1:${leverageRatio}` : '--'}</span>
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                        <span>Margin:</span>
+                        <span className="text-foreground/85 tabular-nums">{formatUnsignedMoney(estimatedMargin, accountCurrency)}</span>
+                    </div>
+                    <button
+                        type="button"
+                        className="mt-[1px] inline-flex w-fit items-center gap-0.5 text-[10px] font-semibold text-muted-foreground transition-colors hover:text-foreground"
+                    >
+                        More <ChevronDown size={10} />
+                    </button>
+                </div>
+                    </>
                 )}
             </div>
         </div>

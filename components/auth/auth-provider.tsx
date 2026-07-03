@@ -171,6 +171,17 @@ const parseNetworkError = (error: unknown): AuthError => {
   );
 };
 
+const isTerminalLaunchCodePage = (): boolean => {
+  if (typeof window === "undefined") return false;
+  if (window.location.pathname !== "/terminal") return false;
+
+  const hash = window.location.hash.startsWith("#")
+    ? window.location.hash.slice(1)
+    : window.location.hash;
+
+  return new URLSearchParams(hash).has("launch");
+};
+
 /**
  * Fetch with timeout and retry logic
  */
@@ -238,6 +249,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const router = useRouter();
 
   const refresh = useCallback(async () => {
+    if (isTerminalLaunchCodePage()) {
+      setUser(null);
+      return;
+    }
+
     try {
       const response = await fetchWithAuthRetry("/api/auth/me", {
         method: "GET",

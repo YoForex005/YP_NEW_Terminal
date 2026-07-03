@@ -211,17 +211,25 @@ export const deleteSession = async (token: string): Promise<void> => {
 };
 
 export const getUserSnapshot = async (userId: string): Promise<DashboardSnapshot> => {
-  const { rows } = await query(
-    "SELECT snapshot FROM dashboard_snapshots WHERE owner_id = $1 LIMIT 1",
-    [userId],
-  );
-  if (rows.length === 0) return createEmptyDashboardSnapshot();
-  const raw = rows[0].snapshot;
-  const snapshot = typeof raw === "string" ? JSON.parse(raw) : raw;
-  return {
-    ...createEmptyDashboardSnapshot(),
-    ...(snapshot ?? {}),
-  } as DashboardSnapshot;
+  try {
+    const { rows } = await query(
+      "SELECT snapshot FROM dashboard_snapshots WHERE owner_id = $1 LIMIT 1",
+      [userId],
+    );
+    if (rows.length === 0) return createEmptyDashboardSnapshot();
+    const raw = rows[0].snapshot;
+    const snapshot = typeof raw === "string" ? JSON.parse(raw) : raw;
+    return {
+      ...createEmptyDashboardSnapshot(),
+      ...(snapshot ?? {}),
+    } as DashboardSnapshot;
+  } catch (err) {
+    console.warn(
+      "[database] getUserSnapshot failed; returning empty local snapshot:",
+      err instanceof Error ? err.message : err,
+    );
+    return createEmptyDashboardSnapshot();
+  }
 };
 
 const DEFAULT_FLEXY_MARKETS_SERVER_IP = "89.21.67.29";

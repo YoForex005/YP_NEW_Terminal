@@ -8,7 +8,7 @@ const nextConfig = {
   experimental: {
     optimizePackageImports: ['recharts', 'framer-motion', 'date-fns', 'lucide-react', 'lightweight-charts'],
     serverActions: {
-      allowedOrigins: ['localhost:3001', '127.0.0.1:3001', '0.0.0.0:3001'],
+      allowedOrigins: ['localhost:3002', '127.0.0.1:3002', '0.0.0.0:3002'],
     },
   },
   env: {

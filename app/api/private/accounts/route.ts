@@ -21,6 +21,10 @@ import {
   getSnapshotForUser,
 } from "@/lib/server/dashboard-service";
 import { mergeDashboardSnapshots } from "@/lib/server/dashboard-snapshot-merge";
+import {
+  fetchPropfirmDashboardData,
+  isForwardableToken,
+} from "@/lib/server/propfirm-backend";
 import { isMt5GroupAllowedForUser } from "@/lib/server/mt5-account-scope";
 import { resolveBackendEnvValue } from "@/lib/server/backend-env";
 import { Mt5ProvisioningError } from "@/lib/server/mt5-manager";
@@ -549,6 +553,27 @@ export async function GET(request: NextRequest) {
   const auth = await authenticateRequest(request);
   if (!auth) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  // Preferred source: PropFirm C++ Backend over HTTP with the forwarded JWT.
+  // Falls through to the local/PG path on any failure.
+  if (isForwardableToken(auth.token)) {
+    try {
+      const backendData = await fetchPropfirmDashboardData(auth.token, {
+        includePositions: false,
+      });
+      if (backendData && backendData.tradingAccounts.length > 0) {
+        return NextResponse.json(
+          { accounts: backendData.tradingAccounts },
+          { status: 200, headers: { "X-Accounts-Source": "propfirm-backend" } },
+        );
+      }
+    } catch (error) {
+      console.warn(
+        `[api/private/accounts] PropFirm backend fetch failed; using local/PG path:`,
+        error instanceof Error ? error.message : error,
+      );
+    }
   }
 
   try {

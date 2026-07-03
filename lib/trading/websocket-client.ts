@@ -369,6 +369,17 @@ const parseNumber = (value: unknown, fallback = 0): number => {
   return fallback;
 };
 
+const firstPositiveNumber = (...values: unknown[]): number => {
+  for (const value of values) {
+    const parsed = parseNumber(value, Number.NaN);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+
+  return 0;
+};
+
 const parseOptionalBoolean = (value: unknown): boolean | undefined => {
   if (typeof value === 'boolean') {
     return value;
@@ -667,27 +678,49 @@ const normalizeFillingMode = (value: unknown): Order['fillingMode'] => {
 };
 
 const mapTradeResult = (payload: unknown): TradeResult => {
-  const source = isObject(payload) ? payload : {};
+  const source = isObject(payload) && isObject(payload.result)
+    ? payload.result
+    : isObject(payload)
+      ? payload
+      : {};
+  const envelope = isObject(payload) ? payload : {};
+  const status = String(source.status ?? envelope.status ?? '').toLowerCase();
+  const action = String(source.action ?? envelope.action ?? '').toLowerCase();
+  const rejected =
+    source.success === false ||
+    ['failed', 'rejected', 'error'].includes(status);
 
   return {
-    retcode: parseInteger(source.retcode),
-    deal: parseNumber(source.deal || undefined),
-    order: parseNumber(source.order || undefined),
-    volume: parseNumber(source.volume ?? source.confirmedVolume),
-    price: parseNumber(source.price ?? source.confirmedPrice),
+    retcode: parseInteger(source.retcode ?? source.ret_code ?? source.code, rejected ? 10006 : 10009),
+    deal: parseNumber(source.deal ?? source.mt5_deal_id ?? source.deal_id ?? undefined),
+    order: parseNumber(source.order ?? source.mt5_order_id ?? source.order_id ?? undefined),
+    volume: parseNumber(source.volume ?? source.confirmedVolume ?? envelope.volume),
+    price: parseNumber(source.price ?? source.confirmedPrice ?? source.price_order ?? envelope.price),
     bid: parseNumber(source.bid || undefined),
     ask: parseNumber(source.ask || undefined),
     comment:
       typeof source.comment === 'string' && source.comment.trim()
         ? source.comment
-        : undefined,
+        : typeof source.message === 'string' && source.message.trim()
+          ? source.message
+          : typeof source.status === 'string' && source.status.trim()
+            ? source.status
+            : undefined,
     requestId:
-      source.requestId !== undefined ? parseInteger(source.requestId) : undefined,
+      source.requestId !== undefined || source.request_id !== undefined || envelope.requestId !== undefined || envelope.request_id !== undefined
+        ? parseInteger(source.requestId ?? source.request_id ?? envelope.requestId ?? envelope.request_id)
+        : undefined,
     retcodeExternal:
       source.retcodeExternal !== undefined
         ? parseInteger(source.retcodeExternal)
         : undefined,
-    pending: source.pending === true ? true : undefined,
+    pending:
+      source.pending === true ||
+      action === 'pending_order' ||
+      status === 'pending' ||
+      status === 'queued'
+        ? true
+        : undefined,
     outcomeUnknown: source.outcomeUnknown === true ? true : undefined,
     duplicateRetryBlocked: source.duplicateRetryBlocked === true ? true : undefined,
     retryAfterMs:
@@ -885,19 +918,19 @@ const mapOrder = (payload: unknown): Order | null => {
   }
 
   const closeTimeValue =
-    payload.closeTime ?? payload.closeTimeMsc ?? payload.doneTimeMsc;
+    payload.closeTime ?? payload.close_time ?? payload.closeTimeMsc ?? payload.close_time_msc ?? payload.doneTimeMsc ?? payload.done_time_msc;
 
   return {
-    ticket: parseInteger(payload.ticket),
+    ticket: parseInteger(payload.ticket ?? payload.orderId ?? payload.order_id ?? payload.mt5_order_id ?? payload.id),
     symbol: typeof payload.symbol === 'string' ? payload.symbol : '',
-    type: normalizeOrderType(payload.type),
+    type: normalizeOrderType(payload.type_label ?? payload.pending_type ?? payload.order_type ?? payload.type),
     state: normalizeOrderState(payload.state),
-    volume: parseNumber(payload.volume ?? payload.volumeInitial),
-    volumeCurrent: parseNumber(payload.volumeCurrent),
-    openPrice: parseNumber(payload.openPrice ?? payload.orderPrice),
-    priceCurrent: parseNumber(payload.priceCurrent ?? payload.currentPrice),
-    sl: parseNumber(payload.sl),
-    tp: parseNumber(payload.tp),
+    volume: parseNumber(payload.lots ?? payload.volumeLots ?? payload.volume_lots ?? payload.volumeInitial ?? payload.volume_initial ?? payload.volume),
+    volumeCurrent: parseNumber(payload.lots_current ?? payload.volumeCurrent ?? payload.volume_current ?? payload.volume),
+    openPrice: parseNumber(payload.openPrice ?? payload.open_price ?? payload.orderPrice ?? payload.order_price ?? payload.price_order ?? payload.price),
+    priceCurrent: parseNumber(payload.priceCurrent ?? payload.currentPrice ?? payload.price_current ?? payload.current_price),
+    sl: parseNumber(payload.sl ?? payload.stopLoss ?? payload.stop_loss ?? payload.price_sl),
+    tp: parseNumber(payload.tp ?? payload.takeProfit ?? payload.take_profit ?? payload.price_tp),
     profit: parseNumber(payload.profit),
     swap: parseNumber(payload.swap),
     commission: parseNumber(payload.commission),
@@ -906,10 +939,10 @@ const mapOrder = (payload: unknown): Order | null => {
         ? payload.comment
         : undefined,
     externalId:
-      typeof payload.externalId === 'string' && payload.externalId.trim()
-        ? payload.externalId
+      typeof (payload.externalId ?? payload.external_id) === 'string' && String(payload.externalId ?? payload.external_id).trim()
+        ? String(payload.externalId ?? payload.external_id).trim()
         : undefined,
-    openTime: parseDate(payload.openTime ?? payload.openTimeMsc ?? payload.setupTimeMsc),
+    openTime: parseDate(payload.openTime ?? payload.open_time ?? payload.openTimeMsc ?? payload.open_time_msc ?? payload.setupTimeMsc ?? payload.setup_time_msc ?? payload.timeSetup ?? payload.time_setup ?? payload.time),
     closeTime:
       closeTimeValue !== null && closeTimeValue !== undefined
         ? parseDate(closeTimeValue)
@@ -1018,20 +1051,78 @@ const mapTick = (payload: unknown): PriceTick => {
               ? root.payload
               : root;
   const timestampSource =
+    source.mt5_time_msc ??
+    source.mt5TimeMsc ??
+    source.mt5_time ??
+    source.mt5Time ??
+    root.mt5_time_msc ??
+    root.mt5TimeMsc ??
+    root.mt5_time ??
+    root.mt5Time ??
+    source.time_msc ??
+    source.timeMsc ??
+    source.timestamp_msc ??
+    source.timestampMsc ??
+    source.tick_time ??
+    source.tickTime ??
+    root.time_msc ??
+    root.timeMsc ??
+    root.timestamp_msc ??
+    root.timestampMsc ??
+    root.tick_time ??
+    root.tickTime ??
     source.timestampMs ??
     source.timestamp_ms ??
     source.timeMs ??
     source.time_ms ??
-    source.timeMsc ??
-    source.time_msc;
+    source.time ??
+    source.timestamp ??
+    root.timestampMs ??
+    root.timestamp_ms ??
+    root.timeMs ??
+    root.time_ms ??
+    root.time ??
+    root.timestamp;
+  const mt5TimeMsc = firstPositiveNumber(source.mt5_time_msc, source.mt5TimeMsc, root.mt5_time_msc, root.mt5TimeMsc);
+  const mt5Time = firstPositiveNumber(source.mt5_time, source.mt5Time, root.mt5_time, root.mt5Time);
+  const serverTimeMsc = firstPositiveNumber(source.server_time_msc, source.serverTimeMsc, root.server_time_msc, root.serverTimeMsc);
+  const serverReceivedMsc = firstPositiveNumber(
+    source.server_received_msc,
+    source.serverReceivedMsc,
+    root.server_received_msc,
+    root.serverReceivedMsc,
+  );
+  const bid = parseNumber(source.bid ?? root.bid);
+  const ask = parseNumber(source.ask ?? root.ask);
+  const last = source.last !== undefined || source.price !== undefined || root.last !== undefined || root.price !== undefined
+    ? parseNumber(source.last ?? source.price ?? root.last ?? root.price)
+    : undefined;
+  const volume = firstPositiveNumber(
+    source.volume,
+    source.tick_volume,
+    source.tickVolume,
+    source.real_volume,
+    source.realVolume,
+    source.volume_real,
+    source.volumeReal,
+    root.volume,
+    root.tick_volume,
+    root.tickVolume,
+    root.real_volume,
+    root.realVolume,
+    root.volume_real,
+    root.volumeReal,
+  );
   const raw: TickPayload = {
-    symbol: typeof source.symbol === 'string' ? source.symbol : '',
-    bid: parseNumber(source.bid),
-    ask: parseNumber(source.ask),
-    last:
-      source.last !== undefined ? parseNumber(source.last) : undefined,
-    volume:
-      source.volume !== undefined ? parseNumber(source.volume) : undefined,
+    symbol: typeof source.symbol === 'string'
+      ? source.symbol
+      : typeof root.symbol === 'string'
+        ? root.symbol
+        : '',
+    bid,
+    ask,
+    last,
+    volume: volume > 0 ? volume : undefined,
     time:
       typeof source.timestamp === 'string'
         ? source.timestamp
@@ -1049,7 +1140,11 @@ const mapTick = (payload: unknown): PriceTick => {
     last: raw.last,
     volume: raw.volume,
     time: parseDate(timestampSource ?? raw.time),
-    spread: raw.ask - raw.bid,
+    ...(mt5TimeMsc > 0 ? { mt5_time_msc: mt5TimeMsc, mt5TimeMsc } : {}),
+    ...(mt5Time > 0 ? { mt5_time: mt5Time, mt5Time } : {}),
+    ...(serverTimeMsc > 0 ? { server_time_msc: serverTimeMsc, serverTimeMsc } : {}),
+    ...(serverReceivedMsc > 0 ? { server_received_msc: serverReceivedMsc, serverReceivedMsc } : {}),
+    spread: raw.bid > 0 && raw.ask > 0 ? raw.ask - raw.bid : undefined,
   };
 };
 
@@ -1100,12 +1195,15 @@ const mapOhlcPayload = (payload: unknown): OhlcPayload | null => {
     payload.timeframe ??
     payload.periodMinutes ??
     payload.period_minutes;
-  const volume =
-    payload.volume ??
-    payload.tickVolume ??
-    payload.tick_volume ??
-    payload.realVolume ??
-    payload.real_volume;
+  const normalizedVolume = firstPositiveNumber(
+    payload.volume,
+    payload.tick_volume,
+    payload.tickVolume,
+    payload.real_volume,
+    payload.realVolume,
+    payload.volume_real,
+    payload.volumeReal,
+  );
   const source = parseOptionalString(payload.source);
   // Derived broker/live OHLC is still real market data. Keep explicit continuity
   // markers separate so backend backfill metadata can decide how to render gaps.
@@ -1128,7 +1226,7 @@ const mapOhlcPayload = (payload: unknown): OhlcPayload | null => {
     high: parseNumber(payload.high),
     low: parseNumber(payload.low),
     close: parseNumber(payload.close),
-    volume: parseNumber(volume),
+    volume: normalizedVolume,
     openTimeMs: parseInteger(openTimeMs),
     closeTimeMs:
       closeTimeMs !== undefined
@@ -2173,7 +2271,7 @@ const isKnownRealOhlcSource = (source: string | undefined): boolean => {
     normalized === 'rust_realtime' ||
     normalized === 'mt5_tick' ||
     normalized === 'mt5_live_tick' ||
-    /chart|history|ohlc|server|manager/.test(normalized)
+    /chart|history|ohlc|cache|server|manager|database|rust_db|backend|upstream|\bdb\b/.test(normalized)
   );
 };
 

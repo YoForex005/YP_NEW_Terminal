@@ -632,18 +632,15 @@ const liveRuntimeStore = createStore<LiveRuntimeState>()((set, get) => ({
   },
   setPositions: (positions) => {
     set((state) => {
-      let knownClosedTickets = state.knownClosedTickets;
-
-      for (const position of positions) {
-        if (knownClosedTickets.has(position.ticket)) {
-          knownClosedTickets = new Set(knownClosedTickets);
-          knownClosedTickets.delete(position.ticket);
-        }
+      if (state.knownClosedTickets.size === 0) {
+        return { positions };
       }
 
-      return knownClosedTickets === state.knownClosedTickets
-        ? { positions }
-        : { positions, knownClosedTickets };
+      return {
+        positions: positions.filter(
+          (position) => !state.knownClosedTickets.has(position.ticket),
+        ),
+      };
     });
   },
   addPosition: (position) => {

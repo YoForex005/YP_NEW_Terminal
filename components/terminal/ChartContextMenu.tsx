@@ -69,6 +69,7 @@ const TIMEFRAMES: { label: string; minutes: number }[] = [
     { label: 'D1', minutes: 1440 },
     { label: 'W1', minutes: 10080 },
     { label: 'MN', minutes: 43200 },
+    { label: 'Y1', minutes: 525600 },
 ];
 
 const INDICATORS = [

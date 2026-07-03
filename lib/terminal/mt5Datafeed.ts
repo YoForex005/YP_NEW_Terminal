@@ -193,6 +193,8 @@ function getResolutionMinutes(resolution: string): number {
 
     if (resolution === 'D' || resolution === '1D') return 1440;
     if (resolution === 'W' || resolution === '1W') return 10080;
+    if (resolution === 'M' || resolution === '1M' || resolution === 'MN') return 43200;
+    if (resolution === 'Y' || resolution === '1Y' || resolution === 'Y1') return 525600;
     return 1;
 }
 
@@ -207,6 +209,17 @@ function normalizeUnixMs(value: unknown): number | null {
             ? numeric * 1000
             : numeric,
     );
+}
+
+function firstPositiveNumber(...values: unknown[]): number {
+    for (const value of values) {
+        const parsed = Number(value);
+        if (Number.isFinite(parsed) && parsed > 0) {
+            return parsed;
+        }
+    }
+
+    return 0;
 }
 
 function normalizeHistoryBar(rawBar: any, resolutionMinutes: number): DatafeedBar | null {
@@ -225,7 +238,15 @@ function normalizeHistoryBar(rawBar: any, resolutionMinutes: number): DatafeedBa
     const high = Number(rawBar?.high);
     const low = Number(rawBar?.low);
     const close = Number(rawBar?.close);
-    const volume = Number(rawBar?.volume);
+    const volume = firstPositiveNumber(
+        rawBar?.volume,
+        rawBar?.tick_volume,
+        rawBar?.tickVolume,
+        rawBar?.real_volume,
+        rawBar?.realVolume,
+        rawBar?.volume_real,
+        rawBar?.volumeReal,
+    );
 
     if (
         !time ||
@@ -247,7 +268,7 @@ function normalizeHistoryBar(rawBar: any, resolutionMinutes: number): DatafeedBa
         high: Math.max(high, open, close),
         low: Math.min(low, open, close),
         close,
-        volume: Number.isFinite(volume) && volume > 0 ? volume : 0,
+        volume,
         sourceTimeMs: rawBar?.sourceTimeMs ?? rawTime,
         ...(typeof rawBar?.source === 'string' && rawBar.source.trim()
             ? { source: rawBar.source.trim() }

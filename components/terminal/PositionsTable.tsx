@@ -1,9 +1,10 @@
 'use client';
 
 import type { Position, ClosedTrade } from '@/lib/terminal/types';
+import type { Order } from '@/types/webtrader';
+import dynamic from 'next/dynamic';
 import { X, Layers, MoreVertical, Briefcase, XCircle, Droplet, Edit2, Database, GripVertical, AlertTriangle, Loader2, RefreshCw } from 'lucide-react';
-import ModifyPositionModal from './ModifyPositionModal';
-import { useState, useEffect, useRef, useMemo, type Dispatch, type SetStateAction } from 'react';
+import { memo, useCallback, useState, useEffect, useRef, useMemo, type Dispatch, type SetStateAction } from 'react';
 import { usePriceBySymbol } from '@/store/webtrader-store';
 import { SymbolIcon } from './SymbolIcon';
 import { getSafePriceDigits } from '@/lib/terminal/price-digits';
@@ -11,6 +12,7 @@ import { formatMt5DateTimeShort } from '@/lib/mt5-time';
 
 interface PositionsTableProps {
     openPositions: Position[];
+    pendingOrders?: Order[];
     closedTrades: ClosedTrade[];
     positionsLoading?: boolean;
     positionsError?: string | null;
@@ -33,6 +35,11 @@ type DisplayPosition = Position & {
     isHedged: boolean;
     positions: Position[];
 };
+
+const ModifyPositionModal = dynamic(() => import('./ModifyPositionModal'), {
+    ssr: false,
+    loading: () => null,
+});
 
 function LoadingState({ title, message }: { title: string; message: string }) {
     return (
@@ -127,6 +134,7 @@ function RetryableErrorBanner({
 
 export default function PositionsTable({
     openPositions,
+    pendingOrders = [],
     closedTrades,
     positionsLoading = false,
     positionsError = null,
@@ -149,7 +157,7 @@ export default function PositionsTable({
     const [isGrouped, setIsGrouped] = useState(false);
     const columnsMenuRef = useRef<HTMLDivElement>(null);
 
-    const [columns, setColumns] = useState([
+    const [columns, setColumns] = useState(() => [
         { id: 'type', label: 'Type', visible: true },
         { id: 'volume', label: 'Volume', visible: true },
         { id: 'openPrice', label: 'Open price', visible: true },
@@ -162,18 +170,23 @@ export default function PositionsTable({
         { id: 'marketCloses', label: 'Market closes in', visible: false },
     ]);
 
-    const toggleColumn = (id: string) => {
+    const toggleColumn = useCallback((id: string) => {
         setColumns(cols => cols.map(c => c.id === id ? { ...c, visible: !c.visible } : c));
-    };
+    }, []);
 
-    const isVisible = (id: string) => columns.find(c => c.id === id)?.visible;
+    const visibleColumns = useMemo(
+        () => new Set(columns.filter((column) => column.visible).map((column) => column.id)),
+        [columns],
+    );
 
-    const handleTabChange = (tabId: 'open' | 'pending' | 'closed') => {
+    const isVisible = useCallback((id: string) => visibleColumns.has(id), [visibleColumns]);
+
+    const handleTabChange = useCallback((tabId: 'open' | 'pending' | 'closed') => {
         setActiveTab(tabId);
         if (tabId === 'closed' && !closedHistoryLoaded) {
             onOpenClosedTab?.();
         }
-    };
+    }, [closedHistoryLoaded, onOpenClosedTab]);
 
     useEffect(() => {
         function handleClickOutside(event: MouseEvent) {
@@ -196,14 +209,14 @@ export default function PositionsTable({
         }
     }, [activeTab, closedHistoryError, closedHistoryLoaded, closedHistoryLoading, onOpenClosedTab]);
 
-    const handleEditComplete = (id: string, field: 'tp' | 'sl', value: string) => {
+    const handleEditComplete = useCallback((id: string, field: 'tp' | 'sl', value: string) => {
         if (!onUpdatePosition) return;
         const numValue = value === '' ? null : parseFloat(value);
         if (value !== '' && isNaN(numValue as number)) return; // Invalid input
 
         onUpdatePosition(id, { [field]: numValue });
         setEditingCell(null);
-    };
+    }, [onUpdatePosition]);
 
     const displayPositions = useMemo<DisplayPosition[]>(() => {
         if (!isGrouped) {
@@ -243,11 +256,11 @@ export default function PositionsTable({
         }, {} as Record<string, DisplayPosition>));
     }, [isGrouped, openPositions]);
 
-    const tabs = [
+    const tabs = useMemo(() => [
         { id: 'open' as const, label: 'Open', count: openPositions.length },
-        { id: 'pending' as const, label: 'Pending', count: 0 },
+        { id: 'pending' as const, label: 'Pending', count: pendingOrders.length },
         { id: 'closed' as const, label: 'Closed', count: closedTrades.length },
-    ];
+    ], [closedTrades.length, openPositions.length, pendingOrders.length]);
 
     return (
         <div className="flex flex-col h-full text-[12px] bg-background">
@@ -431,11 +444,42 @@ export default function PositionsTable({
                 )}
 
                 {activeTab === 'pending' && (
-                    <div className="flex flex-col items-center justify-center h-[200px] gap-2 border border-dashed border-border/40 rounded-[6px] m-4 bg-card/10 select-none animate-in fade-in-50 duration-300">
-                        <Briefcase size={36} strokeWidth={1.2} className="text-muted-foreground/40 animate-pulse" />
-                        <p className="text-[11px] font-bold text-muted-foreground/60 tracking-wider uppercase">No pending orders</p>
-                        <p className="text-[10px] text-muted-foreground/45 max-w-[200px] text-center">Your limit or stop orders will show here.</p>
-                    </div>
+                    pendingOrders.length === 0 ? (
+                        <div className="flex flex-col items-center justify-center h-[200px] gap-2 border border-dashed border-border/40 rounded-[6px] m-4 bg-card/10 select-none animate-in fade-in-50 duration-300">
+                            <Briefcase size={36} strokeWidth={1.2} className="text-muted-foreground/40 animate-pulse" />
+                            <p className="text-[11px] font-bold text-muted-foreground/60 tracking-wider uppercase">No pending orders</p>
+                            <p className="text-[10px] text-muted-foreground/45 max-w-[200px] text-center">Your limit or stop orders will show here.</p>
+                        </div>
+                    ) : (
+                        <table className="min-w-[1160px] w-full text-left border-collapse">
+                            <thead>
+                                <tr className="text-muted-foreground text-[10px] uppercase tracking-wider font-semibold sticky top-0 z-20 border-b border-border/40 bg-card select-none">
+                                    <th className="pl-4 py-2 font-semibold w-[120px]">Symbol</th>
+                                    {isVisible('type') && <th className="py-2 font-semibold w-[80px]">Type</th>}
+                                    {isVisible('volume') && <th className="py-2 font-semibold w-[90px]">Volume, lot</th>}
+                                    {isVisible('openPrice') && <th className="py-2 font-semibold w-[90px]">Open price</th>}
+                                    {isVisible('currentPrice') && <th className="py-2 font-semibold w-[100px]">Current price</th>}
+                                    {isVisible('tp') && <th className="py-2 font-semibold w-[70px]">T/P</th>}
+                                    {isVisible('sl') && <th className="py-2 font-semibold w-[70px]">S/L</th>}
+                                    {isVisible('ticket') && <th className="py-2 font-semibold w-[80px]">Order</th>}
+                                    {isVisible('openTime') && <th className="py-2 font-semibold w-[160px] min-w-[160px]">Open time</th>}
+                                    {isVisible('swap') && <th className="py-2 font-semibold w-[80px]">State</th>}
+                                    {isVisible('marketCloses') && <th className="py-2 font-semibold w-[100px]">Market closes in</th>}
+                                    <th className="text-right pr-3 py-2 font-semibold w-[100px] min-w-[100px] sticky right-[60px] z-30 bg-card">P/L, USD</th>
+                                    <th className="w-[60px] min-w-[60px] sticky right-0 z-30 bg-card"></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {pendingOrders.map((order) => (
+                                    <PendingOrderRow
+                                        key={order.ticket}
+                                        order={order}
+                                        isVisible={isVisible}
+                                    />
+                                ))}
+                            </tbody>
+                        </table>
+                    )
                 )}
 
                 {activeTab === 'closed' && (
@@ -504,20 +548,21 @@ export default function PositionsTable({
                 )}
             </div>
 
-            {/* Modify Position Modal */}
-            <ModifyPositionModal
-                isOpen={modifyingPosition !== null}
-                onClose={() => setModifyingPosition(null)}
-                position={modifyingPosition}
-                onUpdate={(id, updates) => {
-                    onUpdatePosition?.(id, updates);
-                    setModifyingPosition(null);
-                }}
-                onClosePosition={(id) => {
-                    onClosePosition(id);
-                    setModifyingPosition(null);
-                }}
-            />
+            {modifyingPosition ? (
+                <ModifyPositionModal
+                    isOpen={true}
+                    onClose={() => setModifyingPosition(null)}
+                    position={modifyingPosition}
+                    onUpdate={(id: string, updates: { sl?: number | null; tp?: number | null }) => {
+                        onUpdatePosition?.(id, updates);
+                        setModifyingPosition(null);
+                    }}
+                    onClosePosition={(id: string) => {
+                        onClosePosition(id);
+                        setModifyingPosition(null);
+                    }}
+                />
+            ) : null}
         </div>
     );
 }
@@ -533,7 +578,7 @@ interface OpenPositionRowProps {
     isChild?: boolean;
 }
 
-function OpenPositionRow({
+function OpenPositionRowComponent({
     pos,
     isVisible,
     editingCell,
@@ -572,6 +617,7 @@ function OpenPositionRow({
             : undefined;
     const isHedged = pos.isHedged;
     const isAggregated = pos.isAggregated;
+    const isOptimistic = pos.id.startsWith('optimistic-') || pos.ticket === 'Syncing' || (pos as Position & { isOptimistic?: boolean }).isOptimistic === true;
 
     useEffect(() => {
         prevPrice.current = displayCurrentPrice;
@@ -657,8 +703,10 @@ function OpenPositionRow({
                 <td className="py-0 font-mono">
                     {isAggregated ? <span className="text-muted-foreground">--</span> : (
                         <div
-                            className="group/cell cursor-pointer relative inline-block"
-                            onClick={() => setEditingCell({ id: pos.id, field: 'tp', value: pos.tp ? pos.tp.toString() : '' })}
+                            className={`group/cell relative inline-block ${isOptimistic ? 'cursor-default' : 'cursor-pointer'}`}
+                            onClick={() => {
+                                if (!isOptimistic) setEditingCell({ id: pos.id, field: 'tp', value: pos.tp ? pos.tp.toString() : '' });
+                            }}
                         >
                             {editingCell?.id === pos.id && editingCell?.field === 'tp' ? (
                                 <input
@@ -684,8 +732,10 @@ function OpenPositionRow({
                 <td className="py-0 font-mono">
                     {isAggregated ? <span className="text-muted-foreground">--</span> : (
                         <div
-                            className="group/cell cursor-pointer relative inline-block"
-                            onClick={() => setEditingCell({ id: pos.id, field: 'sl', value: pos.sl ? pos.sl.toString() : '' })}
+                            className={`group/cell relative inline-block ${isOptimistic ? 'cursor-default' : 'cursor-pointer'}`}
+                            onClick={() => {
+                                if (!isOptimistic) setEditingCell({ id: pos.id, field: 'sl', value: pos.sl ? pos.sl.toString() : '' });
+                            }}
                         >
                             {editingCell?.id === pos.id && editingCell?.field === 'sl' ? (
                                 <input
@@ -706,7 +756,11 @@ function OpenPositionRow({
                 </td>
             )}
 
-            {isVisible('ticket') && <td className="py-0 font-mono text-foreground">{!isAggregated && pos.ticket}</td>}
+            {isVisible('ticket') && (
+                <td className="py-0 font-mono text-foreground">
+                    {!isAggregated && (isOptimistic ? <span className="text-muted-foreground">--</span> : pos.ticket)}
+                </td>
+            )}
             {isVisible('openTime') && (
                 <td className="py-0 font-mono text-foreground whitespace-nowrap">
                     {formatMt5DateTimeShort(pos.openTime) || pos.openTime}
@@ -726,22 +780,29 @@ function OpenPositionRow({
                 <div className={`flex items-center justify-end gap-1 w-full h-full min-h-[30px] pr-2 ${isChild ? 'bg-accent/10' : isAggregated ? 'bg-accent/20' : 'bg-transparent'} group-hover:bg-accent/40 transition-colors`}>
                     {!isAggregated && (
                         <button 
-                            onClick={(e) => { e.stopPropagation(); setModifyingPosition(pos); }}
-                            className="p-1 rounded-[2px] hover:bg-accent text-muted-foreground hover:text-foreground transition-all"
+                            onClick={(e) => {
+                                e.stopPropagation();
+                                if (!isOptimistic) setModifyingPosition(pos);
+                            }}
+                            className={`p-1 rounded-[2px] transition-all ${isOptimistic ? 'cursor-default text-muted-foreground/35' : 'text-muted-foreground hover:bg-accent hover:text-foreground'}`}
+                            aria-disabled={isOptimistic ? true : undefined}
                         >
                             <Edit2 size={12} strokeWidth={2} />
                         </button>
                     )}
                     <button
                         onClick={(e) => { 
-                            e.stopPropagation(); 
-                            if (isAggregated && pos.positions) {
-                                pos.positions.forEach(p => onClosePosition(p.id));
-                            } else {
-                                onClosePosition(pos.id); 
+                            e.stopPropagation();
+                            if (!isOptimistic) {
+                                if (isAggregated && pos.positions) {
+                                    pos.positions.forEach(p => onClosePosition(p.id));
+                                } else {
+                                    onClosePosition(pos.id);
+                                }
                             }
                         }}
-                        className="p-1 rounded-[2px] hover:bg-accent text-muted-foreground hover:text-foreground transition-all"
+                        className={`p-1 rounded-[2px] transition-all ${isOptimistic ? 'cursor-default text-muted-foreground/35' : 'text-muted-foreground hover:bg-accent hover:text-foreground'}`}
+                        aria-disabled={isOptimistic ? true : undefined}
                     >
                         <XCircle size={13} strokeWidth={1.5} />
                     </button>
@@ -764,3 +825,107 @@ function OpenPositionRow({
         </>
     );
 }
+
+const OpenPositionRow = memo(OpenPositionRowComponent);
+
+interface PendingOrderRowProps {
+    order: Order;
+    isVisible: (id: string) => boolean | undefined;
+}
+
+const getPendingOrderSide = (type: Order['type']) => (
+    String(type).toLowerCase().startsWith('sell') ? 'sell' : 'buy'
+);
+
+const formatPendingOrderType = (type: Order['type']) => (
+    String(type)
+        .split('_')
+        .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+        .join(' ')
+);
+
+function PendingOrderRowComponent({ order, isVisible }: PendingOrderRowProps) {
+    const rawLivePrice = usePriceBySymbol(order.symbol);
+    const side = getPendingOrderSide(order.type);
+    const currentPrice = rawLivePrice
+        ? (side === 'buy' ? rawLivePrice.ask : rawLivePrice.bid)
+        : order.priceCurrent;
+    const priceDigits = getSafePriceDigits(undefined);
+    const openPrice = Number.isFinite(order.openPrice) ? order.openPrice : 0;
+    const displayCurrentPrice = Number.isFinite(currentPrice) ? currentPrice : 0;
+    const volume = Number.isFinite(order.volumeCurrent) && order.volumeCurrent > 0
+        ? order.volumeCurrent
+        : order.volume;
+
+    return (
+        <tr className="group hover:bg-accent/40 border-b border-border/40 text-foreground text-[11px] h-[30px] bg-background">
+            <td className="pl-4 py-0 font-bold">
+                <div className="flex items-center gap-1.5">
+                    {order.symbol.includes('OIL') ? (
+                        <div className="w-3 h-3 flex items-center justify-center"><Droplet size={10} className="fill-foreground text-foreground" /></div>
+                    ) : (
+                        <div className="flex h-3 w-[18px] items-center justify-center overflow-hidden">
+                            <SymbolIcon symbol={order.symbol} className="scale-[0.6]" />
+                        </div>
+                    )}
+                    <span>{order.symbol}</span>
+                </div>
+            </td>
+            {isVisible('type') && (
+                <td className="py-0 font-medium h-full">
+                    <div className="flex items-center gap-1.5 h-full">
+                        <div className={`w-[6px] h-[6px] rounded-full ${side === 'buy' ? 'bg-success' : 'bg-destructive'}`} />
+                        <span className="text-foreground">{formatPendingOrderType(order.type)}</span>
+                    </div>
+                </td>
+            )}
+            {isVisible('volume') && (
+                <td className="py-0 font-mono text-foreground">{volume.toFixed(2)}</td>
+            )}
+            {isVisible('openPrice') && (
+                <td className="py-0 font-mono text-foreground">
+                    {openPrice > 0 ? openPrice.toFixed(priceDigits) : '--'}
+                </td>
+            )}
+            {isVisible('currentPrice') && (
+                <td className="py-0 font-mono text-foreground">
+                    {displayCurrentPrice > 0 ? displayCurrentPrice.toFixed(priceDigits) : '--'}
+                </td>
+            )}
+            {isVisible('tp') && (
+                <td className="py-0 font-mono text-muted-foreground">
+                    {order.tp ? order.tp.toFixed(priceDigits) : '--'}
+                </td>
+            )}
+            {isVisible('sl') && (
+                <td className="py-0 font-mono text-muted-foreground">
+                    {order.sl ? order.sl.toFixed(priceDigits) : '--'}
+                </td>
+            )}
+            {isVisible('ticket') && (
+                <td className="py-0 font-mono text-foreground">{order.ticket}</td>
+            )}
+            {isVisible('openTime') && (
+                <td className="py-0 font-mono text-foreground whitespace-nowrap">
+                    {formatMt5DateTimeShort(order.openTime) || String(order.openTime)}
+                </td>
+            )}
+            {isVisible('swap') && (
+                <td className="py-0 font-mono text-muted-foreground capitalize">{order.state}</td>
+            )}
+            {isVisible('marketCloses') && <td className="py-0 font-mono text-muted-foreground">--</td>}
+            <td className="p-0 sticky right-[60px] z-10 bg-background border-b border-border/40 w-[100px] min-w-[100px]">
+                <div className="flex items-center justify-end w-full h-full min-h-[30px] pr-3 font-mono font-medium text-muted-foreground group-hover:bg-accent/40 transition-colors">
+                    --
+                </div>
+            </td>
+            <td className="p-0 sticky right-0 z-20 bg-background border-b border-border/40 w-[60px] min-w-[60px]">
+                <div className="flex items-center justify-end gap-1 w-full h-full min-h-[30px] pr-2 group-hover:bg-accent/40 transition-colors">
+                    <span className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground/70">Pending</span>
+                </div>
+            </td>
+        </tr>
+    );
+}
+
+const PendingOrderRow = memo(PendingOrderRowComponent);

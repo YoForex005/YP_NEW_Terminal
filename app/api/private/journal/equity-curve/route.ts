@@ -6,6 +6,14 @@ import { requestAccountsBackend } from "@/lib/server/accounts-backend";
 export async function GET(request: NextRequest) {
     const auth = await authenticateRequest(request);
     if (!auth) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    const data = await requestAccountsBackend("/journal/equity-curve");
-    return NextResponse.json({ ok: true, data });
+    try {
+        const data = await requestAccountsBackend("/journal/equity-curve");
+        return NextResponse.json({ ok: true, data });
+    } catch (error) {
+        console.warn(
+            "[journal/equity-curve] backend unavailable; returning empty fallback:",
+            error instanceof Error ? error.message : error,
+        );
+        return NextResponse.json({ ok: true, data: [], degraded: true, fallbackSource: "local_empty" });
+    }
 }

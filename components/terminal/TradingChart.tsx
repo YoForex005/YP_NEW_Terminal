@@ -7,10 +7,6 @@ import { useTheme } from 'next-themes';
 import { memo, useMemo, useState, useRef, useEffect, useCallback, type MutableRefObject, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { ChartCandlesIcon, ChartHlcBarsIcon, ChartHollowCandlesIcon, ChartLineIcon } from './ChartIcons';
-import CompareSymbolModal from './CompareSymbolModal';
-import IndicatorsModal from './IndicatorsModal';
-import ChartSettingsModal from './ChartSettingsModal';
-import ChartContextMenu from './ChartContextMenu';
 import { usePriceBySymbol } from '@/store/webtrader-store';
 import { DEFAULT_CHART_TYPES, type ChartType } from '@/lib/terminal/chart-visual-config';
 
@@ -123,6 +119,75 @@ const KlineChartContainer = dynamic(() => import('./KlineChartContainer'), {
     ssr: false,
     loading: () => <ChartPaneLoadingFallback />,
 });
+
+const IndicatorsModal = dynamic(() => import('./IndicatorsModal'), {
+    ssr: false,
+    loading: () => null,
+});
+const CompareSymbolModal = dynamic(() => import('./CompareSymbolModal'), {
+    ssr: false,
+    loading: () => null,
+});
+const ChartSettingsModal = dynamic(() => import('./ChartSettingsModal'), {
+    ssr: false,
+    loading: () => null,
+});
+const ChartContextMenu = dynamic(() => import('./ChartContextMenu'), {
+    ssr: false,
+    loading: () => null,
+});
+
+const CHART_RUNTIME_FALLBACK_DELAY_MS = 140;
+const CHART_RUNTIME_IDLE_TIMEOUT_MS = 1_200;
+const SECONDARY_PANE_HYDRATION_STAGGER_MS = 180;
+
+function scheduleChartRuntimeMount(callback: () => void, delayMs = 0) {
+    if (typeof window === 'undefined') {
+        return () => {};
+    }
+
+    let cancelled = false;
+    let frameId: number | null = null;
+    let timeoutId: number | null = null;
+    let idleId: number | null = null;
+    const idleWindow = window as Window & {
+        requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number;
+        cancelIdleCallback?: (handle: number) => void;
+    };
+
+    const run = () => {
+        if (!cancelled) {
+            callback();
+        }
+    };
+
+    const queueRuntime = () => {
+        if (cancelled) return;
+
+        if (idleWindow.requestIdleCallback) {
+            idleId = idleWindow.requestIdleCallback(run, { timeout: CHART_RUNTIME_IDLE_TIMEOUT_MS });
+            return;
+        }
+
+        timeoutId = window.setTimeout(run, CHART_RUNTIME_FALLBACK_DELAY_MS);
+    };
+
+    frameId = window.requestAnimationFrame(() => {
+        if (delayMs > 0) {
+            timeoutId = window.setTimeout(queueRuntime, delayMs);
+            return;
+        }
+
+        queueRuntime();
+    });
+
+    return () => {
+        cancelled = true;
+        if (frameId !== null) window.cancelAnimationFrame(frameId);
+        if (timeoutId !== null) window.clearTimeout(timeoutId);
+        if (idleId !== null) idleWindow.cancelIdleCallback?.(idleId);
+    };
+}
 
 export interface ChartHistoryStatus {
     symbol: string;
@@ -283,6 +348,7 @@ function ChartPaneWithPriceSeed({
     chartBarSpacing,
     onChartBarSpacingChange,
     showTitle,
+    hydrationDelayMs = 0,
 }: {
     symbol: string;
     accountSessionScopeId?: string | null;
@@ -301,7 +367,22 @@ function ChartPaneWithPriceSeed({
     chartBarSpacing?: number | null;
     onChartBarSpacingChange?: (barSpacing: number) => void;
     showTitle?: boolean;
+    hydrationDelayMs?: number;
 }) {
+    const [isChartRuntimeReady, setIsChartRuntimeReady] = useState(false);
+
+    useEffect(() => {
+        if (isChartRuntimeReady) {
+            return;
+        }
+
+        return scheduleChartRuntimeMount(() => setIsChartRuntimeReady(true), hydrationDelayMs);
+    }, [hydrationDelayMs, isChartRuntimeReady]);
+
+    if (!isChartRuntimeReady) {
+        return <ChartPaneLoadingFallback />;
+    }
+
     return (
         <KlineFallbackChartPane
             symbol={symbol}
@@ -538,19 +619,25 @@ function TradingChart({
         return () => window.removeEventListener('keydown', onKey);
     }, []);
 
-    const chartTypeIcons: Record<ChartType, JSX.Element> = {
-        Bars: <ChartHlcBarsIcon />,
-        Candles: <ChartCandlesIcon />,
-        'Hollow Candles': <ChartHollowCandlesIcon />,
-        Line: <ChartLineIcon />,
-    };
-    const chartTypes: ChartTypeOption[] = DEFAULT_CHART_TYPES.map((label, index) => ({
-        id: String(index + 1),
-        label,
-        icon: chartTypeIcons[label],
-    }));
+    const chartTypes = useMemo<ChartTypeOption[]>(() => {
+        const chartTypeIcons: Record<ChartType, JSX.Element> = {
+            Bars: <ChartHlcBarsIcon />,
+            Candles: <ChartCandlesIcon />,
+            'Hollow Candles': <ChartHollowCandlesIcon />,
+            Line: <ChartLineIcon />,
+        };
 
-    const currentType = chartTypes.find(t => t.label === selectedChartType) || chartTypes[1];
+        return DEFAULT_CHART_TYPES.map((label, index) => ({
+            id: String(index + 1),
+            label,
+            icon: chartTypeIcons[label],
+        }));
+    }, []);
+
+    const currentType = useMemo(
+        () => chartTypes.find(t => t.label === selectedChartType) || chartTypes[1],
+        [chartTypes, selectedChartType],
+    );
 
     const layoutGridClass = activeLayoutPanes === 1
         ? 'grid-cols-1 grid-rows-1'
@@ -562,7 +649,10 @@ function TradingChart({
                     ? 'grid-cols-2 grid-rows-2'
                     : 'grid-cols-3 grid-rows-2';
 
-    const paneIndices = Array.from({ length: activeLayoutPanes }, (_, i) => i);
+    const paneIndices = useMemo(
+        () => Array.from({ length: activeLayoutPanes }, (_, i) => i),
+        [activeLayoutPanes],
+    );
 
     return (
         <div className="relative flex h-full min-h-0 w-full min-w-0 flex-1 select-none flex-col overflow-hidden bg-card">
@@ -775,30 +865,33 @@ function TradingChart({
                     onTimeframeChange={onTimeframeChange}
                     chartBarSpacing={chartBarSpacing}
                     onChartBarSpacingChange={onChartBarSpacingChange}
+                    hydrationDelayMs={paneIndex * SECONDARY_PANE_HYDRATION_STAGGER_MS}
                 />
                 </div>
                 ))}
             </div>
 
-            <IndicatorsModal isOpen={isIndicatorsOpen} onClose={() => setIsIndicatorsOpen(false)} />
-            <CompareSymbolModal isOpen={isCompareOpen} onClose={() => setIsCompareOpen(false)} />
-            <ChartSettingsModal isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} symbol={symbol} />
+            {isIndicatorsOpen ? <IndicatorsModal isOpen={isIndicatorsOpen} onClose={() => setIsIndicatorsOpen(false)} /> : null}
+            {isCompareOpen ? <CompareSymbolModal isOpen={isCompareOpen} onClose={() => setIsCompareOpen(false)} /> : null}
+            {isSettingsOpen ? <ChartSettingsModal isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} symbol={symbol} /> : null}
 
-            <ChartContextMenu
-                visible={contextMenu.visible}
-                x={contextMenu.x}
-                y={contextMenu.y}
-                symbol={symbol}
-                currentChartType={selectedChartType}
-                onClose={() => setContextMenu((s) => ({ ...s, visible: false }))}
-                onChangeChartType={(type) => setSelectedChartType(type)}
-                onOpenOrder={() => onOpenOrderPanel?.()}
-                onBuy={onBuy}
-                onSell={onSell}
-                onOpenIndicators={() => setIsIndicatorsOpen(true)}
-                onTakeScreenshot={() => chartControlRef.current?.takeScreenshot?.()}
-                onOpenProperties={() => setIsSettingsOpen(true)}
-            />
+            {contextMenu.visible ? (
+                <ChartContextMenu
+                    visible={contextMenu.visible}
+                    x={contextMenu.x}
+                    y={contextMenu.y}
+                    symbol={symbol}
+                    currentChartType={selectedChartType}
+                    onClose={() => setContextMenu((s) => ({ ...s, visible: false }))}
+                    onChangeChartType={(type: ChartType) => setSelectedChartType(type)}
+                    onOpenOrder={() => onOpenOrderPanel?.()}
+                    onBuy={onBuy}
+                    onSell={onSell}
+                    onOpenIndicators={() => setIsIndicatorsOpen(true)}
+                    onTakeScreenshot={() => chartControlRef.current?.takeScreenshot?.()}
+                    onOpenProperties={() => setIsSettingsOpen(true)}
+                />
+            ) : null}
 
             {/* Layout Portal */}
             {isLayoutMenuOpen && iframeBody && createPortal(

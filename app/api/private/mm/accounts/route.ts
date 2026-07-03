@@ -30,8 +30,14 @@ export async function GET(request: NextRequest) {
         });
     } catch (error: any) {
         return NextResponse.json({ 
-            ok: false, 
-            error: error.message || "Failed to fetch PAMM accounts" 
-        }, { status: 502 });
+            ok: true,
+            data: {
+                accounts: [],
+                total: 0,
+            },
+            degraded: true,
+            fallbackSource: "local_empty",
+            error: error.message || "Failed to fetch PAMM accounts",
+        }, { status: 200 });
     }
 }

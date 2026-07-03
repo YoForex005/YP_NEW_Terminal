@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Plus, Settings, ExternalLink, Activity, DollarSign, BarChart3, TrendingUp, MonitorPlay, Wallet, Lock, Key, Trash2, RefreshCw, Sparkles, Terminal, Archive, ArchiveRestore, ArrowUpCircle, Loader2, Zap } from "lucide-react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { formatCurrency } from "@/lib/utils";
 import { useDashboardData } from "@/components/dashboard/dashboard-data-provider";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -15,6 +16,179 @@ import { AccountPreviewModal } from "./account-preview-modal";
 import { ChangePasswordModal } from "./change-password-modal";
 import { AccountCredentialsModal } from "./account-credentials-modal";
 import type { TradingAccount } from "@/types/dashboard";
+import type { TradingAccountInfo } from "@/types/webtrader";
+import {
+    extractTerminalLaunchPositionsPayload,
+    extractTerminalLaunchSymbolsPayload,
+    writeTerminalFrontendLaunchSnapshot,
+} from "@/lib/terminal/terminal-launch-cache";
+
+const TERMINAL_LAST_ACCOUNT_GLOBAL_STORAGE_KEY = "terminal:last-account:global";
+const TERMINAL_LAUNCH_ACCOUNT_HINT_STORAGE_KEY = "terminal:launch-account-hint:v1";
+const TERMINAL_LAUNCH_ACCOUNT_HINT_TTL_MS = 2 * 60 * 1000;
+const TERMINAL_LAUNCH_WARMUP_TIMEOUT_MS = 6_500;
+const terminalLaunchWarmupsInFlight = new Set<string>();
+
+const getTerminalAccountLogin = (account: TradingAccount): string => {
+    const login = account.credentials?.login?.trim() || account.accountNumber?.trim() || "";
+    return /^\d+$/.test(login) ? login : "";
+};
+
+const getTerminalSessionAccountId = (account: TradingAccount): string => {
+    const login = getTerminalAccountLogin(account);
+    return login ? `mt5-${login}` : account.id;
+};
+
+const getTerminalHref = (account: TradingAccount): string =>
+    `/terminal?accountId=${encodeURIComponent(getTerminalSessionAccountId(account))}`;
+
+const toFiniteAccountNumber = (value: unknown, fallback = 0): number => {
+    const parsed = typeof value === "number" ? value : Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const buildTerminalAccountInfoSnapshot = (account: TradingAccount): TradingAccountInfo | null => {
+    const login = Number.parseInt(getTerminalAccountLogin(account), 10);
+    if (!Number.isFinite(login)) {
+        return null;
+    }
+
+    const balance = toFiniteAccountNumber(account.balance);
+    const equity = toFiniteAccountNumber(account.equity, balance);
+    const margin = toFiniteAccountNumber(account.margin);
+    const marginFree = toFiniteAccountNumber(account.freeMargin, Math.max(0, equity - margin));
+    const marginLevel = margin > 0 ? (equity / margin) * 100 : 0;
+
+    return {
+        login,
+        name: account.name || account.accountNumber || `MT5 ${login}`,
+        server: account.serverIp || account.credentials?.server || "",
+        currency: account.currency || "USD",
+        leverage: toFiniteAccountNumber(account.leverage, 100),
+        balance,
+        equity,
+        margin,
+        marginFree,
+        marginLevel,
+        marginInitial: margin,
+        marginMaintenance: margin,
+        profit: equity - balance,
+        swap: 0,
+        commission: 0,
+        credit: 0,
+        limitOrders: 0,
+        availableMargin: marginFree,
+    };
+};
+
+const rememberTerminalLaunchHint = (account: TradingAccount) => {
+    if (typeof window === "undefined") {
+        return;
+    }
+
+    const login = getTerminalAccountLogin(account);
+    const terminalAccountId = getTerminalSessionAccountId(account);
+    const now = Date.now();
+    const hint = {
+        accountId: terminalAccountId,
+        createdAtMs: now,
+        expiresAtMs: now + TERMINAL_LAUNCH_ACCOUNT_HINT_TTL_MS,
+        account: {
+            id: account.id,
+            accountNumber: account.accountNumber || login || account.id,
+            name: account.name,
+            platform: account.platform || "mt5",
+            type: account.type,
+            leverage: account.leverage,
+            serverIp: account.serverIp || account.credentials?.server,
+            currency: account.currency,
+            balance: account.balance,
+            equity: account.equity,
+            freeMargin: account.freeMargin,
+            margin: account.margin,
+            status: account.status,
+            createdAt: account.createdAt,
+        },
+    };
+
+    try {
+        window.localStorage.setItem(TERMINAL_LAST_ACCOUNT_GLOBAL_STORAGE_KEY, terminalAccountId);
+        window.localStorage.setItem(TERMINAL_LAUNCH_ACCOUNT_HINT_STORAGE_KEY, JSON.stringify(hint));
+    } catch {
+        // Best-effort only. The terminal can still fall back to URL/account hydration.
+    }
+};
+
+const fetchTerminalWarmupJson = async (url: string): Promise<unknown | null> => {
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), TERMINAL_LAUNCH_WARMUP_TIMEOUT_MS);
+
+    try {
+        const response = await fetch(url, {
+            cache: "no-store",
+            credentials: "include",
+            signal: controller.signal,
+            headers: { Accept: "application/json" },
+        });
+        if (!response.ok) {
+            return null;
+        }
+        return await response.json().catch(() => null);
+    } catch {
+        return null;
+    } finally {
+        window.clearTimeout(timeout);
+    }
+};
+
+const warmTerminalLaunch = (account: TradingAccount, router?: ReturnType<typeof useRouter>) => {
+    if (typeof window === "undefined") {
+        return;
+    }
+
+    const terminalAccountId = getTerminalSessionAccountId(account);
+    const terminalHref = getTerminalHref(account);
+    rememberTerminalLaunchHint(account);
+    writeTerminalFrontendLaunchSnapshot(terminalAccountId, {
+        source: "accounts-prefetch",
+        accountInfo: buildTerminalAccountInfoSnapshot(account),
+    });
+    router?.prefetch(terminalHref);
+
+    if (terminalLaunchWarmupsInFlight.has(terminalAccountId)) {
+        return;
+    }
+
+    terminalLaunchWarmupsInFlight.add(terminalAccountId);
+    void (async () => {
+        const encodedAccountId = encodeURIComponent(terminalAccountId);
+        const [positionsPayload, symbolsPayload] = await Promise.all([
+            fetchTerminalWarmupJson(`/api/trading/positions?accountId=${encodedAccountId}`),
+            fetchTerminalWarmupJson(`/api/trading/symbols?accountId=${encodedAccountId}`),
+            fetchTerminalWarmupJson("/api/auth/me"),
+            fetchTerminalWarmupJson("/api/private/dashboard/snapshot"),
+            fetchTerminalWarmupJson(`/api/private/accounts/${encodedAccountId}/terminal-session`),
+        ]);
+
+        const positions = extractTerminalLaunchPositionsPayload(positionsPayload);
+        if (positions.length > 0) {
+            writeTerminalFrontendLaunchSnapshot(terminalAccountId, {
+                source: "accounts-prefetch",
+                positions,
+            });
+        }
+
+        const symbols = extractTerminalLaunchSymbolsPayload(symbolsPayload);
+        if (symbols.length > 0) {
+            writeTerminalFrontendLaunchSnapshot(terminalAccountId, {
+                source: "accounts-prefetch",
+                symbols,
+            });
+        }
+    })().finally(() => {
+        window.setTimeout(() => terminalLaunchWarmupsInFlight.delete(terminalAccountId), 10_000);
+    });
+};
 
 const getAccountLoginSortValue = (account: TradingAccount): number | null => {
     const login = account.credentials?.login?.trim() || account.accountNumber?.trim() || "";
@@ -52,6 +226,7 @@ const getAccountCardTitle = (account: TradingAccount) => {
 };
 
 export function AccountsPageContent() {
+    const router = useRouter();
     const { tradingAccounts, archiveAccount, unarchiveAccount, deleteAccount, syncAccountBalance } = useTradingStore();
     const { isLoading, reload } = useDashboardData();
     const [isCreateAccountOpen, setIsCreateAccountOpen] = useState(false);
@@ -185,6 +360,22 @@ export function AccountsPageContent() {
             return matchesType && matchesPlatform && matchesStatus;
         })
         .sort(compareAccountsByLogin);
+
+    const primaryTerminalWarmupAccount = filteredAccounts.find(
+        (account) => account.status !== "Archived" && (account.platform === "mt5" || !account.platform),
+    );
+
+    useEffect(() => {
+        if (isLoading || !primaryTerminalWarmupAccount) {
+            return;
+        }
+
+        const timeout = window.setTimeout(() => {
+            warmTerminalLaunch(primaryTerminalWarmupAccount, router);
+        }, 800);
+
+        return () => window.clearTimeout(timeout);
+    }, [isLoading, primaryTerminalWarmupAccount, router]);
 
     if (isLoading && tradingAccounts.length === 0) {
         return (
@@ -493,9 +684,13 @@ export function AccountsPageContent() {
                                     {/* Open Terminal — only for active MT5 accounts */}
                                     {!isArchived && (account.platform === 'mt5' || !account.platform) && (
                                         <a
-                                            href={`/terminal?accountId=${account.id}`}
+                                            href={getTerminalHref(account)}
                                             target="_blank"
                                             rel="noopener noreferrer"
+                                            onPointerEnter={() => warmTerminalLaunch(account, router)}
+                                            onFocus={() => warmTerminalLaunch(account, router)}
+                                            onTouchStart={() => warmTerminalLaunch(account, router)}
+                                            onClick={() => warmTerminalLaunch(account, router)}
                                         >
                                             <Button
                                                 variant="ghost"

@@ -7,6 +7,27 @@ export async function GET(request: NextRequest) {
     const auth = await authenticateRequest(request);
     if (!auth) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     const subTab = request.nextUrl.searchParams.get("subTab") || "overview";
-    const data = await requestAccountsBackend("/journal/stats", { query: { subTab } });
-    return NextResponse.json({ ok: true, data });
+    try {
+        const data = await requestAccountsBackend("/journal/stats", { query: { subTab } });
+        return NextResponse.json({ ok: true, data });
+    } catch (error) {
+        console.warn(
+            "[journal/stats] backend unavailable; using local fallback:",
+            error instanceof Error ? error.message : error,
+        );
+        return NextResponse.json({
+            ok: true,
+            data: {
+                subTab,
+                totalTrades: 0,
+                winRate: 0,
+                profitFactor: 0,
+                totalVolume: 0,
+                averageWin: 0,
+                averageLoss: 0,
+            },
+            degraded: true,
+            fallbackSource: "local_defaults",
+        });
+    }
 }

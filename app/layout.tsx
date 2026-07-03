@@ -14,13 +14,13 @@ const inter = Inter({
 
 export const metadata: Metadata = {
   title: {
-    default: "fxtrusts",
-    template: "%s | fxtrusts",
+    default: "Yopips Web Terminal",
+    template: "%s | Yopips",
   },
-  description: "fxtrusts client dashboard for wallets, trading accounts, and platform activity.",
+  description: "Yopips web terminal for trading accounts, market data, charts, and order management.",
   icons: {
-    icon: "/fx-icon.svg",
-    apple: "/assets/logo_white.png",
+    icon: "/favicon.ico",
+    apple: "/assets/yopips-logo-white.png",
   },
 };
 

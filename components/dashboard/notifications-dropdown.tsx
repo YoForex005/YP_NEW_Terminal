@@ -149,7 +149,7 @@ export function NotificationsPanel({ isOpen, onClose }: NotificationsPanelProps)
                         {/* Footer / App Info */}
                         <div className="border-t border-border/30 bg-muted/5 px-6 py-4">
                             <p className="text-[9px] font-black uppercase tracking-[0.2em] text-muted-foreground/60 text-center">
-                                fxtrusts • v1.0.4
+                                Yopips Web Terminal v1.0.4
                             </p>
                         </div>
                     </motion.div>

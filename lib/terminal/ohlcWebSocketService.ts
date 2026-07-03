@@ -1,4 +1,8 @@
-import { getLivePriceSnapshotBySymbol, useWebtraderStore } from '@/store/webtrader-store';
+import {
+  getLivePriceSnapshotBySymbol,
+  subscribeToLivePriceBySymbol,
+  useWebtraderStore,
+} from '@/store/webtrader-store';
 import {
   DEFAULT_OHLC_HISTORY_LIMIT,
   getOhlcHistoryMetadata,
@@ -22,7 +26,18 @@ import {
 
 type WebtraderStoreSnapshot = ReturnType<typeof useWebtraderStore.getState>;
 
+function formatBackendTimeframe(timeframeMinutes: number): string {
+  if (timeframeMinutes === 525600) return 'Y1';
+  if (timeframeMinutes === 43200) return 'MN1';
+  if (timeframeMinutes === 10080) return 'W1';
+  if (timeframeMinutes % 1440 === 0) return `D${timeframeMinutes / 1440}`;
+  if (timeframeMinutes % 60 === 0) return `H${timeframeMinutes / 60}`;
+  return `M${timeframeMinutes}`;
+}
+
 export interface OHLCBar {
+  symbol?: string;
+  timeframeMinutes?: number;
   time: number;
   open: number;
   high: number;
@@ -115,6 +130,13 @@ type CachedHistoryRequest = {
 type OhlcHistoryPayloadResponse = {
   bars: unknown[];
   metadata?: OhlcHistoryResponseMetadata;
+};
+type HttpOhlcHistoryResponse = {
+  ok?: boolean;
+  bars?: unknown[];
+  metadata?: OhlcHistoryResponseMetadata;
+  error?: string;
+  code?: string;
 };
 type BackgroundHistoryRefreshRequest = {
   requestKey: string;
@@ -236,6 +258,17 @@ function normalizeOptionalInteger(value: unknown): number | undefined {
   }
 
   return Math.trunc(parsed);
+}
+
+function firstPositiveFiniteNumber(...values: unknown[]): number {
+  for (const value of values) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+
+  return 0;
 }
 
 function parseOptionalBoolean(value: unknown): boolean | undefined {
@@ -1067,7 +1100,7 @@ function isRawTickDerivedSource(source: string | undefined): boolean {
 
 function isHistoricalOhlcSource(source: string | undefined): boolean {
   source = source?.trim().toLowerCase() ?? '';
-  return /chart|history|ohlc|cache|server|manager/.test(source);
+  return /chart|history|ohlc|cache|server|manager|database|rust_db|backend|upstream|\bdb\b/.test(source);
 }
 
 function isLiveGeneratedBar(bar: OHLCBar): boolean {
@@ -1243,6 +1276,7 @@ export type OhlcSanitySymbolClass = 'fx' | 'fx_cross' | 'metals' | 'crypto' | 'd
 export type OhlcSanityRejectionReason =
   | 'invalid_ohlc_price'
   | 'invalid_ohlc_range'
+  | 'symbol_price_domain'
   | 'reference_price_deviation'
   | 'isolated_high_spike'
   | 'isolated_low_spike'
@@ -1318,6 +1352,8 @@ const OHLCSANITY_REJECTION_WARNING_LIMIT = 3;
 export const OHLCSANITY_REJECTED_LOG_KEY_LIMIT = 2_048;
 const OHLCSANITY_MIN_STALE_REFERENCE_GAP_MS = 10 * 60 * 1000;
 const OHLCSANITY_STALE_REFERENCE_GAP_BUCKETS = 20;
+const LIVE_BUCKET_ROLLOVER_GRACE_MS = 0;
+const LIVE_BUCKET_ROLLOVER_MAX_CATCHUP_BARS = 30;
 
 const OHLCSANITY_THRESHOLDS: Record<OhlcSanitySymbolClass, OhlcSanityThresholds> = {
   // Major FX pairs (EUR/USD, GBP/USD, AUD/USD, USD/CHF …)
@@ -1398,6 +1434,61 @@ const KNOWN_CRYPTO_BASES = [
 const HIGH_VOLATILITY_FX_QUOTE_CURRENCIES = new Set([
   'JPY', 'TRY', 'ZAR', 'MXN', 'NOK', 'SEK', 'HUF', 'CZK', 'PLN', 'RUB',
 ]);
+
+export function getOhlcSymbolPriceDomain(symbol: string): { min?: number; max?: number } | null {
+  const normalized = normalizeSymbolKey(symbol).toUpperCase();
+  if (!normalized) {
+    return null;
+  }
+
+  if (/^(BTC|XBT)/.test(normalized)) {
+    return { min: 1000, max: 2_000_000 };
+  }
+
+  if (/^ETH/.test(normalized)) {
+    return { min: 50, max: 200_000 };
+  }
+
+  if (/XAU|GOLD/.test(normalized)) {
+    return { min: 100, max: 50_000 };
+  }
+
+  if (/XAG|SILVER/.test(normalized)) {
+    return { min: 1, max: 500 };
+  }
+
+  if (/US30|DJI|DOW|US100|USTEC|NAS100|NAS|SPX|US500|GER40|DAX|UK100|JP225|HK50/.test(normalized)) {
+    return { min: 100, max: 500_000 };
+  }
+
+  const base = normalized.slice(0, 3);
+  const quote = normalized.slice(3, 6);
+  if (
+    normalized.length >= 6 &&
+    KNOWN_FX_CURRENCIES.has(base) &&
+    KNOWN_FX_CURRENCIES.has(quote)
+  ) {
+    return { min: 0.00001, max: 500 };
+  }
+
+  return null;
+}
+
+function isOhlcBarInsideSymbolPriceDomain(symbol: string, bar: OHLCBar): boolean {
+  const domain = getOhlcSymbolPriceDomain(symbol);
+  if (!domain) {
+    return true;
+  }
+
+  const prices = [bar.open, bar.high, bar.low, bar.close];
+  const minPrice = Math.min(...prices);
+  const maxPrice = Math.max(...prices);
+
+  return !(
+    (domain.min !== undefined && maxPrice < domain.min) ||
+    (domain.max !== undefined && minPrice > domain.max)
+  );
+}
 
 function getOhlcSanitySymbolClass(symbol: string): OhlcSanitySymbolClass {
   const normalized = normalizeSymbolKey(symbol).toUpperCase();
@@ -1537,6 +1628,32 @@ function evaluateBasicOhlcStructureSanity(
   return { accepted: true };
 }
 
+function evaluateOhlcStructureAndDomainSanity(
+  symbol: string,
+  bar: OHLCBar,
+  referenceClose?: number | null,
+): OhlcSanityDecision {
+  const structureDecision = evaluateBasicOhlcStructureSanity(bar, referenceClose);
+  if (!structureDecision.accepted) {
+    return structureDecision;
+  }
+
+  if (!isOhlcBarInsideSymbolPriceDomain(symbol, bar)) {
+    const symbolClass = getOhlcSanitySymbolClass(symbol);
+    return withOhlcSanityReferenceClose(
+      {
+        accepted: false,
+        reason: 'symbol_price_domain',
+        symbolClass,
+        thresholds: OHLCSANITY_THRESHOLDS[symbolClass],
+      },
+      referenceClose,
+    );
+  }
+
+  return { accepted: true };
+}
+
 function getOhlcSanityStaleReferenceGapMs(
   bucketMs?: number,
   overrideGapMs?: number,
@@ -1579,7 +1696,11 @@ export function evaluateOhlcBarSanity(
   referenceClose: number | null | undefined,
   options: OhlcSanityEvaluationOptions = {},
 ): OhlcSanityDecision {
-  const structureDecision = evaluateBasicOhlcStructureSanity(bar, referenceClose);
+  const structureDecision = evaluateOhlcStructureAndDomainSanity(
+    symbol,
+    bar,
+    referenceClose,
+  );
   if (!structureDecision.accepted) {
     return structureDecision;
   }
@@ -2002,12 +2123,13 @@ function filterChronologicalOhlcBarsBySanity(
     initialReference != null &&
     firstBarTime != null &&
     Math.abs(firstBarTime - initialReference.time) / bucketMs > 20;
+  const chronologicalInitialReference =
+    referenceGapTooLarge ? null : initialReference;
   let batchReference =
-    initialReference &&
+    chronologicalInitialReference &&
     firstReferenceBar &&
-    initialReference.time <= getOhlcSanityBarTime(firstReferenceBar) &&
-    !referenceGapTooLarge
-      ? initialReference
+    chronologicalInitialReference.time <= getOhlcSanityBarTime(firstReferenceBar)
+      ? chronologicalInitialReference
       : null;
   const preliminarilyAcceptedBars: OHLCBar[] = [];
 
@@ -2028,7 +2150,7 @@ function filterChronologicalOhlcBarsBySanity(
     const anchors = getChronologicalOhlcSanityAnchors(
       preliminarilyAcceptedBars,
       index,
-      initialReference,
+      chronologicalInitialReference,
       acceptedBars,
     );
     const decision = evaluateChronologicalOhlcBarIsolation(symbol, bar, anchors);
@@ -2219,7 +2341,11 @@ export function createOhlcSanityReferenceTracker(
     options: OhlcSanityReferenceTrackerAcceptOptions = {},
   ) => {
     if (isOhlcSanityReferenceStaleForBar(reference, bar, options)) {
-      const structureDecision = evaluateBasicOhlcStructureSanity(bar, reference?.close);
+      const structureDecision = evaluateOhlcStructureAndDomainSanity(
+        symbol,
+        bar,
+        reference?.close,
+      );
       if (!structureDecision.accepted) {
         reject(bar, structureDecision, source);
         return false;
@@ -2265,7 +2391,7 @@ function priceFromTickLike(value: unknown): number | null {
   }
 
   const source = value as { bid?: unknown; ask?: unknown; last?: unknown };
-  const candidates = [source.last, source.bid, source.ask]
+  const candidates = [source.bid, source.ask, source.last]
     .map((candidate) => Number(candidate))
     .filter((candidate) => Number.isFinite(candidate) && candidate > 0);
 
@@ -2436,6 +2562,9 @@ class OhlcWebSocketService {
   private subscribedKeys = new Set<SubKey>();
   private subscriberKeyIndex: Map<string, Set<SubKey>> = new Map();
   private subscriberKeyIndexAliases: Map<SubKey, Set<string>> = new Map();
+  private storePriceSubscriptionCounts: Map<string, number> = new Map();
+  private storePriceUnsubscribers: Map<string, () => void> = new Map();
+  private ingestedLivePriceKeys: Map<string, string> = new Map();
   private pendingSubscribeRequests: Map<SubKey, Promise<void>> = new Map();
   private pendingSubscribeAliases: Map<SubKey, Set<string>> = new Map();
   private pendingHistoryRequests: Map<string, PendingHistoryRequest> = new Map();
@@ -2458,11 +2587,19 @@ class OhlcWebSocketService {
     new Map<string, OhlcSanityRejectionWarningBudget>();
   private liveAggregateAnchoredSpikeBaselines =
     new Map<SubKey, LiveAggregateAnchoredSpikeBaseline>();
+  private useHistoryApi = true;
   // Tracks keys that have an active tail-gap fill in flight to prevent double-firing.
   private _tailGapFillKeys = new Set<SubKey>();
   private simulationInterval: ReturnType<typeof setInterval> | null = null;
   private currentBarLatestTickMs: Map<SubKey, number> = new Map();
   private _bucketExpiryTimer: ReturnType<typeof setInterval> | null = null;
+  // Offset between the broker/MT5 server clock and the local browser clock,
+  // sampled from live tick timestamps (serverTimeMs - browserReceiveMs). Candle
+  // buckets use the server clock (tick/bar timestamps), so every rollover timer
+  // must judge "now" on that same clock. getServerNowMs() = Date.now() + offset
+  // advances smoothly between ticks and stays aligned with the server's bars.
+  private _serverClockOffsetMs = 0;
+  private _hasServerClockOffset = false;
   // Fires instantly when the store's dedicated OHLC socket or fallback trading
   // socket changes so ensureClientAttached picks it up without waiting for the
   // poll loop.
@@ -2537,6 +2674,10 @@ class OhlcWebSocketService {
     }
   }
 
+  public setUseHistoryApi(enabled: boolean): void {
+    this.useHistoryApi = enabled;
+  }
+
   public ensureLocalSimulation() {
 
     if (this.hasLiveClient()) {
@@ -2579,7 +2720,17 @@ class OhlcWebSocketService {
     timestampMs?: unknown,
   ) {
     const receivedAtMs = Date.now();
-    const priceCandidates = [Number(last) || 0, bid, ask];
+    const normalizedBid = Number(bid);
+    const normalizedAsk = Number(ask);
+    const normalizedLast = Number(last);
+    const midpoint =
+      Number.isFinite(normalizedBid) &&
+      normalizedBid > 0 &&
+      Number.isFinite(normalizedAsk) &&
+      normalizedAsk > 0
+        ? (normalizedBid + normalizedAsk) / 2
+        : 0;
+    const priceCandidates = [midpoint, normalizedLast, normalizedBid, normalizedAsk];
     const price = priceCandidates.find((candidate) => Number.isFinite(candidate) && candidate > 0);
 
     if (!symbol.trim() || !price) {
@@ -2588,6 +2739,17 @@ class OhlcWebSocketService {
 
     const normalizedVolume = Math.max(0, Number(volume) || 0);
     const normalizedTimestamp = normalizeIncomingTickTimestampMs(timestampMs, receivedAtMs);
+    // Keep the broker/browser clock offset fresh so rollover timers stay on the
+    // same clock as the tick-driven candle buckets. Only sample when the tick
+    // carried a real server timestamp (not the receivedAtMs fallback).
+    if (parseIncomingTickTimestampMs(timestampMs) !== null) {
+      this._updateServerClockOffset(normalizedTimestamp, receivedAtMs);
+    }
+    const normalizedSymbol = normalizeSymbolKey(symbol);
+    const dedupeKey = `${normalizedTimestamp}:${bid}:${ask}:${Number(last) || 0}:${normalizedVolume}`;
+    if (normalizedSymbol && this.ingestedLivePriceKeys.get(normalizedSymbol) === dedupeKey) {
+      return;
+    }
 
     const acceptedLatestTick = this._rememberLatestTick(
       symbol,
@@ -2596,8 +2758,8 @@ class OhlcWebSocketService {
       normalizedTimestamp,
       'mt5_tick',
     );
-    if (!acceptedLatestTick) {
-      return;
+    if (normalizedSymbol) {
+      this.ingestedLivePriceKeys.set(normalizedSymbol, dedupeKey);
     }
 
     if (this.subscribers.size === 0) {
@@ -2610,6 +2772,7 @@ class OhlcWebSocketService {
       normalizedVolume,
       normalizedTimestamp,
       'mt5_tick',
+      receivedAtMs,
     );
   }
 
@@ -2625,6 +2788,7 @@ class OhlcWebSocketService {
     if (!this.subscribers.has(key)) {
       this.subscribers.set(key, new Set());
       this._indexSubscriberKey(key);
+      this._retainStorePriceSubscription(symbol);
       void this._sendSubscribe(symbol, timeframeMinutes);
       void this._waitForLiveClientAttached().then((attached) => {
         if (attached && this.subscribers.has(key)) {
@@ -2652,6 +2816,7 @@ class OhlcWebSocketService {
       if (callbacks.size === 0) {
         this.subscribers.delete(key);
         this._removeSubscriberKeyFromIndex(key);
+        this._releaseStorePriceSubscription(symbol);
         void Promise.resolve().then(() => {
           if (!this.subscribers.has(key)) {
             void this._sendUnsubscribe(symbol, timeframeMinutes);
@@ -3374,6 +3539,37 @@ class OhlcWebSocketService {
   }
 
   /**
+   * Re-samples the broker-vs-browser clock offset from one observed pair of
+   * (server timestamp, local receive time). Lightly smoothed so per-tick network
+   * latency jitter doesn't wobble the offset; snaps immediately on first sample.
+   */
+  private _updateServerClockOffset(serverMs: number, receivedAtMs: number): void {
+    if (
+      !Number.isFinite(serverMs) || serverMs <= 0 ||
+      !Number.isFinite(receivedAtMs) || receivedAtMs <= 0
+    ) {
+      return;
+    }
+    const sample = serverMs - receivedAtMs;
+    this._serverClockOffsetMs = this._hasServerClockOffset
+      ? Math.round(this._serverClockOffsetMs * 0.8 + sample * 0.2)
+      : sample;
+    this._hasServerClockOffset = true;
+  }
+
+  /**
+   * Current time on the broker/MT5 server clock, in UTC ms. This is the clock
+   * candle buckets live on, so rollover/expiry timers must use this — NOT
+   * Date.now() — or any broker timezone offset desyncs the live candle from the
+   * server's history bars. Falls back to Date.now() until the first tick lands.
+   */
+  public getServerNowMs(): number {
+    return this._hasServerClockOffset
+      ? Date.now() + this._serverClockOffsetMs
+      : Date.now();
+  }
+
+  /**
    * Synchronously returns whatever bars are already in the local history cache
    * for a given symbol + timeframe. Used by the chart on mount to seed itself
    * instantly — zero network round-trip, zero timer delay.
@@ -3744,7 +3940,8 @@ class OhlcWebSocketService {
 
     // Seed current bar for subscribers; don't return as history when live client present -
     // it is an in-progress live candle, not completed history.
-    this._seedCurrentBarFromLatestTick(key) || this._seedCurrentBarFromStorePrice(key);
+    this._seedCurrentBarFromLatestTick(key, { allowWithHistory: true }) ||
+      this._seedCurrentBarFromStorePrice(key, { allowWithHistory: true });
 
     if (canUseLocalHistoryFallback && !this.hasLiveClient()) {
       const local = range.cacheOnly
@@ -3858,6 +4055,7 @@ class OhlcWebSocketService {
     this.detachOhlcHistoryMetadataListener = null;
     this.wsClient = null;
     this.sessionId = null;
+    this._clearStorePriceSubscriptions();
     this.subscribers.clear();
     this._clearSessionScopedState();
   }
@@ -4306,7 +4504,19 @@ class OhlcWebSocketService {
       high: Number(bar.high) || 0,
       low: Number(bar.low) || 0,
       close: Number(bar.close) || 0,
-      volume: Number(bar.volume) || 0,
+      volume: firstPositiveFiniteNumber(
+        bar.volume,
+        bar.tick_volume,
+        bar.tickVolume,
+        bar.real_volume,
+        bar.realVolume,
+        bar.volume_real,
+        bar.volumeReal,
+      ),
+      symbol: parseOptionalString(bar.symbol),
+      timeframeMinutes: normalizeOptionalInteger(
+        bar.timeframeMinutes ?? bar.timeframe_minutes ?? bar.timeframe,
+      ),
       source,
       derived: (!isKnownRealSource && bar.derived === true) ? true : continuity ? true : undefined,
       continuity: continuity ? true : undefined,
@@ -4659,7 +4869,11 @@ class OhlcWebSocketService {
       const barTime = getOhlcSanityBarTime(bar);
       if (barTime > 0 && reference.time > 0 && barTime - reference.time > STALE_REFERENCE_GAP_MS) {
         // Reference is stale — accept this bar and use it as the new reference
-        const structureDecision = evaluateBasicOhlcStructureSanity(bar, reference.close);
+        const structureDecision = evaluateOhlcStructureAndDomainSanity(
+          symbol,
+          bar,
+          reference.close,
+        );
         if (!structureDecision.accepted) {
           this._logOhlcSanityRejection(symbol, bar, source, structureDecision);
           return false;
@@ -4834,7 +5048,11 @@ class OhlcWebSocketService {
     // Stale-reference bypass: if the key-scoped reference is too old, start a
     // fresh baseline for this symbol/timeframe instead of rejecting real gaps.
     if (isOhlcSanityReferenceStaleForBar(reference, bar, { bucketMs: this._bucketMsForKey(key) })) {
-      const structureDecision = evaluateBasicOhlcStructureSanity(bar, reference?.close);
+      const structureDecision = evaluateOhlcStructureAndDomainSanity(
+        symbol,
+        bar,
+        reference?.close,
+      );
       if (!structureDecision.accepted) {
         this._logOhlcSanityRejection(symbol, bar, source, structureDecision);
         return false;
@@ -5059,6 +5277,24 @@ class OhlcWebSocketService {
       isContinuity: true,
       synthetic: true,
       basis: 'prior_close',
+    };
+  }
+
+  private _liveRolloverBar(time: number, price: number, previousBar: OHLCBar): OHLCBar {
+    const open = previousBar.close > 0 ? previousBar.close : price;
+    return {
+      symbol: previousBar.symbol,
+      timeframeMinutes: previousBar.timeframeMinutes,
+      time,
+      open,
+      high: Math.max(open, price),
+      low: Math.min(open, price),
+      close: price,
+      // Use one visual tick so flat rollover candles render like a live terminal candle.
+      volume: 1,
+      source: 'mt5_tick',
+      sourceTimeMs: time,
+      basis: 'rollover_last_close',
     };
   }
 
@@ -5419,8 +5655,10 @@ class OhlcWebSocketService {
       this._seedLocalHistoryFromRawCache(key);
     }
 
-    if (this._getLocalHistory(key).length === 0) {
-      this._seedCurrentBarFromLatestTick(key) || this._seedCurrentBarFromStorePrice(key);
+    if (!this.currentBars.has(key)) {
+      this._seedCurrentBarFromLatestHistory(key) ||
+        this._seedCurrentBarFromLatestTick(key, { allowWithHistory: true }) ||
+        this._seedCurrentBarFromStorePrice(key, { allowWithHistory: true });
     }
 
     const replayBars = this._getLocalHistory(key);
@@ -5518,8 +5756,60 @@ class OhlcWebSocketService {
     return latestTick ? { ...latestTick } : null;
   }
 
-  private _seedCurrentBarFromLatestTick(key: SubKey): boolean {
-    if (this._getLocalHistory(key).length > 0) {
+  private _seedCurrentBarFromLatestHistory(
+    key: SubKey,
+    nowMs = this.getServerNowMs(),
+  ): boolean {
+    if (this.currentBars.has(key)) {
+      return false;
+    }
+
+    const bucketMs = this._bucketMsForKey(key);
+    if (bucketMs <= 0) {
+      return false;
+    }
+
+    const history = this._getStoredHistory(key);
+    const previousBar = history[history.length - 1];
+    if (!previousBar || previousBar.close <= 0) {
+      return false;
+    }
+
+    const currentBucketTime = bucketTime(nowMs, bucketMs);
+    const latestTick = this._getLatestTickForSymbol(this._symbolFromKey(key));
+    const price = latestTick?.price && latestTick.price > 0
+      ? latestTick.price
+      : previousBar.close;
+    const seedTime = currentBucketTime > previousBar.time
+      ? currentBucketTime
+      : previousBar.time;
+    const seedBar = seedTime > previousBar.time
+      ? this._liveRolloverBar(seedTime, price, previousBar)
+      : {
+          ...previousBar,
+          sourceTimeMs: previousBar.sourceTimeMs ?? previousBar.time,
+        };
+
+    this.currentBars.set(key, seedBar);
+    this.currentBarLatestTickMs.set(
+      key,
+      latestTick?.timestampMs && latestTick.timestampMs > 0
+        ? latestTick.timestampMs
+        : seedTime,
+    );
+    this._notifySubscribers(key, { ...seedBar });
+    return true;
+  }
+
+  private _seedCurrentBarFromLatestTick(
+    key: SubKey,
+    options: { allowWithHistory?: boolean } = {},
+  ): boolean {
+    if (this.currentBars.has(key)) {
+      return false;
+    }
+
+    if (!options.allowWithHistory && this._getLocalHistory(key).length > 0) {
       return false;
     }
 
@@ -5538,8 +5828,15 @@ class OhlcWebSocketService {
     );
   }
 
-  private _seedCurrentBarFromStorePrice(key: SubKey): boolean {
-    if (this._getLocalHistory(key).length > 0) {
+  private _seedCurrentBarFromStorePrice(
+    key: SubKey,
+    options: { allowWithHistory?: boolean } = {},
+  ): boolean {
+    if (this.currentBars.has(key)) {
+      return false;
+    }
+
+    if (!options.allowWithHistory && this._getLocalHistory(key).length > 0) {
       return false;
     }
 
@@ -5552,9 +5849,20 @@ class OhlcWebSocketService {
     let volume = 0;
     let timestampMs = Date.now();
 
-    if (liveSnapshot && (liveSnapshot.bid > 0 || liveSnapshot.ask > 0)) {
-      seedPrice = liveSnapshot.bid > 0 ? liveSnapshot.bid : liveSnapshot.ask;
-      const snapTime = liveSnapshot.time instanceof Date ? liveSnapshot.time.getTime() : Date.now();
+    if (liveSnapshot && (liveSnapshot.bid > 0 || liveSnapshot.ask > 0 || (liveSnapshot.last ?? 0) > 0)) {
+      seedPrice =
+        liveSnapshot.bid > 0 && liveSnapshot.ask > 0
+          ? (liveSnapshot.bid + liveSnapshot.ask) / 2
+          : (liveSnapshot.last ?? 0) > 0
+            ? liveSnapshot.last!
+            : liveSnapshot.bid > 0
+              ? liveSnapshot.bid
+              : liveSnapshot.ask;
+      const snapTime = typeof liveSnapshot.receivedAtMs === 'number' && liveSnapshot.receivedAtMs > 0
+        ? liveSnapshot.receivedAtMs
+        : liveSnapshot.time instanceof Date
+          ? liveSnapshot.time.getTime()
+          : Date.now();
       timestampMs = snapTime > 0 ? snapTime : Date.now();
     } else {
       const price = findValueBySymbol(useWebtraderStore.getState().prices ?? {}, symbol);
@@ -5587,7 +5895,7 @@ class OhlcWebSocketService {
     source: string,
     derived = false,
   ): boolean {
-    const [, tfStr] = key.split(':');
+    const [symbol, tfStr] = key.split(':');
     const timeframe = parseInt(tfStr, 10);
     const bucketMs = timeframe * 60 * 1000;
     if (!Number.isFinite(price) || price <= 0 || bucketMs <= 0) {
@@ -5596,6 +5904,8 @@ class OhlcWebSocketService {
     const normalizedTimestamp = normalizeIncomingTickTimestampMs(timestampMs);
 
     const bar: OHLCBar = {
+      symbol,
+      timeframeMinutes: timeframe,
       time: bucketTime(normalizedTimestamp, bucketMs),
       open: price,
       high: price,
@@ -5624,13 +5934,20 @@ class OhlcWebSocketService {
   private _ensureBucketExpiryTimer() {
     if (this._bucketExpiryTimer !== null) return;
     this._bucketExpiryTimer = setInterval(() => {
-      const nowMs = Date.now();
+      // Server clock, not Date.now() — buckets are keyed on the broker clock, so
+      // a broker timezone offset would otherwise stop this timer from ever rolling.
+      const nowMs = Math.max(this.getServerNowMs(), Date.now());
+      for (const key of this.subscribers.keys()) {
+        if (!this.currentBars.has(key)) {
+          this._seedCurrentBarFromLatestHistory(key, nowMs);
+        }
+      }
       for (const [key, current] of this.currentBars.entries()) {
         if (!current || current.time <= 0) continue;
         const tf = parseInt(key.slice(key.lastIndexOf(':') + 1), 10);
         const bucketMs = tf * 60 * 1000;
-        // Close bar only if the entire bucket period has elapsed with 1s grace.
-        if (nowMs >= current.time + bucketMs + 1000) {
+        // Close bar only if the entire bucket period has elapsed with a small grace.
+        if (nowMs >= current.time + bucketMs + LIVE_BUCKET_ROLLOVER_GRACE_MS) {
           const closedBar: OHLCBar = { ...current, closed: true };
           this._pushToHistory(key, closedBar);
           this._notifySubscribers(key, closedBar);
@@ -5638,9 +5955,47 @@ class OhlcWebSocketService {
           if (closedBar.time > prev) {
             this.lastKnownCandleTimestampMs.set(key, closedBar.time);
           }
-          this.currentBars.delete(key);
-          this.currentBarLatestTickMs.delete(key);
           this.liveAggregateAnchoredSpikeBaselines.delete(key);
+
+          const currentBucketTime = bucketTime(nowMs, bucketMs);
+          const firstRolloverTime = current.time + bucketMs;
+          const catchUpBars = Math.max(
+            1,
+            Math.floor((currentBucketTime - firstRolloverTime) / bucketMs) + 1,
+          );
+          const limitedFirstRolloverTime = catchUpBars > LIVE_BUCKET_ROLLOVER_MAX_CATCHUP_BARS
+            ? currentBucketTime - ((LIVE_BUCKET_ROLLOVER_MAX_CATCHUP_BARS - 1) * bucketMs)
+            : firstRolloverTime;
+          let previousRolloverBar: OHLCBar = closedBar;
+
+          for (
+            let rolloverTime = limitedFirstRolloverTime;
+            rolloverTime <= currentBucketTime;
+            rolloverTime += bucketMs
+          ) {
+            const rolloverBar = this._liveRolloverBar(
+              rolloverTime,
+              previousRolloverBar.close,
+              previousRolloverBar,
+            );
+
+            if (rolloverTime < currentBucketTime) {
+              const closedRolloverBar: OHLCBar = { ...rolloverBar, closed: true };
+              this._pushToHistory(key, closedRolloverBar);
+              this._notifySubscribers(key, closedRolloverBar);
+              const known = this.lastKnownCandleTimestampMs.get(key) ?? 0;
+              if (closedRolloverBar.time > known) {
+                this.lastKnownCandleTimestampMs.set(key, closedRolloverBar.time);
+              }
+              previousRolloverBar = closedRolloverBar;
+              continue;
+            }
+
+            this.currentBars.set(key, rolloverBar);
+            this.currentBarLatestTickMs.set(key, rolloverTime);
+            this._notifySubscribers(key, rolloverBar);
+            previousRolloverBar = rolloverBar;
+          }
         }
       }
     }, 1000);
@@ -5658,6 +6013,7 @@ class OhlcWebSocketService {
     volume: number,
     tsMs: number,
     source = 'mt5_tick',
+    receivedAtMs = tsMs,
   ) {
     const acceptedBarsForSanityReference: Array<{ key: SubKey; bar: OHLCBar }> = [];
     const acceptLiveAggregateBar = (key: SubKey, bar: OHLCBar): boolean => {
@@ -5682,12 +6038,66 @@ class OhlcWebSocketService {
       const tfStr = key.slice(key.lastIndexOf(':') + 1);
       const tf = parseInt(tfStr, 10);
       const bucketMs = tf * 60 * 1000;
-      const bucketStart = Math.floor(tsMs / bucketMs) * bucketMs;
+      const liveGeneratedSource = isLiveGeneratedSource(source);
+      // Bucket every tick by its own MT5/server timestamp (tsMs), which the backend
+      // stamps in UTC epoch ms — the SAME clock it uses for history bar open-times
+      // (server_time_msc / open_time). Previously live ticks were bucketed by the
+      // browser receive clock (receivedAtMs); any skew between the dev/browser clock
+      // and the broker clock pushed the live candle onto a different bucket boundary
+      // than the server's bars, breaking per-timeframe bucketing, the history/live
+      // seam, and the merge. tsMs is already normalized (server time, with a
+      // receivedAtMs fallback only when the backend omits the timestamp).
+      const bucketTimestampMs = Number.isFinite(tsMs) && tsMs > 0
+        ? tsMs
+        : normalizeIncomingTickTimestampMs(receivedAtMs, Date.now());
+      let bucketStart = Math.floor(bucketTimestampMs / bucketMs) * bucketMs;
 
       const current = this.currentBars.get(key);
       const history = this.history.get(key) ?? [];
       const previousCommitted = history[history.length - 1];
       const latestCurrentTickMs = this.currentBarLatestTickMs.get(key) ?? 0;
+      let effectiveTickMs = bucketTimestampMs;
+      const receivedTimestampMs = normalizeIncomingTickTimestampMs(receivedAtMs, Date.now());
+      const serverNowMs = Math.max(tsMs, this.getLatestKnownMt5TimestampMs(), Date.now());
+      const receivedBucketStart = Math.floor(receivedTimestampMs / bucketMs) * bucketMs;
+      const currentClockBucketStart = Math.max(
+        receivedBucketStart,
+        bucketTime(serverNowMs, bucketMs),
+      );
+
+      // Rescue a marginally late / out-of-order live tick into the still-open current
+      // candle, judged against the broker server clock (latest known MT5 time) rather
+      // than the browser clock so the decision stays on the same basis as the buckets.
+      if (
+        current &&
+        bucketStart < current.time &&
+        liveGeneratedSource &&
+        bucketTime(serverNowMs, bucketMs) === current.time
+      ) {
+        bucketStart = current.time;
+        effectiveTickMs = Math.max(effectiveTickMs, current.time);
+      }
+
+      // Some gateways repeat the last MT5 tick timestamp while fresh prices keep
+      // arriving. Without this guard every new price keeps mutating the old open
+      // candle. Once the browser receive clock has crossed the next timeframe
+      // boundary, live ticks should advance to that bucket even if their source
+      // timestamp is stale.
+      if (current && liveGeneratedSource) {
+        const sourceTimestampIsStale = (
+          bucketStart <= current.time ||
+          (
+            latestCurrentTickMs > 0 &&
+            bucketTimestampMs <= latestCurrentTickMs &&
+            currentClockBucketStart > current.time
+          )
+        );
+
+        if (sourceTimestampIsStale && currentClockBucketStart > current.time) {
+          bucketStart = currentClockBucketStart;
+          effectiveTickMs = Math.max(effectiveTickMs, receivedTimestampMs, currentClockBucketStart);
+        }
+      }
 
       if (current) {
         if (bucketStart < current.time) {
@@ -5697,7 +6107,7 @@ class OhlcWebSocketService {
         if (
           bucketStart === current.time &&
           latestCurrentTickMs > 0 &&
-          tsMs < latestCurrentTickMs
+          effectiveTickMs < latestCurrentTickMs
         ) {
           return;
         }
@@ -5707,7 +6117,7 @@ class OhlcWebSocketService {
 
       // Count each price change as 1 unit — matches MT5's tick_volume metric used in
       // all historical bars for every instrument (Forex, Metals, Crypto alike).
-      const tickVolumeUnit = 1;
+      const tickVolumeUnit = Number.isFinite(volume) && volume > 0 ? volume : 1;
 
       if (!current || current.time !== bucketStart) {
         let previousBar = current ?? previousCommitted ?? null;
@@ -5719,11 +6129,7 @@ class OhlcWebSocketService {
         // For the history/live seam, inherit the previous close as the provisional
         // open only when there is no missing candle bucket. If one or more
         // buckets are missing, the first live tick opens the new candle.
-        const open = !previousBar
-          ? price
-          : hasBucketGap
-            ? price
-            : previousBar.close;
+        const open = previousBar ? previousBar.close : price;
         const newBar: OHLCBar = {
           time: bucketStart,
           open,
@@ -5732,6 +6138,7 @@ class OhlcWebSocketService {
           close: price,
           volume: tickVolumeUnit,
           source,
+          sourceTimeMs: effectiveTickMs,
         };
         const baselineForDeferredSpike: OHLCBar = {
           ...newBar,
@@ -5767,7 +6174,7 @@ class OhlcWebSocketService {
         }
 
         this.currentBars.set(key, newBar);
-        this.currentBarLatestTickMs.set(key, tsMs);
+        this.currentBarLatestTickMs.set(key, effectiveTickMs);
         if (deferredSpikeDecision?.referenceClose) {
           this._rememberLiveAggregateAnchoredSpikeBaseline(
             key,
@@ -5788,6 +6195,7 @@ class OhlcWebSocketService {
           close: price,
           volume: current.volume + tickVolumeUnit,
           source,
+          sourceTimeMs: effectiveTickMs,
           derived: undefined,
           continuity: undefined,
           isContinuity: undefined,
@@ -5805,6 +6213,7 @@ class OhlcWebSocketService {
             tickVolumeUnit,
             source,
           );
+          recoveredBar.sourceTimeMs = effectiveTickMs;
           this._logOhlcSanityRejection(
             this._symbolFromKey(key),
             nextBar,
@@ -5817,7 +6226,7 @@ class OhlcWebSocketService {
 
           this.liveAggregateAnchoredSpikeBaselines.delete(key);
           this.currentBars.set(key, recoveredBar);
-          this.currentBarLatestTickMs.set(key, tsMs);
+          this.currentBarLatestTickMs.set(key, effectiveTickMs);
           if (!areBarsEquivalent(previousVisibleBar, recoveredBar)) {
             this._notifySubscribers(key, { ...recoveredBar });
           }
@@ -5836,7 +6245,7 @@ class OhlcWebSocketService {
         }
 
         this.currentBars.set(key, nextBar);
-        this.currentBarLatestTickMs.set(key, tsMs);
+        this.currentBarLatestTickMs.set(key, effectiveTickMs);
         if (deferredSpikeDecision?.referenceClose) {
           this._rememberLiveAggregateAnchoredSpikeBaseline(
             key,
@@ -5872,7 +6281,7 @@ class OhlcWebSocketService {
     return {
       symbol,
       timeframeMinutes,
-      timeframe: timeframeMinutes,
+      timeframe: formatBackendTimeframe(timeframeMinutes),
       limit,
       type: requestType,
       requestType,
@@ -5887,6 +6296,135 @@ class OhlcWebSocketService {
         : {}),
       ...(range.fromUnixMs !== undefined ? { fromUnixMs: range.fromUnixMs } : {}),
       ...(range.toUnixMs !== undefined ? { toUnixMs: range.toUnixMs } : {}),
+    };
+  }
+
+  private _retainStorePriceSubscription(symbol: string): void {
+    const normalizedSymbol = symbol.trim();
+    if (!normalizedSymbol) {
+      return;
+    }
+
+    const count = this.storePriceSubscriptionCounts.get(normalizedSymbol) ?? 0;
+    this.storePriceSubscriptionCounts.set(normalizedSymbol, count + 1);
+    if (count > 0) {
+      return;
+    }
+
+    const handleStorePrice = () => {
+      const snapshot = getLivePriceSnapshotBySymbol(normalizedSymbol);
+      if (!snapshot || ((snapshot.bid ?? 0) <= 0 && (snapshot.ask ?? 0) <= 0 && (snapshot.last ?? 0) <= 0)) {
+        return;
+      }
+
+      this.ingestTick(
+        normalizedSymbol,
+        snapshot.bid ?? 0,
+        snapshot.ask ?? 0,
+        snapshot.last,
+        snapshot.volume,
+        snapshot.receivedAtMs ?? snapshot.time,
+      );
+    };
+
+    this.storePriceUnsubscribers.set(
+      normalizedSymbol,
+      subscribeToLivePriceBySymbol(normalizedSymbol, handleStorePrice),
+    );
+    handleStorePrice();
+  }
+
+  private _releaseStorePriceSubscription(symbol: string): void {
+    const normalizedSymbol = symbol.trim();
+    if (!normalizedSymbol) {
+      return;
+    }
+
+    const count = this.storePriceSubscriptionCounts.get(normalizedSymbol) ?? 0;
+    if (count > 1) {
+      this.storePriceSubscriptionCounts.set(normalizedSymbol, count - 1);
+      return;
+    }
+
+    this.storePriceSubscriptionCounts.delete(normalizedSymbol);
+    this.storePriceUnsubscribers.get(normalizedSymbol)?.();
+    this.storePriceUnsubscribers.delete(normalizedSymbol);
+    const normalizedKey = normalizeSymbolKey(normalizedSymbol);
+    if (normalizedKey) {
+      this.ingestedLivePriceKeys.delete(normalizedKey);
+    }
+  }
+
+  private _clearStorePriceSubscriptions(): void {
+    this.storePriceUnsubscribers.forEach((unsubscribe) => unsubscribe());
+    this.storePriceUnsubscribers.clear();
+    this.storePriceSubscriptionCounts.clear();
+    this.ingestedLivePriceKeys.clear();
+  }
+
+  private _getAccountIdFromSessionId(): string | null {
+    const accountId = this.sessionId?.split('|')[0]?.trim();
+    return accountId || null;
+  }
+
+  private async _requestOhlcHistoryPayloadViaApi(
+    accountId: string,
+    alias: string,
+    timeframeMinutes: number,
+    limit: number,
+    range: HistoryRequestRange,
+  ): Promise<OhlcHistoryPayloadResponse> {
+    const requestType = getHistoryRequestType(range);
+    const params = new URLSearchParams({
+      accountId,
+      symbol: alias,
+      timeframeMinutes: String(timeframeMinutes),
+      limit: String(limit),
+    });
+
+    if (range.beforeUnixMs !== undefined) {
+      params.set('beforeUnixMs', String(range.beforeUnixMs));
+    }
+    if (range.fromUnixMs !== undefined) {
+      params.set('fromUnixMs', String(range.fromUnixMs));
+    }
+    if (range.toUnixMs !== undefined) {
+      params.set('toUnixMs', String(range.toUnixMs));
+    }
+
+    const response = await fetch(`/api/trading/ohlc-history?${params.toString()}`, {
+      cache: 'no-store',
+    });
+    const payload = await response.json().catch(() => ({})) as HttpOhlcHistoryResponse;
+
+    if (!response.ok && response.status !== 202) {
+      throw new Error(payload.error || payload.code || `OHLC history API failed with status ${response.status}.`);
+    }
+
+    return {
+      bars: Array.isArray(payload.bars)
+        ? payload.bars.map((bar) =>
+            isRecord(bar)
+              ? {
+                  symbol: alias,
+                  timeframeMinutes,
+                  ...bar,
+                }
+              : bar,
+          )
+        : [],
+      metadata: {
+        ...(isRecord(payload.metadata) ? payload.metadata : {}),
+        symbol: alias,
+        timeframeMinutes,
+        limit,
+        requestedLimit: limit,
+        requestType,
+        cacheFirst: range.cacheFirst ?? true,
+        cacheOnly: range.cacheOnly ?? false,
+        source: 'history_api',
+        ...(range.beforeUnixMs !== undefined ? { beforeUnixMs: range.beforeUnixMs } : {}),
+      } as OhlcHistoryResponseMetadata,
     };
   }
 
@@ -5926,6 +6464,26 @@ class OhlcWebSocketService {
     limit: number,
     range: HistoryRequestRange,
   ): Promise<OhlcHistoryPayloadResponse> {
+    const accountId = this.useHistoryApi ? this._getAccountIdFromSessionId() : null;
+    if (accountId) {
+      try {
+        return await this._requestOhlcHistoryPayloadViaApi(
+          accountId,
+          alias,
+          timeframeMinutes,
+          limit,
+          range,
+        );
+      } catch (error) {
+        console.warn('[ohlcWebSocketService] history API unavailable; falling back to WS history request', {
+          accountId,
+          symbol: alias,
+          timeframeMinutes,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
     const requestClient = this.wsClient;
     const rawRequester = requestClient as unknown as Partial<RawOhlcHistoryRequester>;
     if (typeof rawRequester.sendAuthenticatedRequest === 'function') {

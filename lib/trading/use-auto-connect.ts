@@ -1925,7 +1925,7 @@ export function useAutoConnectTrading(
               tick.ask,
               tick.last,
               tick.volume,
-              tick.time instanceof Date ? tick.time.getTime() : Date.now(),
+              tick.mt5_time_msc ?? tick.mt5TimeMsc ?? tick.time,
             );
           }
         },
@@ -1987,23 +1987,39 @@ export function useAutoConnectTrading(
               force: true,
               coalesceInFlight: true,
             }),
-          ]).then(([positionsResult]) => {
+            client.getOrders(),
+          ]).then(([positionsResult, ordersResult]) => {
             if (!isCurrentMainClientAccountEvent()) {
               return;
             }
 
             if (positionsResult.status === 'fulfilled') {
               callbacksRef.current.setPositions(positionsResult.value);
-              return;
             }
 
-            console.warn('[Terminal] Failed to refresh positions after trade_result', {
-              requestId: payload.requestId,
-              error:
-                positionsResult.reason instanceof Error
-                  ? positionsResult.reason.message
-                  : String(positionsResult.reason),
-            });
+            if (ordersResult.status === 'fulfilled') {
+              callbacksRef.current.setOrders(ordersResult.value);
+            }
+
+            if (positionsResult.status === 'rejected') {
+              console.warn('[Terminal] Failed to refresh positions after trade_result', {
+                requestId: payload.requestId,
+                error:
+                  positionsResult.reason instanceof Error
+                    ? positionsResult.reason.message
+                    : String(positionsResult.reason),
+              });
+            }
+
+            if (ordersResult.status === 'rejected') {
+              console.warn('[Terminal] Failed to refresh pending orders after trade_result', {
+                requestId: payload.requestId,
+                error:
+                  ordersResult.reason instanceof Error
+                    ? ordersResult.reason.message
+                    : String(ordersResult.reason),
+              });
+            }
           });
         },
         onSymbolList: (symbols) => {
@@ -2132,7 +2148,7 @@ export function useAutoConnectTrading(
               tick.ask,
               tick.last,
               tick.volume,
-              tick.time instanceof Date ? tick.time.getTime() : Date.now(),
+              tick.mt5_time_msc ?? tick.mt5TimeMsc ?? tick.time,
             );
           },
           onSymbolUpdate: (symbol) => {

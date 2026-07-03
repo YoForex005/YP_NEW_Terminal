@@ -7,6 +7,10 @@
 
 # ── Environment & secrets (NEVER commit) ──────────────────────────────────────
 .env*
+!.env.example
+
+# ── Generated backend API reference (large; fetch from <origin>/swagger.json) ──
+backend-openapi.json
 
 # ── TypeScript build cache ────────────────────────────────────────────────────
 *.tsbuildinfo

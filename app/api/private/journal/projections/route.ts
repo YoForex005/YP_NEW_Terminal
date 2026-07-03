@@ -7,6 +7,22 @@ export async function GET(request: NextRequest) {
     const auth = await authenticateRequest(request);
     if (!auth) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     const months = request.nextUrl.searchParams.get("months") || "12";
-    const data = await requestAccountsBackend("/journal/projections", { query: { months } });
-    return NextResponse.json({ ok: true, data });
+    try {
+        const data = await requestAccountsBackend("/journal/projections", { query: { months } });
+        return NextResponse.json({ ok: true, data });
+    } catch (error) {
+        console.warn(
+            "[journal/projections] backend unavailable; returning empty fallback:",
+            error instanceof Error ? error.message : error,
+        );
+        return NextResponse.json({
+            ok: true,
+            data: {
+                months: Number(months) || 12,
+                projections: [],
+            },
+            degraded: true,
+            fallbackSource: "local_empty",
+        });
+    }
 }

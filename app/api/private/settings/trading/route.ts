@@ -2,10 +2,7 @@ import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
 
 import { authenticateRequest } from "@/lib/server/auth";
-import {
-  buildSettingsBackendErrorResponse,
-  requestSettingsBackend,
-} from "@/lib/server/settings-backend";
+import { requestSettingsBackend } from "@/lib/server/settings-backend";
 
 interface SettingsPayload {
   settings?: Record<string, string>;
@@ -57,6 +54,21 @@ export async function GET(request: NextRequest) {
       { status: 200 },
     );
   } catch (error) {
-    return buildSettingsBackendErrorResponse(error);
+    console.warn(
+      "[settings/trading] backend unavailable; using local fallback:",
+      error instanceof Error ? error.message : error,
+    );
+    return NextResponse.json(
+      {
+        ok: true,
+        data: {
+          defaultMt5Terminal: "MetaTrader 5",
+          defaultMt4Terminal: "MetaTrader 4",
+        },
+        degraded: true,
+        fallbackSource: "local_defaults",
+      },
+      { status: 200 },
+    );
   }
 }

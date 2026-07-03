@@ -71,7 +71,7 @@ export function BrandBadge({
 
       <Image
         src="/assets/logo.png"
-        alt="fxtrusts logo"
+        alt="Yopips logo"
         width={240}
         height={72}
         priority={priority}
@@ -84,7 +84,7 @@ export function BrandBadge({
       />
       <Image
         src="/assets/logo_white.png"
-        alt="fxtrusts logo"
+        alt="Yopips logo"
         width={240}
         height={72}
         priority={priority}

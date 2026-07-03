@@ -793,16 +793,18 @@ function Header({ account, selectedSymbol, openTabs, userProfile, notifications,
                 </button>
 
                 <div className="hidden md:flex flex-col justify-center h-full pl-2 md:pl-4 pr-4 border-r border-border">
-                    <div className="relative inline-flex items-center justify-center rounded-none h-[64px] select-none group cursor-pointer">
-                        {/* FxTrusts logo resized to match Exness sleek proportions */}
+                    <div className="relative inline-flex items-center justify-center gap-2 rounded-none h-[64px] select-none group cursor-pointer">
                         <img
-                            src={theme === 'dark' ? '/assets/logo_white.png' : '/assets/logo.png'}
-                            alt="FxTrusts"
-                            width={180}
-                            height={48}
-                            className="h-[36px] md:h-[48px] w-auto object-contain opacity-90 transition-opacity hover:opacity-100"
+                            src={theme === 'dark' ? '/assets/yopips-logo-white.png' : '/assets/yopips-logo-dark.png'}
+                            alt="YoPips"
+                            width={154}
+                            height={39}
+                            className="h-[30px] md:h-[34px] w-auto max-w-[148px] object-contain opacity-95 transition-opacity hover:opacity-100"
                             style={{ maxWidth: '100%', width: 'auto' }}
                         />
+                        <span className="mb-5 rounded-[3px] border border-primary/35 bg-primary/10 px-1.5 py-[1px] text-[9px] font-bold uppercase leading-none tracking-[0.08em] text-primary">
+                            Beta
+                        </span>
                     </div>
                 </div>
             </div>
