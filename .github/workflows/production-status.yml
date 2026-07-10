@@ -40,6 +40,11 @@ jobs:
           systemctl is-active nginx redis-server fail2ban
           echo "Port 3002 listener:"
           ss -ltnp 'sport = :3002' || true
+          for pid in $(fuser 3002/tcp 2>/dev/null || true); do
+            ps -o pid,ppid,user,lstart,cmd -p "$pid" || true
+            echo "cwd=$(readlink -f "/proc/$pid/cwd" || true)"
+            echo "cgroup=$(tr '\n' ' ' <"/proc/$pid/cgroup" || true)"
+          done
           echo "YoPips release layout:"
           ls -la /opt/yopips-terminal
           echo "YoPips PM2 status:"
