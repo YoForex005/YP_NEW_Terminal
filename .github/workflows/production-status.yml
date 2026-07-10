@@ -1,0 +1,47 @@
+name: Production status
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: production
+    steps:
+      - name: Configure SSH
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.PROD_SSH_PRIVATE_KEY }}
+          SSH_HOST_KEY: ${{ secrets.PROD_SSH_HOST_KEY }}
+        run: |
+          install -d -m 0700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 0600 ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_HOST_KEY" > ~/.ssh/known_hosts
+          chmod 0600 ~/.ssh/known_hosts
+      - name: Read production status
+        env:
+          HOST: ${{ secrets.PROD_SSH_HOST }}
+          PORT: ${{ secrets.PROD_SSH_PORT }}
+          USER: ${{ secrets.PROD_SSH_USER }}
+        run: |
+          ssh -p "${PORT:-22}" "$USER@$HOST" 'sudo bash -se' <<'REMOTE'
+          set -Eeuo pipefail
+          hostname
+          . /etc/os-release
+          echo "OS=$PRETTY_NAME"
+          node --version
+          npm --version
+          nginx -t
+          systemctl is-active nginx redis-server fail2ban
+          echo "Port 3002 listener:"
+          ss -ltnp 'sport = :3002' || true
+          echo "YoPips release layout:"
+          ls -la /opt/yopips-terminal
+          echo "YoPips PM2 status:"
+          sudo -u yopips-terminal pm2 status || true
+          REMOTE

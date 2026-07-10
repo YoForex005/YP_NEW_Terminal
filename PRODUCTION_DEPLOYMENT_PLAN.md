@@ -14,7 +14,7 @@
 | TLS | Let's Encrypt certificate with automatic renewal |
 | Repository | `YoForex005/YP_NEW_Terminal` |
 | Production branch | `main` |
-| Runtime | Node.js 20 LTS, npm, PM2 managed by systemd |
+| Runtime | Node.js 24 LTS, npm, PM2 managed by systemd |
 | Release directory | `/opt/yopips-terminal` |
 
 The production target is an Ubuntu server at `37.187.159.136`.
@@ -71,7 +71,7 @@ browser bundle.
 Run the bootstrap through the initial `root` SSH login:
 
 1. Patch Ubuntu and install Nginx, Git, curl, UFW, fail2ban, and Certbot.
-2. Install Node.js 20 LTS and PM2.
+2. Install Node.js 24 LTS and PM2.
 3. Create restricted users:
    - `yopips-terminal`: owns and runs the application.
    - `deploy`: SSH target used by GitHub Actions.
@@ -191,7 +191,7 @@ Use two workflows.
 Trigger on pull requests targeting `main`:
 
 1. Checkout repository.
-2. Install Node.js 20 with npm cache.
+2. Install Node.js 24 with npm cache.
 3. Run `npm ci`.
 4. Run `npm run typecheck`.
 5. Run `npm run lint`; warnings should be tracked and new warnings should not be

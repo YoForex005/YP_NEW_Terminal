@@ -16,8 +16,8 @@ DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
   ca-certificates curl git nginx certbot python3-certbot-nginx ufw fail2ban redis-server
 
-if ! command -v node >/dev/null || [[ "$(node -p 'process.versions.node.split(`.`)[0]' 2>/dev/null || true)" != "20" ]]; then
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+if ! command -v node >/dev/null || [[ "$(node -p 'process.versions.node.split(`.`)[0]' 2>/dev/null || true)" != "24" ]]; then
+  curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
   apt-get install -y nodejs
 fi
 

@@ -123,7 +123,6 @@ jobs:
             /etc/nginx/sites-available/terminal.yopips.com
           nginx -t
           systemctl reload nginx
-          certbot renew --dry-run
           REMOTE
 
       - name: Verify certificate
