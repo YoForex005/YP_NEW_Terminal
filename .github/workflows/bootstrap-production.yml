@@ -51,7 +51,7 @@ jobs:
           PORT: ${{ secrets.PROD_SSH_PORT }}
           USER: ${{ secrets.PROD_SSH_USER }}
         run: |
-          ssh -p "${PORT:-22}" "$USER@$HOST" 'bash -se' <<'REMOTE'
+          ssh -p "${PORT:-22}" "$USER@$HOST" 'sudo bash -se' <<'REMOTE'
           set -Eeuo pipefail
           cd /tmp/yopips-bootstrap
           bash ./bootstrap-ubuntu.sh
