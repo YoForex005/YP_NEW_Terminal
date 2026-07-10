@@ -38,9 +38,9 @@ jobs:
           npm --version
           nginx -t
           systemctl is-active nginx redis-server fail2ban
-          echo "Port 3002 listener:"
-          ss -ltnp 'sport = :3002' || true
-          for pid in $(fuser 3002/tcp 2>/dev/null || true); do
+          echo "YoPips port 3012 listener:"
+          ss -ltnp 'sport = :3012' || true
+          for pid in $(fuser 3012/tcp 2>/dev/null || true); do
             ps -o pid,ppid,user,lstart,cmd -p "$pid" || true
             echo "cwd=$(readlink -f "/proc/$pid/cwd" || true)"
             echo "cgroup=$(tr '\n' ' ' <"/proc/$pid/cgroup" || true)"

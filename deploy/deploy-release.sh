@@ -42,7 +42,7 @@ pm2 startOrReload ecosystem.config.cjs --update-env
 pm2 save
 
 for _ in {1..30}; do
-  if curl --fail --silent --show-error http://127.0.0.1:3002/api/node-bridge/health >/dev/null; then
+  if curl --fail --silent --show-error http://127.0.0.1:3012/api/node-bridge/health >/dev/null; then
     trap - ERR
     find "$APP_ROOT/releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' \
       | sort -nr | tail -n +6 | cut -d' ' -f2- | xargs -r rm -rf

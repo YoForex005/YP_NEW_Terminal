@@ -9,7 +9,7 @@
 | DNS record | `terminal.yopips.com` `A` record -> `37.187.159.136` |
 | Initial SSH access | `root@37.187.159.136` |
 | Application user | `yopips-terminal` (non-root, created during bootstrap) |
-| Application port | `127.0.0.1:3002` |
+| Application port | `127.0.0.1:3012` (`3002` is already used by the reseller app) |
 | Edge proxy | Nginx on ports 80 and 443 |
 | TLS | Let's Encrypt certificate with automatic renewal |
 | Repository | `YoForex005/YP_NEW_Terminal` |
@@ -24,14 +24,14 @@ The production target is an Ubuntu server at `37.187.159.136`.
 ```mermaid
 flowchart LR
     Browser["Browser"] -->|"HTTPS / WSS :443"| Nginx["Nginx\nterminal.yopips.com"]
-    Nginx -->|"HTTP + WebSocket upgrade\n127.0.0.1:3002"| Node["Next.js + Node WS bridge\nPM2/systemd"]
+    Nginx -->|"HTTP + WebSocket upgrade\n127.0.0.1:3012"| Node["Next.js + Node WS bridge\nPM2/systemd"]
     Node -->|"REST"| API["C++/Rust backend :3001"]
     Node -->|"WebSocket"| Realtime["C++ realtime service :3003"]
     Node -.->|"optional"| Redis[(Redis)]
     Node -.->|"optional"| Postgres[(PostgreSQL)]
 ```
 
-Only Nginx ports 80/443 are public. Port 3002 binds to loopback. Backend,
+Only Nginx ports 80/443 are public. Port 3012 binds to loopback. Backend,
 realtime, Redis, PostgreSQL, and MT5 access should use private networking or
 strict source-IP firewall rules; they must not be opened globally.
 
@@ -102,7 +102,7 @@ Store `/opt/yopips-terminal/shared/.env.production` on the server with mode
 ```dotenv
 NODE_ENV=production
 HOST=127.0.0.1
-PORT=3002
+PORT=3012
 
 TERMINAL_API_BASE=<BACKEND_HTTP_ORIGIN>
 RUST_GATEWAY_HTTP_URL=<BACKEND_HTTP_ORIGIN>
@@ -154,7 +154,7 @@ Do not use plain `next start`, because it would omit the WebSocket bridge in
 - working directory `/opt/yopips-terminal/current`;
 - script `server.mjs` and argument `--prod`;
 - one forked instance initially (WebSocket connections are stateful);
-- `NODE_ENV=production`, `HOST=127.0.0.1`, and `PORT=3002`;
+- `NODE_ENV=production`, `HOST=127.0.0.1`, and `PORT=3012`;
 - graceful shutdown and bounded restart policy;
 - timestamped logs plus `pm2-logrotate`.
 
@@ -163,7 +163,7 @@ Do not use plain `next start`, because it would omit the WebSocket bridge in
 Create an Nginx server block for `terminal.yopips.com` that:
 
 - redirects HTTP to HTTPS after the certificate exists;
-- proxies all HTTP traffic to `http://127.0.0.1:3002`;
+- proxies all HTTP traffic to `http://127.0.0.1:3012`;
 - passes `Host`, `X-Real-IP`, `X-Forwarded-For`, and `X-Forwarded-Proto`;
 - supports WebSocket upgrades (`Upgrade`, `Connection`, HTTP/1.1) on bridge and
   terminal socket paths;
@@ -215,7 +215,7 @@ gate for the first releases:
    if they are not included in the artifact.
 7. Atomically move `current` to the new release.
 8. Reload the PM2 process with environment refresh.
-9. Poll `http://127.0.0.1:3002/api/node-bridge/health` on the server.
+9. Poll `http://127.0.0.1:3012/api/node-bridge/health` on the server.
 10. Poll `https://terminal.yopips.com/api/node-bridge/health` externally.
 11. If either health check fails, point `current` back to the previous release
     and reload PM2 automatically.

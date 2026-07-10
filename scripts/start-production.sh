@@ -15,6 +15,6 @@ set +a
 
 export NODE_ENV=production
 export HOST="${HOST:-127.0.0.1}"
-export PORT="${PORT:-3002}"
+export PORT="${PORT:-3012}"
 
 exec node server.mjs --prod

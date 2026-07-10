@@ -61,7 +61,7 @@ jobs:
           cat >/opt/yopips-terminal/shared/.env.production <<ENV
           NODE_ENV=production
           HOST=127.0.0.1
-          PORT=3002
+          PORT=3012
 
           TERMINAL_API_BASE=https://api.yopips.com
           ACCOUNTS_BACKEND_URL=https://api.yopips.com
@@ -106,7 +106,7 @@ jobs:
               listen [::]:80;
               server_name terminal.yopips.com;
               location / {
-                  proxy_pass http://127.0.0.1:3002;
+                  proxy_pass http://127.0.0.1:3012;
                   proxy_set_header Host $host;
                   proxy_set_header X-Forwarded-Proto $scheme;
               }
