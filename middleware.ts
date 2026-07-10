@@ -5,6 +5,7 @@ import { SESSION_COOKIE_NAME } from "@/lib/auth/constants";
 
 const AUTH_REDIRECT_PATHS = new Set(["/login", "/register"]);
 const PUBLIC_BYPASS_PATHS = new Set([
+  "/",
   "/health",
   "/login",
   "/register",
@@ -78,4 +79,3 @@ export function middleware(request: NextRequest) {
 export const config = {
   matcher: ["/((?!_next/static|_next/image|.*\\..*).*)"],
 };
-
