@@ -1299,6 +1299,7 @@ function KlineChartContainer({
     const livePriceRef = useRef<number | null>(null);
     const preferredLiveAxisPriceRef = useRef<number | null>(null);
     const updateLivePriceOverlayRef = useRef<(() => void) | null>(null);
+    const manualPriceRangeRef = useRef<{ minValue: number; maxValue: number } | null>(null);
     const positionsRef = useRef(positions);
     const onUpdatePositionRef = useRef(onUpdatePosition);
     const onClosePositionRef = useRef(onClosePosition);
@@ -1334,6 +1335,10 @@ function KlineChartContainer({
     useEffect(() => {
         onChartBarSpacingChangeRef.current = onChartBarSpacingChange;
     }, [onChartBarSpacingChange]);
+
+    useEffect(() => {
+        manualPriceRangeRef.current = null;
+    }, [selectedResolution.minutes, symbol]);
 
     const getPreferredBarSpacing = useCallback((fallback: number) => {
         const minimumSpacing = visualConfig.timeScale.minBarSpacing;
@@ -2328,7 +2333,7 @@ function KlineChartContainer({
             },
             handleScroll: { pressedMouseMove: !autoScrollEnabled, vertTouchDrag: false, horzTouchDrag: true, mouseWheel: false },
             handleScale: {
-                axisPressedMouseMove: { time: false, price: true },
+                axisPressedMouseMove: { time: false, price: false },
                 axisDoubleClickReset: { time: false, price: true },
                 mouseWheel: false,
                 pinch: false,
@@ -2574,9 +2579,22 @@ function KlineChartContainer({
         const autoscaleInfoProvider = (original: () => any) => {
             const autoscaleInfo = original();
             const priceRange = autoscaleInfo?.priceRange;
+            const manualPriceRange = manualPriceRangeRef.current;
 
             if (!priceRange) {
                 return autoscaleInfo;
+            }
+
+            if (
+                manualPriceRange &&
+                Number.isFinite(manualPriceRange.minValue) &&
+                Number.isFinite(manualPriceRange.maxValue) &&
+                manualPriceRange.maxValue > manualPriceRange.minValue
+            ) {
+                return {
+                    ...autoscaleInfo,
+                    priceRange: manualPriceRange,
+                };
             }
 
             return {
@@ -2724,7 +2742,7 @@ function KlineChartContainer({
             },
             handleScroll: { vertTouchDrag: false, horzTouchDrag: true, mouseWheel: false, pressedMouseMove: !autoScrollEnabled },
             handleScale: {
-                axisPressedMouseMove: { time: false, price: true },
+                axisPressedMouseMove: { time: false, price: false },
                 axisDoubleClickReset: { time: false, price: true },
                 mouseWheel: false,
                 pinch: false,
@@ -3077,17 +3095,119 @@ function KlineChartContainer({
             return getVisualVolumeScaleMax(visibleVolumes.length > 0 ? visibleVolumes : totalVolumes);
         };
 
+        const getVisibleCandlePriceRange = () => {
+            const range = chart.timeScale().getVisibleLogicalRange();
+            let visibleLow = Number.POSITIVE_INFINITY;
+            let visibleHigh = Number.NEGATIVE_INFINITY;
+            let fallbackLow = Number.POSITIVE_INFINITY;
+            let fallbackHigh = Number.NEGATIVE_INFINITY;
+            let visibleCount = 0;
+            let fallbackCount = 0;
+
+            for (const [seriesTime, bar] of displayBarsBySeriesTime) {
+                if (!hasValidBarPrices(bar)) continue;
+
+                fallbackLow = Math.min(fallbackLow, bar.low);
+                fallbackHigh = Math.max(fallbackHigh, bar.high);
+                fallbackCount += 1;
+
+                const logicalIndex = seriesTimeToLogicalIndex.get(seriesTime);
+                const isVisible = !range
+                    || logicalIndex === undefined
+                    || (logicalIndex >= range.from && logicalIndex <= range.to);
+                if (!isVisible) continue;
+
+                visibleLow = Math.min(visibleLow, bar.low);
+                visibleHigh = Math.max(visibleHigh, bar.high);
+                visibleCount += 1;
+            }
+
+            const low = visibleCount > 0 ? visibleLow : fallbackLow;
+            const high = visibleCount > 0 ? visibleHigh : fallbackHigh;
+            if (
+                (visibleCount === 0 && fallbackCount === 0)
+                || !Number.isFinite(low)
+                || !Number.isFinite(high)
+                || high < low
+            ) {
+                return null;
+            }
+
+            const rawSpan = Math.max(high - low, minMove * 20, Math.abs((high + low) / 2) * 0.00002);
+            const padding = Math.max(rawSpan * 0.12, minMove * 20);
+
+            return {
+                minValue: low - padding,
+                maxValue: high + padding,
+            };
+        };
+
+        const keepPriceRangeContainingVisibleCandles = (range: { minValue: number; maxValue: number }) => {
+            const candleRange = getVisibleCandlePriceRange();
+            if (!candleRange) {
+                return expandPriceRangeToMinVisibleRange(range, digits);
+            }
+
+            const requestedSpan = range.maxValue - range.minValue;
+            const requiredSpan = candleRange.maxValue - candleRange.minValue;
+            if (
+                !Number.isFinite(requestedSpan)
+                || !Number.isFinite(requiredSpan)
+                || requestedSpan <= 0
+                || requiredSpan <= 0
+            ) {
+                return expandPriceRangeToMinVisibleRange(candleRange, digits);
+            }
+
+            const span = Math.max(requestedSpan, requiredSpan);
+            const requestedCenter = (range.minValue + range.maxValue) / 2;
+            const candleCenter = (candleRange.minValue + candleRange.maxValue) / 2;
+            const center = Number.isFinite(requestedCenter) ? requestedCenter : candleCenter;
+            let minValue = center - span / 2;
+            let maxValue = center + span / 2;
+
+            if (minValue > candleRange.minValue) {
+                const shift = minValue - candleRange.minValue;
+                minValue -= shift;
+                maxValue -= shift;
+            }
+
+            if (maxValue < candleRange.maxValue) {
+                const shift = candleRange.maxValue - maxValue;
+                minValue += shift;
+                maxValue += shift;
+            }
+
+            return expandPriceRangeToMinVisibleRange({ minValue, maxValue }, digits);
+        };
+
         const renderVolumeSeriesForCurrentRange = () => {
             volumeRenderFrame = null;
-            volSeries.applyOptions({ visible: shouldShowVolumeSeriesRef.current });
+            if (
+                disposed ||
+                chartRef.current !== chart ||
+                volumeSeriesRef.current !== volSeries
+            ) {
+                return;
+            }
+
+            try {
+                volSeries.applyOptions({ visible: shouldShowVolumeSeriesRef.current });
+            } catch {
+                return;
+            }
             if (!shouldShowVolumeSeriesRef.current) {
-                volSeries.setData([]);
+                try { volSeries.setData([]); } catch { /* detached */ }
                 lastVisibleMaxVolume = 0;
                 latestAppliedVolumeSeriesTime = null;
                 return;
             }
 
-            volSeries.priceScale().applyOptions({ scaleMargins: VOLUME_SCALE_MARGINS });
+            try {
+                volSeries.priceScale().applyOptions({ scaleMargins: VOLUME_SCALE_MARGINS });
+            } catch {
+                return;
+            }
             const visibleVolumeScaleMax = getVisibleVolumeScaleMax();
             lastVisibleMaxVolume = visibleVolumeScaleMax;
             // Sort by logical index to guarantee ascending series time for lightweight-charts
@@ -3117,6 +3237,14 @@ function KlineChartContainer({
         };
 
         const scheduleVolumeSeriesRender = () => {
+            if (
+                disposed ||
+                chartRef.current !== chart ||
+                volumeSeriesRef.current !== volSeries
+            ) {
+                return;
+            }
+
             if (!shouldShowVolumeSeriesRef.current) {
                 return;
             }
@@ -3132,7 +3260,19 @@ function KlineChartContainer({
         volumeSeriesRefreshRef.current = scheduleVolumeSeriesRender;
 
         const updateVolumeSeriesForLiveBar = (bar: OHLCBar, seriesTime: UTCTimestamp) => {
-            volSeries.applyOptions({ visible: shouldShowVolumeSeriesRef.current });
+            if (
+                disposed ||
+                chartRef.current !== chart ||
+                volumeSeriesRef.current !== volSeries
+            ) {
+                return;
+            }
+
+            try {
+                volSeries.applyOptions({ visible: shouldShowVolumeSeriesRef.current });
+            } catch {
+                return;
+            }
             if (!shouldShowVolumeSeriesRef.current) {
                 return;
             }
@@ -3491,6 +3631,31 @@ function KlineChartContainer({
             e.stopPropagation();
 
             const ts = currentChart.timeScale();
+            if (e.ctrlKey || e.metaKey) {
+                const current = (ts.options() as any).barSpacing ?? visualConfig.timeScale.barSpacing;
+                const safeCurrent = typeof current === 'number' && Number.isFinite(current) && current > 0
+                    ? current
+                    : visualConfig.timeScale.barSpacing;
+                const wheelSteps = Math.max(1, Math.min(8, Math.round(Math.abs(e.deltaY) / 80)));
+                const zoomFactor = Math.pow(1.12, wheelSteps);
+                const next = e.deltaY < 0
+                    ? Math.min(60, safeCurrent * zoomFactor)
+                    : Math.max(visualConfig.timeScale.minBarSpacing, safeCurrent / zoomFactor);
+
+                try {
+                    markProgrammaticBarSpacing(next);
+                    ts.applyOptions({
+                        barSpacing: next,
+                        rightOffset: getPreferredRightOffset(next),
+                    });
+                    chartBarSpacingRef.current = next;
+                    onChartBarSpacingChangeRef.current?.(next);
+                } catch { /* chart disposed */ }
+
+                scheduleAutoScroll();
+                return;
+            }
+
             const range = ts.getVisibleLogicalRange();
             if (!range) return;
 
@@ -3507,7 +3672,7 @@ function KlineChartContainer({
         };
         window.addEventListener('wheel', onWheel, { passive: false, capture: true });
 
-        // â”€â”€ Price axis drag-to-zoom (MT5-style scaleMargins manipulation). â”€â”€
+        // Price axis drag-to-zoom. Keep scaleMargins fixed so the candle pane does not slide.
         let priceAxisCleanup: (() => void) | null = null;
         const attachPriceAxisHandlers = () => {
             const table = host.querySelector('table');
@@ -3520,36 +3685,84 @@ function KlineChartContainer({
 
             let dragActive = false;
             let startY = 0;
-            let startTop = activePriceScaleMargins.top;
-            let startBottom = activePriceScaleMargins.bottom;
+            let startRange: { minValue: number; maxValue: number } | null = null;
+            let anchorPrice: number | null = null;
+            let startAnchorRatio = 0.5;
 
             const onMouseDown = (ev: MouseEvent) => {
+                const series = mainSeriesRef.current;
+                const hostRect = host.getBoundingClientRect();
+                if (!series || !hostRect.height) return;
+
+                const y = Math.min(Math.max(ev.clientY - hostRect.top, 0), hostRect.height);
+                const priceAtCursor = series.coordinateToPrice(y);
+                const topPrice = series.coordinateToPrice(0);
+                const bottomPrice = series.coordinateToPrice(hostRect.height);
+                if (
+                    typeof priceAtCursor !== 'number' ||
+                    typeof topPrice !== 'number' ||
+                    typeof bottomPrice !== 'number' ||
+                    !Number.isFinite(priceAtCursor) ||
+                    !Number.isFinite(topPrice) ||
+                    !Number.isFinite(bottomPrice)
+                ) {
+                    return;
+                }
+
+                const minValue = Math.min(topPrice, bottomPrice);
+                const maxValue = Math.max(topPrice, bottomPrice);
+                if (!Number.isFinite(minValue) || !Number.isFinite(maxValue) || maxValue <= minValue) return;
+
+                const visibleCandleRange = getVisibleCandlePriceRange();
+                const visibleCandleCenter = visibleCandleRange
+                    ? (visibleCandleRange.minValue + visibleCandleRange.maxValue) / 2
+                    : priceAtCursor;
+                const safeStartRange = keepPriceRangeContainingVisibleCandles({ minValue, maxValue });
+                const rangeSpan = safeStartRange.maxValue - safeStartRange.minValue;
+                const rawAnchorRatio = (visibleCandleCenter - safeStartRange.minValue) / rangeSpan;
+
                 dragActive = true;
                 startY = ev.clientY;
-                const ps = chartRef.current?.priceScale('right');
-                const opts = ps?.options() as any;
-                const margins = opts?.scaleMargins ?? activePriceScaleMargins;
-                startTop = margins.top ?? activePriceScaleMargins.top;
-                startBottom = margins.bottom ?? activePriceScaleMargins.bottom;
+                startRange = safeStartRange;
+                anchorPrice = visibleCandleCenter;
+                startAnchorRatio = Number.isFinite(rawAnchorRatio)
+                    ? Math.min(0.85, Math.max(0.15, rawAnchorRatio))
+                    : 0.5;
                 ev.preventDefault();
+                ev.stopPropagation();
             };
             const onMouseMove = (ev: MouseEvent) => {
-                if (!dragActive) return;
+                if (!dragActive || !startRange || anchorPrice === null) return;
                 const dy = ev.clientY - startY;
-                const sensitivity = 0.003;
-                const nextTop = Math.min(0.45, Math.max(0.01, startTop + dy * sensitivity));
-                const nextBottom = Math.min(0.45, Math.max(0.01, startBottom - dy * sensitivity));
+                const zoomFactor = Math.exp(dy * 0.006);
+                const startSpan = startRange.maxValue - startRange.minValue;
+                const minSpan = Math.max(minMove, Math.abs(anchorPrice) * 0.000000001);
+                const nextSpan = Math.max(minSpan, startSpan * zoomFactor);
+                if (!Number.isFinite(nextSpan)) return;
+                const nextRange = {
+                    minValue: anchorPrice - nextSpan * startAnchorRatio,
+                    maxValue: anchorPrice + nextSpan * (1 - startAnchorRatio),
+                };
+
                 try {
+                    manualPriceRangeRef.current = keepPriceRangeContainingVisibleCandles(nextRange);
+                    mainSeriesRef.current?.applyOptions({ autoscaleInfoProvider });
                     chartRef.current?.priceScale('right').applyOptions({
-                        scaleMargins: { top: nextTop, bottom: nextBottom },
-                        autoScale: false,
+                        autoScale: true,
+                        scaleMargins: activePriceScaleMargins,
                     });
                     updatePositionLineOverlays();
                 } catch { /* chart disposed */ }
             };
-            const onMouseUp = () => { dragActive = false; };
+            const onMouseUp = () => {
+                dragActive = false;
+                startRange = null;
+                anchorPrice = null;
+            };
             const onDblClick = () => {
                 try {
+                    manualPriceRangeRef.current = null;
+                    mainSeriesRef.current?.applyOptions({ autoscaleInfoProvider });
                     chartRef.current?.priceScale('right').applyOptions({
                         autoScale: true,
                         scaleMargins: activePriceScaleMargins,
