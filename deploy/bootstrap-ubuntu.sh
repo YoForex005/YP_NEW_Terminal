@@ -27,6 +27,12 @@ id -u "$APP_USER" >/dev/null 2>&1 || useradd --system --create-home --shell /bin
 id -u "$DEPLOY_USER" >/dev/null 2>&1 || adduser --disabled-password --gecos "" "$DEPLOY_USER"
 usermod -aG "$APP_USER" "$DEPLOY_USER"
 
+if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" && -f "/home/$SUDO_USER/.ssh/authorized_keys" ]]; then
+  install -d -o "$DEPLOY_USER" -g "$DEPLOY_USER" -m 0700 "/home/$DEPLOY_USER/.ssh"
+  install -o "$DEPLOY_USER" -g "$DEPLOY_USER" -m 0600 \
+    "/home/$SUDO_USER/.ssh/authorized_keys" "/home/$DEPLOY_USER/.ssh/authorized_keys"
+fi
+
 pm2 startup systemd -u "$APP_USER" --hp "/home/$APP_USER"
 
 install -d -o "$APP_USER" -g "$APP_USER" -m 0750 "$APP_ROOT" "$APP_ROOT/releases" "$APP_ROOT/shared"

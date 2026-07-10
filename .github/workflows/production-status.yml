@@ -29,14 +29,13 @@ jobs:
           PORT: ${{ secrets.PROD_SSH_PORT }}
           USER: ${{ secrets.PROD_SSH_USER }}
         run: |
-          ssh -p "${PORT:-22}" "$USER@$HOST" 'sudo bash -se' <<'REMOTE'
+          ssh -p "${PORT:-22}" "$USER@$HOST" 'bash -se' <<'REMOTE'
           set -Eeuo pipefail
           hostname
           . /etc/os-release
           echo "OS=$PRETTY_NAME"
           node --version
           npm --version
-          nginx -t
           systemctl is-active nginx redis-server fail2ban
           echo "YoPips port 3012 listener:"
           ss -ltnp 'sport = :3012' || true
@@ -48,5 +47,5 @@ jobs:
           echo "YoPips release layout:"
           ls -la /opt/yopips-terminal
           echo "YoPips PM2 status:"
-          sudo -u yopips-terminal pm2 status || true
+          curl --fail --silent http://127.0.0.1:3012/api/node-bridge/health
           REMOTE
