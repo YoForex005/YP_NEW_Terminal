@@ -186,12 +186,15 @@ const HISTORY_CLIENT_ATTACH_WAIT_MS = 1_200;
 const LIVE_CLIENT_ATTACH_POLL_MS = 80;
 const LOCAL_HISTORY_POLL_MS = 100;
 const LOCAL_REPLAY_BATCH_SIZE = 100;
-const MAX_NORMALIZED_OHLC_BARS = Math.max(DEFAULT_OHLC_HISTORY_LIMIT * 4, 20_000);
+const MAX_NORMALIZED_OHLC_BARS = DEFAULT_OHLC_HISTORY_LIMIT;
+const SYNC_HISTORY_CACHE_LIMIT = 1_000;
+const IN_MEMORY_HISTORY_MAX_KEYS = 64;
 const MAX_ACCEPTED_FUTURE_TICK_SKEW_MS = 60_000;
 const MAX_ACCEPTED_PAST_LIVE_TICK_SKEW_MS = 2 * 60_000;
 const RAW_OHLC_HISTORY_LIMIT = 512;
 const RAW_OHLC_HISTORY_MAX_KEYS = 128;
 const HISTORY_RESULT_CACHE_TTL_MS = 15_000;
+const HISTORY_RESULT_CACHE_MAX_ENTRIES = 24;
 const LATEST_HISTORY_REQUEST_COALESCE_DELAY_MS = 0;
 const BACKGROUND_HISTORY_REFRESH_STAGGER_MS = 1_200;
 const UNIX_SECONDS_TO_MILLISECONDS_THRESHOLD = 10_000_000_000;
@@ -3010,7 +3013,7 @@ class OhlcWebSocketService {
           symbol,
           timeframeMinutes,
         );
-        this.recentHistoryRequestResults.set(pendingRequestKey, {
+        this._rememberRecentHistoryResult(pendingRequestKey, {
           bars: bars.map((bar) => ({ ...bar })),
           limit: pendingEntry.limit,
           storedAtMs: Date.now(),
@@ -3381,7 +3384,7 @@ class OhlcWebSocketService {
             task.symbol,
             task.timeframeMinutes,
           );
-          this.recentHistoryRequestResults.set(task.requestKey, {
+          this._rememberRecentHistoryResult(task.requestKey, {
             bars: bars.map((bar) => ({ ...bar })),
             limit: task.requestLimit,
             storedAtMs: Date.now(),
@@ -3585,9 +3588,14 @@ class OhlcWebSocketService {
     }
 
     const key = makeSubKey(symbol, timeframeMinutes);
+    for (const historyKey of this._getHistoryReadKeys(key, { includeCurrent: false })) {
+      this._touchHistoryCacheEntry(historyKey);
+    }
     const directBars = this._getDirectLocalHistory(key);
     const bars = directBars.length > 0 ? directBars : this._getLocalHistory(key);
-    return bars.map((bar) => ({ ...bar, cached: bar.cached ?? true }));
+    return bars
+      .slice(-SYNC_HISTORY_CACHE_LIMIT)
+      .map((bar) => ({ ...bar, cached: bar.cached ?? true }));
   }
 
   public setHistoryDiagnosticsDebugEnabled(enabled: boolean) {
@@ -5174,11 +5182,58 @@ class OhlcWebSocketService {
       this._upsertSortedBar(history, bar, limit, bucketMs);
     }
 
-    if (!this.history.has(key)) {
-      this.history.set(key, history);
-    }
+    this._rememberHistoryCacheEntry(key, history);
 
     return history;
+  }
+
+  private _rememberHistoryCacheEntry(key: SubKey, bars: OHLCBar[]): void {
+    // Map insertion order is the LRU order. Account changes clear this map, so
+    // each entry is effectively scoped by account + symbol + timeframe.
+    this.history.delete(key);
+    this.history.set(key, bars);
+
+    while (this.history.size > IN_MEMORY_HISTORY_MAX_KEYS) {
+      const oldestInactiveKey = [...this.history.keys()].find(
+        (candidate) => candidate !== key && !this.subscribers.has(candidate),
+      );
+      const oldestKey = oldestInactiveKey ?? [...this.history.keys()].find(
+        (candidate) => candidate !== key,
+      );
+      if (!oldestKey) {
+        break;
+      }
+
+      this.history.delete(oldestKey);
+      this.historyMetadata.delete(oldestKey);
+      this.lastKnownCandleTimestampMs.delete(oldestKey);
+    }
+  }
+
+  private _touchHistoryCacheEntry(key: SubKey): void {
+    const bars = this.history.get(key);
+    if (!bars) {
+      return;
+    }
+
+    this.history.delete(key);
+    this.history.set(key, bars);
+  }
+
+  private _rememberRecentHistoryResult(
+    requestKey: string,
+    result: CachedHistoryRequest,
+  ): void {
+    this.recentHistoryRequestResults.delete(requestKey);
+    this.recentHistoryRequestResults.set(requestKey, result);
+
+    while (this.recentHistoryRequestResults.size > HISTORY_RESULT_CACHE_MAX_ENTRIES) {
+      const oldestKey = this.recentHistoryRequestResults.keys().next().value;
+      if (!oldestKey) {
+        break;
+      }
+      this.recentHistoryRequestResults.delete(oldestKey);
+    }
   }
 
   private _rememberRawOhlcBar(
@@ -5259,7 +5314,7 @@ class OhlcWebSocketService {
       return false;
     }
 
-    this.history.set(key, this._normalizeBars(rawHistory, bucketMs));
+    this._rememberHistoryCacheEntry(key, this._normalizeBars(rawHistory, bucketMs));
     return true;
   }
 
@@ -6890,10 +6945,6 @@ class OhlcWebSocketService {
   }
 
   private _pushToHistory(key: SubKey, bar: OHLCBar): OHLCBar {
-    if (!this.history.has(key)) {
-      this.history.set(key, []);
-    }
-
     const bucketMs = this._bucketMsForKey(key);
     const sourceTimeMs = getCanonicalIncomingBarTime(bar);
     const normalizedBar = {
@@ -6901,8 +6952,9 @@ class OhlcWebSocketService {
       sourceTimeMs: bar.sourceTimeMs ?? sourceTimeMs,
       time: bucketTime(sourceTimeMs, bucketMs),
     };
-    const history = this.history.get(key)!;
+    const history = this.history.get(key) ?? [];
     const storedBar = this._upsertSortedBar(history, normalizedBar, MAX_NORMALIZED_OHLC_BARS, bucketMs);
+    this._rememberHistoryCacheEntry(key, history);
 
     // Keep lastKnownCandleTimestampMs up to date for reconnect gap-fill.
     if (normalizedBar.time > 0) {

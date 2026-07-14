@@ -74,6 +74,7 @@ export interface TerminalTicketClientOptions {
   wsBaseUrl?: string;
   onStatus?: (status: TicketClientStatus, message?: string) => void;
   onError?: (error: Error) => void;
+  onTerminalAuthExpired?: (error: Error) => void;
   onSession?: (session: TradingSession | null) => void;
   onTick?: (tick: PriceTick) => void;
   onAccountSummary?: (summary: {
@@ -192,6 +193,11 @@ const getErrorPayloadMessage = (payload: unknown, fallback: string): string => {
       error?.code,
     fallback,
   );
+};
+
+const isTerminalAuthError = (error: unknown): boolean => {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  return /(^|\b)(401|403|unauthorized|forbidden|invalid[_\s-]?(terminal[_\s-]?token|token|session)|expired[_\s-]?(token|session)|session[_\s-]?(revoked|expired|not[_\s-]?found))(\b|$)/i.test(message);
 };
 
 const parseDate = (value: unknown): Date => {
@@ -1108,6 +1114,13 @@ export class TerminalTicketRealtimeClient {
     this.options.onStatus?.('disconnected');
   }
 
+  public expireSession(): void {
+    this.disconnect();
+    this.terminalToken = '';
+    this.feedTicket = '';
+    this.tradeTicket = '';
+  }
+
   public async revoke(): Promise<void> {
     await fetch(buildHttpUrl(this.options.apiBaseUrl, '/api/terminal/sessions/revoke'), {
       method: 'POST',
@@ -1308,10 +1321,10 @@ export class TerminalTicketRealtimeClient {
         };
         socket.onmessage = (event) => this.handleFeedMessage(event.data);
         socket.onerror = () => reject(new Error('Feed websocket connection failed.'));
-        socket.onclose = () => {
+        socket.onclose = (event) => {
           if (this.feedSocket !== socket) return;
           this.feedSubscribedSymbols.clear();
-          this.handleSocketClose('feed');
+          this.handleSocketClose('feed', event);
         };
       } catch (error) {
         reject(error);
@@ -1347,9 +1360,9 @@ export class TerminalTicketRealtimeClient {
         };
         socket.onmessage = (event) => this.handleTradeMessage(event.data);
         socket.onerror = () => reject(new Error('Trade websocket connection failed.'));
-        socket.onclose = () => {
+        socket.onclose = (event) => {
           if (this.tradeSocket !== socket) return;
-          this.handleSocketClose('trade');
+          this.handleSocketClose('trade', event);
         };
       } catch (error) {
         reject(error);
@@ -1851,10 +1864,14 @@ export class TerminalTicketRealtimeClient {
     }
   }
 
-  private handleSocketClose(lane: 'feed' | 'trade'): void {
+  private handleSocketClose(lane: 'feed' | 'trade', event?: CloseEvent): void {
     if (this.manualDisconnect) return;
-    this.rejectPendingRequests(new Error(`${lane} websocket disconnected.`), lane);
-    this.options.onStatus?.('reconnecting', `${lane} websocket disconnected. Reconnecting...`);
+    const closeDetails = event
+      ? ` (code ${event.code}${event.reason ? `: ${event.reason}` : ''})`
+      : '';
+    const message = `${lane} websocket disconnected${closeDetails}.`;
+    this.rejectPendingRequests(new Error(message), lane);
+    this.options.onStatus?.('reconnecting', `${message} Reconnecting...`);
     this.scheduleReconnect();
   }
 
@@ -1867,8 +1884,14 @@ export class TerminalTicketRealtimeClient {
         await this.connect();
         await this.refreshState().catch(() => undefined);
       } catch (error) {
+        const reconnectError = error instanceof Error ? error : new Error(String(error));
         this.options.onStatus?.('error');
-        this.options.onError?.(error instanceof Error ? error : new Error(String(error)));
+        this.options.onError?.(reconnectError);
+        if (isTerminalAuthError(error)) {
+          this.expireSession();
+          this.options.onTerminalAuthExpired?.(reconnectError);
+          return;
+        }
         this.scheduleReconnect();
       }
     }, RECONNECT_DELAY_MS);

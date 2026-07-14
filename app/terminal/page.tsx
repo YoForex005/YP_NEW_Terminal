@@ -160,15 +160,8 @@ const TERMINAL_OHLC_HISTORY_WARMUP_STAGGER_MS = 1_200;
 const TERMINAL_BOOTSTRAP_QUOTE_PREWARM_DELAY_MS = 250;
 const TERMINAL_BOOTSTRAP_OHLC_HISTORY_PREWARM_DELAY_MS = 1_500;
 const TERMINAL_REACTIVE_OHLC_HISTORY_PREWARM_DELAY_MS = 2_500;
-const TERMINAL_SWITCH_TIMEFRAME_PREFETCH_DELAY_MS = 1_200;
+const TERMINAL_BACKGROUND_OHLC_PREWARM_LIMIT = 300;
 const TERMINAL_DEFAULT_TIMEFRAME_MINUTES = 1;
-// Predictive prefetch on hover: start loading before user clicks
-const TERMINAL_HOVER_PREFETCH_LIMIT = 300;                  // lightweight hover prime, fills fast
-// Timeframes pre-warmed on every symbol switch (common chart resolutions)
-const TERMINAL_SWITCH_PREFETCH_TIMEFRAMES = [1, 5, 15, 30, 60, 240, 1440, 10080] as const; // M1 M5 M15 M30 H1 H4 D1 W1
-// Minimum cached bars considered "warm enough" to show instantly without fresh fetch
-// If cache has ΓëÑ this many bars, skip the fresh fetch and show instantly
-const TERMINAL_SWITCH_MIN_CACHE_BARS = 200;
 const TERMINAL_OHLC_REPAIR_FETCH_TIMEOUT_MS = 17_000;
 const TERMINAL_OHLC_REPAIR_REQUEST_DEDUPE_MS = 15_000;
 // Exponential backoff for consecutive repair failures (e.g. upstream down).
@@ -3278,7 +3271,8 @@ function TradingDashboardInner() {
         key: string;
         timeoutId: number;
     } | null>(null);
-    const switchOhlcPrefetchTimerRef = useRef<number | null>(null);
+    const symbolSwitchWarmupFrameRef = useRef<number | null>(null);
+    const symbolSwitchWarmupTimerRef = useRef<number | null>(null);
     const symbolCatalogRefreshInFlightRef = useRef(false);
     const hasAnyLiveQuote = livePriceSymbolKey.length > 0;
     const clearOhlcWarmupTimers = useCallback(() => {
@@ -3287,9 +3281,13 @@ function TradingDashboardInner() {
         });
         ohlcHistoryWarmupRetryTimeoutsRef.current.clear();
 
-        if (switchOhlcPrefetchTimerRef.current !== null) {
-            window.clearTimeout(switchOhlcPrefetchTimerRef.current);
-            switchOhlcPrefetchTimerRef.current = null;
+        if (symbolSwitchWarmupFrameRef.current !== null) {
+            window.cancelAnimationFrame(symbolSwitchWarmupFrameRef.current);
+            symbolSwitchWarmupFrameRef.current = null;
+        }
+        if (symbolSwitchWarmupTimerRef.current !== null) {
+            window.clearTimeout(symbolSwitchWarmupTimerRef.current);
+            symbolSwitchWarmupTimerRef.current = null;
         }
     }, []);
     useEffect(() => {
@@ -5079,7 +5077,7 @@ function TradingDashboardInner() {
                 exactSymbol,
                 normalizedTimeframeMinutes,
                 historyLimit,
-                { cacheFirst: true, cacheOnly: false, bypassPendingLatest: true },
+                { cacheFirst: true, cacheOnly: false },
             )
             .then((history) => {
                 if (!isOhlcHistoryConsoleDebugEnabled) {
@@ -5419,22 +5417,6 @@ function TradingDashboardInner() {
         isOhlcHistoryClientReady,
         selectedBrokerSymbol,
         chartTimeframeMinutes,
-    ]);
-
-    useEffect(() => {
-        if (!isOhlcHistoryClientReady || !selectedBrokerSymbol) {
-            return;
-        }
-
-        requestSelectedOhlcHistoryRef.current(
-            selectedBrokerSymbol,
-            TERMINAL_SELECTED_OHLC_HISTORY_PRIME_LIMIT,
-            chartTimeframeMinutes,
-        );
-    }, [
-        chartTimeframeMinutes,
-        isOhlcHistoryClientReady,
-        selectedBrokerSymbol,
     ]);
 
     // ΓöÇΓöÇ Debounced gap recovery via WS ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -6040,7 +6022,7 @@ function TradingDashboardInner() {
             watchlistOhlcPrewarmKeyRef.current = prewarmKey;
             requestOhlcHistoryForSymbolsRef.current(
                 boundedPrewarmSymbols,
-                TERMINAL_HOVER_PREFETCH_LIMIT,
+                TERMINAL_BACKGROUND_OHLC_PREWARM_LIMIT,
                 chartTimeframeMinutes,
             );
         }, TERMINAL_REACTIVE_OHLC_HISTORY_PREWARM_DELAY_MS);
@@ -7658,7 +7640,28 @@ function TradingDashboardInner() {
                 setActivePanel(null);
             }
         });
-        primeTerminalMarketData([exactSymbol]);
+        if (symbolSwitchWarmupFrameRef.current !== null) {
+            window.cancelAnimationFrame(symbolSwitchWarmupFrameRef.current);
+            symbolSwitchWarmupFrameRef.current = null;
+        }
+        if (symbolSwitchWarmupTimerRef.current !== null) {
+            window.clearTimeout(symbolSwitchWarmupTimerRef.current);
+            symbolSwitchWarmupTimerRef.current = null;
+        }
+        symbolSwitchWarmupFrameRef.current = window.requestAnimationFrame(() => {
+            symbolSwitchWarmupFrameRef.current = null;
+            symbolSwitchWarmupTimerRef.current = window.setTimeout(() => {
+                symbolSwitchWarmupTimerRef.current = null;
+                const activeSymbol = activeChartSymbolRef.current;
+                if (activeSymbol && !symbolsMatch(activeSymbol, exactSymbol)) {
+                    return;
+                }
+                primeTerminalMarketData([exactSymbol], {
+                    requestHistory: true,
+                    historyLimit: TERMINAL_SELECTED_OHLC_HISTORY_PRIME_LIMIT,
+                });
+            }, 0);
+        });
 
         const normalizedTimeframeMinutes = normalizeTerminalTimeframeMinutes(chartTimeframeMinutes);
         const selectedDiagnosticsApplies = Boolean(
@@ -7673,45 +7676,18 @@ function TradingDashboardInner() {
             selectedDiagnosticsApplies &&
             terminalOhlcHistoryDiagnosticsNeedsRepair(selectedHistoryDiagnostics);
 
-        const cachedBarCount = getUsableTerminalOhlcHistoryBarCount(
-            ohlcService.getSyncBars(exactSymbol, normalizedTimeframeMinutes, accountSessionScopeId),
-        );
-        if (cachedBarCount === 0 || selectedDiagnosticsNeedsHistory) {
+        if (selectedDiagnosticsNeedsHistory) {
             requestSelectedOhlcHistoryRef.current(
                 exactSymbol,
                 TERMINAL_SELECTED_OHLC_HISTORY_PRIME_LIMIT,
                 normalizedTimeframeMinutes,
             );
         }
-        if (switchOhlcPrefetchTimerRef.current !== null) {
-            window.clearTimeout(switchOhlcPrefetchTimerRef.current);
-        }
-        switchOhlcPrefetchTimerRef.current = window.setTimeout(() => {
-            switchOhlcPrefetchTimerRef.current = null;
-            const activeSymbol = activeChartSymbolRef.current;
-            if (activeSymbol && !symbolsMatch(activeSymbol, exactSymbol)) {
-                return;
-            }
-            for (const tf of TERMINAL_SWITCH_PREFETCH_TIMEFRAMES) {
-                if (tf === normalizedTimeframeMinutes) {
-                    continue;
-                }
-                const cachedCount = getUsableTerminalOhlcHistoryBarCount(
-                    ohlcService.getSyncBars(exactSymbol, tf, accountSessionScopeId),
-                );
-                if (cachedCount >= TERMINAL_SWITCH_MIN_CACHE_BARS) {
-                    continue;
-                }
-                requestOhlcHistoryForSymbols([exactSymbol], TERMINAL_HOVER_PREFETCH_LIMIT, tf);
-            }
-        }, TERMINAL_SWITCH_TIMEFRAME_PREFETCH_DELAY_MS);
     }, [
-        accountSessionScopeId,
         chartTimeframeMinutes,
         connectAccountId,
         handleShowToast,
         primeTerminalMarketData,
-        requestOhlcHistoryForSymbols,
         selectedHistoryDiagnostics,
         storeSymbols,
     ]);

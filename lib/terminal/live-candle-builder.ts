@@ -29,6 +29,12 @@ export type LiveQuoteLike = {
   timeMsc?: unknown;
   timestamp_msc?: unknown;
   timestampMsc?: unknown;
+  server_time_msc?: unknown;
+  serverTimeMsc?: unknown;
+  server_time?: unknown;
+  serverTime?: unknown;
+  server_received_msc?: unknown;
+  serverReceivedMsc?: unknown;
   tick_time?: unknown;
   tickTime?: unknown;
   timeMs?: unknown;
@@ -134,6 +140,12 @@ export function getLiveQuoteEventTime(quote: LiveQuoteLike, fallback = Date.now(
       quote.timeMsc ??
       quote.timestamp_msc ??
       quote.timestampMsc ??
+      quote.server_time_msc ??
+      quote.serverTimeMsc ??
+      quote.server_time ??
+      quote.serverTime ??
+      quote.server_received_msc ??
+      quote.serverReceivedMsc ??
       quote.tick_time ??
       quote.tickTime ??
       quote.timeMs ??
@@ -208,4 +220,3 @@ export function applyPriceToCandleSeries<TCandle extends LiveCandle>(
 
   return next;
 }
-

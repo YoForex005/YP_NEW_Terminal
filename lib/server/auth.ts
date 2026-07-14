@@ -39,6 +39,7 @@ export interface AuthContext {
 const secureCookie = process.env.NODE_ENV === "production";
 type CookieRequestContext = Pick<Request, "url"> | NextRequest;
 const BACKEND_AUTH_TIMEOUT_MS = 1_000;
+const DEV_AUTO_AUTH_TOKEN = "dev-auto-auth";
 
 // Shared circuit state with the DB layer — both call port 3002, so a DB
 // failure implies auth will also fail. Using the same globalThis key means
@@ -371,7 +372,11 @@ export const authenticateRequest = async (
   request: NextRequest,
 ): Promise<AuthContext | null> => {
   const token = getSessionTokenFromRequest(request);
-  const cached = getCachedAuthContext(getBearerTokenFromRequest(request) ?? token);
+  const cacheToken =
+    getBearerTokenFromRequest(request) ??
+    token ??
+    (isDevAutoAuthEnabled(request) ? DEV_AUTO_AUTH_TOKEN : null);
+  const cached = getCachedAuthContext(cacheToken);
   if (cached) {
     return cached;
   }
@@ -433,13 +438,17 @@ const authenticateDevelopmentRequest = async (
   const adminEmail =
     process.env.APP_ADMIN_EMAIL?.trim().toLowerCase() || "admin@dominionmarkets.local";
   let user: AppUser | null = null;
-  try {
-    user = (await getUserByEmail(adminEmail)) ?? (await getFirstUser());
-  } catch (err) {
-    console.warn(
-      "[auth] dev auto-auth DB lookup failed; using local fallback user:",
-      err instanceof Error ? err.message : err,
-    );
+  if (!isAuthCircuitOpen()) {
+    try {
+      user = (await getUserByEmail(adminEmail)) ?? (await getFirstUser());
+      closeAuthCircuit();
+    } catch (err) {
+      openAuthCircuit();
+      console.warn(
+        "[auth] dev auto-auth DB lookup failed; using local fallback user:",
+        err instanceof Error ? err.message : err,
+      );
+    }
   }
 
   const now = Date.now();
@@ -453,7 +462,7 @@ const authenticateDevelopmentRequest = async (
     profileVerified: "verified",
   };
   const session: AppSession = {
-    token: "dev-auto-auth",
+    token: DEV_AUTO_AUTH_TOKEN,
     userId: user?.id ?? fallbackUser.id,
     brokerId: user?.brokerId,
     createdAt: new Date(now).toISOString(),

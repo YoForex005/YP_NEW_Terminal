@@ -39,6 +39,8 @@ interface UseTerminalLaunchSessionResult {
 type TerminalSessionStart =
   { mode: 'launch-code'; launchCode: string };
 
+const TERMINAL_EXPIRY_SAFETY_WINDOW_MS = 5_000;
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 
@@ -218,6 +220,7 @@ export const useTerminalLaunchSession = (): UseTerminalLaunchSessionResult => {
     let isCancelled = false;
     let didExchange = false;
     let initialAccountRefreshComplete = false;
+    let terminalExpiryTimer: ReturnType<typeof setTimeout> | null = null;
     setStatus(sessionStart.mode === 'launch-code' ? 'exchanging' : 'restoring');
     setConnectionStatus('connecting');
     setError(null);
@@ -225,6 +228,26 @@ export const useTerminalLaunchSession = (): UseTerminalLaunchSessionResult => {
 
     const buildPayload = async (): Promise<TerminalExchangeResponse> => {
       return exchangeTerminalLaunchCode(sessionStart.launchCode, getTerminalApiBaseUrl());
+    };
+
+    const expireTerminalSession = (message: string): void => {
+      if (isCancelled) return;
+      if (terminalExpiryTimer) {
+        clearTimeout(terminalExpiryTimer);
+        terminalExpiryTimer = null;
+      }
+      clientRef.current?.expireSession();
+      clientRef.current = null;
+      setExchange(null);
+      setStatus('error');
+      setError(message);
+      setConnectionStatus('disconnected');
+      setConnectionError(message);
+      setWsClient(null);
+      setMarketWsClient(null);
+      setOhlcWsClient(null);
+      setOhlcSessionScopeId(null);
+      ohlcService.setUseHistoryApi(true);
     };
 
     void buildPayload()
@@ -278,6 +301,9 @@ export const useTerminalLaunchSession = (): UseTerminalLaunchSessionResult => {
             setError(message);
             setConnectionError(message);
           },
+          onTerminalAuthExpired: () => {
+            expireTerminalSession('Terminal session expired. Reopen it from the dashboard.');
+          },
           onSession: (session) => {
             if (isCancelled) return;
             setSession(session);
@@ -308,6 +334,18 @@ export const useTerminalLaunchSession = (): UseTerminalLaunchSessionResult => {
         });
 
         clientRef.current = client;
+
+        const expiresInSeconds = Number(payload.expires_in);
+        if (Number.isFinite(expiresInSeconds) && expiresInSeconds > 0) {
+          const expiryDelayMs = Math.max(
+            0,
+            expiresInSeconds * 1_000 - TERMINAL_EXPIRY_SAFETY_WINDOW_MS,
+          );
+          terminalExpiryTimer = setTimeout(() => {
+            expireTerminalSession('Terminal session expired. Reopen it from the dashboard.');
+          }, expiryDelayMs);
+        }
+
         const storeClient = client as unknown as WebSocketTradingClient;
         setWsClient(storeClient);
         setMarketWsClient(storeClient);
@@ -338,9 +376,9 @@ export const useTerminalLaunchSession = (): UseTerminalLaunchSessionResult => {
         setStatus('error');
         setError(message);
         if (!didExchange) {
-          removeLaunchCodeFromHash();
           setExchange(null);
           setConnectionStatus('disconnected');
+          setConnectionError(message);
           return;
         }
         setConnectionStatus('error');
@@ -349,6 +387,7 @@ export const useTerminalLaunchSession = (): UseTerminalLaunchSessionResult => {
 
     return () => {
       isCancelled = true;
+      if (terminalExpiryTimer) clearTimeout(terminalExpiryTimer);
       clientRef.current?.disconnect();
       clientRef.current = null;
       setWsClient(null);
@@ -379,7 +418,7 @@ export const useTerminalLaunchSession = (): UseTerminalLaunchSessionResult => {
   const isRestoring = status === 'exchanging' || status === 'restoring' || status === 'connecting' || status === 'reconnecting';
 
   return {
-    isActive: Boolean(exchange || (sessionStart && status !== 'error')),
+    isActive: Boolean(exchange || sessionStart),
     status,
     error,
     account,
