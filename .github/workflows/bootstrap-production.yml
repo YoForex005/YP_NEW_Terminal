@@ -1,0 +1,135 @@
+name: Bootstrap production
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment:
+      name: production
+      url: https://terminal.yopips.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.PROD_SSH_PRIVATE_KEY }}
+          SSH_HOST_KEY: ${{ secrets.PROD_SSH_HOST_KEY }}
+        run: |
+          install -d -m 0700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 0600 ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_HOST_KEY" > ~/.ssh/known_hosts
+          chmod 0600 ~/.ssh/known_hosts
+
+      - name: Upload bootstrap files
+        env:
+          HOST: ${{ secrets.PROD_SSH_HOST }}
+          PORT: ${{ secrets.PROD_SSH_PORT }}
+          USER: ${{ secrets.PROD_SSH_USER }}
+        run: |
+          ssh -p "${PORT:-22}" "$USER@$HOST" "rm -rf /tmp/yopips-bootstrap && mkdir -p /tmp/yopips-bootstrap"
+          scp -P "${PORT:-22}" \
+            deploy/bootstrap-ubuntu.sh \
+            deploy/deploy-release.sh \
+            deploy/nginx/terminal.yopips.com.conf \
+            "$USER@$HOST:/tmp/yopips-bootstrap/"
+
+      - name: Bootstrap Ubuntu and create production environment
+        env:
+          HOST: ${{ secrets.PROD_SSH_HOST }}
+          PORT: ${{ secrets.PROD_SSH_PORT }}
+          USER: ${{ secrets.PROD_SSH_USER }}
+        run: |
+          ssh -p "${PORT:-22}" "$USER@$HOST" 'sudo bash -se' <<'REMOTE'
+          set -Eeuo pipefail
+          cd /tmp/yopips-bootstrap
+          bash ./bootstrap-ubuntu.sh
+
+          token_secret="$(sed -n 's/^WEBTRADER_TOKEN_SECRET=//p' /opt/yopips-terminal/shared/.env.production 2>/dev/null | head -n 1)"
+          token_secret="${token_secret:-$(openssl rand -hex 32)}"
+          install -d -o yopips-terminal -g yopips-terminal -m 0750 /opt/yopips-terminal/shared
+          cat >/opt/yopips-terminal/shared/.env.production <<ENV
+          NODE_ENV=production
+          HOST=127.0.0.1
+          PORT=3012
+
+          TERMINAL_API_BASE=https://api.yopips.com
+          ACCOUNTS_BACKEND_URL=https://api.yopips.com
+          ACCOUNTS_BACKEND_BASE_URL=https://api.yopips.com
+          DASHBOARD_BACKEND_URL=https://api.yopips.com
+          RUST_GATEWAY_HTTP_URL=https://api.yopips.com
+          RUST_GATEWAY_PUBLIC_API_BASE_URL=https://api.yopips.com
+          NEXT_PUBLIC_API_BASE_URL=https://api.yopips.com
+
+          NEXT_PUBLIC_TERMINAL_API_BASE=proxy
+          NEXT_PUBLIC_TERMINAL_WS_BASE=wss://api.yopips.com
+          NEXT_PUBLIC_TERMINAL_TRADE_DRY_RUN=true
+          NEXT_PUBLIC_ENABLE_REAL_TRADING=false
+
+          NEXT_PUBLIC_WS_URL=/ws
+          NEXT_PUBLIC_WS_MARKET_URL=/ws/market
+          NEXT_PUBLIC_WS_OHLC_URL=/ws/ohlc
+          NEXT_PUBLIC_WS_ACCOUNT_URL=/ws/account
+          NEXT_PUBLIC_WS_TRADE_URL=/ws/trade
+
+          CPP_REALTIME_WS_URL=wss://api.yopips.com/ws
+          MT5_REALTIME_WS_URL=wss://api.yopips.com/ws
+          NODE_WS_PATHS=/ws,/api/ws,/stream,/realtime,/
+          NODE_WS_AUTH_TIMEOUT_MS=10000
+          NODE_WS_MAX_PENDING_FRAMES=200
+          WEBTRADER_TOKEN_SECRET=$token_secret
+          WEBTRADER_TOKEN_TTL_SECONDS=900
+
+          DEV_AUTO_AUTH=false
+          DEV_AUTO_PROVISION_USERS=false
+          NEXT_PUBLIC_DASHBOARD_DATA_SOURCE=api
+          NEXT_PUBLIC_ENABLE_SYNTHETIC_MARKET_DATA=false
+          NEXT_PUBLIC_ENABLE_LEGACY_QUOTES_SOCKET_IO=false
+          REDIS_URL=redis://127.0.0.1:6379
+          ENV
+          chown yopips-terminal:yopips-terminal /opt/yopips-terminal/shared/.env.production
+          chmod 0600 /opt/yopips-terminal/shared/.env.production
+
+          cat >/etc/nginx/sites-available/terminal.yopips.com <<'NGINX'
+          server {
+              listen 80;
+              listen [::]:80;
+              server_name terminal.yopips.com;
+              location / {
+                  proxy_pass http://127.0.0.1:3012;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Forwarded-Host $host;
+                  proxy_set_header X-Forwarded-Port 443;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+          NGINX
+          ln -sfn /etc/nginx/sites-available/terminal.yopips.com /etc/nginx/sites-enabled/terminal.yopips.com
+          nginx -t
+          systemctl reload nginx
+
+          certbot --nginx --non-interactive --agree-tos --register-unsafely-without-email \
+            --redirect -d terminal.yopips.com
+          install -o root -g root -m 0644 \
+            /tmp/yopips-bootstrap/terminal.yopips.com.conf \
+            /etc/nginx/sites-available/terminal.yopips.com
+          nginx -t
+          systemctl reload nginx
+          REMOTE
+
+      - name: Verify certificate
+        run: >-
+          echo | openssl s_client -connect terminal.yopips.com:443
+          -servername terminal.yopips.com 2>/dev/null |
+          openssl x509 -noout -checkend 86400

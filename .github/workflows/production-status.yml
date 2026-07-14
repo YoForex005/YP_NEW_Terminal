@@ -1,0 +1,51 @@
+name: Production status
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: production
+    steps:
+      - name: Configure SSH
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.PROD_SSH_PRIVATE_KEY }}
+          SSH_HOST_KEY: ${{ secrets.PROD_SSH_HOST_KEY }}
+        run: |
+          install -d -m 0700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 0600 ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_HOST_KEY" > ~/.ssh/known_hosts
+          chmod 0600 ~/.ssh/known_hosts
+      - name: Read production status
+        env:
+          HOST: ${{ secrets.PROD_SSH_HOST }}
+          PORT: ${{ secrets.PROD_SSH_PORT }}
+          USER: ${{ secrets.PROD_SSH_USER }}
+        run: |
+          ssh -p "${PORT:-22}" "$USER@$HOST" 'bash -se' <<'REMOTE'
+          set -Eeuo pipefail
+          hostname
+          . /etc/os-release
+          echo "OS=$PRETTY_NAME"
+          node --version
+          npm --version
+          systemctl is-active nginx redis-server fail2ban
+          echo "YoPips port 3012 listener:"
+          ss -ltnp 'sport = :3012' || true
+          for pid in $(fuser 3012/tcp 2>/dev/null || true); do
+            ps -o pid,ppid,user,lstart,cmd -p "$pid" || true
+            echo "cwd=$(readlink -f "/proc/$pid/cwd" || true)"
+            echo "cgroup=$(tr '\n' ' ' <"/proc/$pid/cgroup" || true)"
+          done
+          echo "YoPips release layout:"
+          ls -la /opt/yopips-terminal
+          echo "YoPips PM2 status:"
+          curl --fail --silent http://127.0.0.1:3012/api/node-bridge/health
+          REMOTE
