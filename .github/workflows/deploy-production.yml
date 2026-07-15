@@ -57,6 +57,14 @@ jobs:
           USER: ${{ secrets.PROD_SSH_USER }}
           SHA: ${{ steps.release.outputs.sha }}
         run: scp -P "${PORT:-22}" "/tmp/yopips-terminal-$SHA.tar.gz" "$USER@$HOST:/tmp/"
+      - name: Update production environment variables
+        env:
+          HOST: ${{ secrets.PROD_SSH_HOST }}
+          PORT: ${{ secrets.PROD_SSH_PORT }}
+          USER: ${{ secrets.PROD_SSH_USER }}
+        run: |
+          ssh -p "${PORT:-22}" "$USER@$HOST" \
+            "sudo sed -i 's/api\.yopips\.com/backend.yopips.com/g' /opt/yopips-terminal/shared/.env.production"
       - name: Activate and verify release
         env:
           HOST: ${{ secrets.PROD_SSH_HOST }}
