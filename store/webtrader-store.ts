@@ -352,25 +352,25 @@ const buildNextPriceSnapshot = (
   };
 };
 
-const applyTickToPrices = (
+const applyTicksToPrices = (
   currentPrices: Record<string, PriceSnapshot>,
-  tick: PriceTick,
+  ticks: PriceTick[],
 ): Record<string, PriceSnapshot> => {
   let nextPrices = currentPrices;
-  const aliases = getSymbolAliases(tick.symbol);
 
-  if (hasNewerPriceTick(currentPrices, aliases, tick)) {
-    return currentPrices;
-  }
-
-  for (const alias of aliases) {
-    const nextPrice = buildNextPriceSnapshot(nextPrices[alias], tick, alias);
+  for (const tick of ticks) {
+    const aliases = getSymbolAliases(tick.symbol);
+    if (hasNewerPriceTick(nextPrices, aliases, tick)) {
+      continue;
+    }
 
     if (nextPrices === currentPrices) {
       nextPrices = { ...currentPrices };
     }
 
-    nextPrices[alias] = nextPrice;
+    for (const alias of aliases) {
+      nextPrices[alias] = buildNextPriceSnapshot(nextPrices[alias], tick, alias);
+    }
   }
 
   return nextPrices;
@@ -786,8 +786,6 @@ const queuedPriceTicks = new Map<string, PriceTick>();
 let pendingPriceFlushHandle: number | ReturnType<typeof setTimeout> | null = null;
 let pendingPriceFlushUsesAnimationFrame = false;
 let nextPriceTickReceivedSequence = 0;
-let lastQueuedPriceFlushAtMs = 0;
-const IMMEDIATE_PRICE_FLUSH_COOLDOWN_MS = 4;
 
 const flushQueuedPrices = () => {
   pendingPriceFlushHandle = null;
@@ -797,17 +795,11 @@ const flushQueuedPrices = () => {
     return;
   }
 
-  lastQueuedPriceFlushAtMs = Date.now();
-
   const ticks = [...queuedPriceTicks.values()];
   queuedPriceTicks.clear();
 
   liveRuntimeStore.setState((state) => {
-    let prices = state.prices;
-
-    for (const tick of ticks) {
-      prices = applyTickToPrices(prices, tick);
-    }
+    const prices = applyTicksToPrices(state.prices, ticks);
 
     if (prices === state.prices) {
       return state;
@@ -817,39 +809,8 @@ const flushQueuedPrices = () => {
   });
 };
 
-const shouldFlushQueuedPricesImmediately = () => {
-  if (typeof window === 'undefined') {
-    return false;
-  }
-
-  if (
-    typeof document !== 'undefined' &&
-    document.visibilityState === 'hidden'
-  ) {
-    return false;
-  }
-
-  return (
-    Date.now() - lastQueuedPriceFlushAtMs >=
-    IMMEDIATE_PRICE_FLUSH_COOLDOWN_MS
-  );
-};
-
 const schedulePriceFlush = () => {
   if (pendingPriceFlushHandle !== null) {
-    return;
-  }
-
-  if (shouldFlushQueuedPricesImmediately()) {
-    // queueMicrotask runs before any timer callback (~0ms) so React state
-    // (colors, button states) updates as soon as the current JS task yields —
-    // faster than the 4ms minimum browser clamp on setTimeout(0).
-    pendingPriceFlushHandle = -1;
-    queueMicrotask(() => {
-      if (pendingPriceFlushHandle === -1) {
-        flushQueuedPrices();
-      }
-    });
     return;
   }
 

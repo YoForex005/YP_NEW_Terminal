@@ -11,6 +11,10 @@ import {
 } from '@/lib/trading/websocket-client';
 import { shouldAllowSyntheticMarketData } from '@/lib/terminal/synthetic-data';
 import {
+  readPersistentOhlcHistory,
+  writePersistentOhlcHistory,
+} from '@/lib/terminal/ohlc-persistent-cache';
+import {
   findValueBySymbol,
   getCanonicalSymbol,
   getSymbolAliases,
@@ -161,6 +165,10 @@ type HistoryRequestRange = {
 type HistoryMergeOptions = {
   notifySubscribers?: boolean;
   barsAlreadyFiltered?: boolean;
+};
+type OhlcSubscriptionReplayMode = 'history' | 'latest' | 'none';
+type OhlcSubscriptionOptions = {
+  replay?: OhlcSubscriptionReplayMode;
 };
 type OhlcHistoryMetadataWithPagination = OhlcHistoryResponseMetadata & {
   requestType?: string;
@@ -2568,6 +2576,8 @@ class OhlcWebSocketService {
   private storePriceSubscriptionCounts: Map<string, number> = new Map();
   private storePriceUnsubscribers: Map<string, () => void> = new Map();
   private ingestedLivePriceKeys: Map<string, string> = new Map();
+  private pendingPersistentHistoryReads: Map<string, Promise<OHLCBar[]>> = new Map();
+  private persistentHistoryWriteTimers: Map<SubKey, ReturnType<typeof setTimeout>> = new Map();
   private pendingSubscribeRequests: Map<SubKey, Promise<void>> = new Map();
   private pendingSubscribeAliases: Map<SubKey, Set<string>> = new Map();
   private pendingHistoryRequests: Map<string, PendingHistoryRequest> = new Map();
@@ -2783,6 +2793,7 @@ class OhlcWebSocketService {
     symbol: string,
     timeframeMinutes: number,
     callback: OHLCCallback,
+    options: OhlcSubscriptionOptions = {},
   ): () => void {
     this.ensureClientAttached();
     this._ensureBucketExpiryTimer();
@@ -2804,7 +2815,7 @@ class OhlcWebSocketService {
     const isNewCallback = !callbacks.has(callback);
     callbacks.add(callback);
     const cancelReplay = isNewCallback
-      ? this._replayLocalStateToCallback(key, callback)
+      ? this._replayLocalStateToCallback(key, callback, options.replay ?? 'history')
       : null;
 
     return () => {
@@ -2982,6 +2993,104 @@ class OhlcWebSocketService {
 
         this.recentHistoryRequestResults.delete(pendingRequestKey);
       }
+    }
+
+    if (canReuseCachedHistory && semanticLatestKey && this.sessionId) {
+      const requestSessionId = this.sessionId;
+      const persistentReadKey = `${requestSessionId}:${key}`;
+      let persistentRead = this.pendingPersistentHistoryReads.get(persistentReadKey);
+      if (!persistentRead) {
+        persistentRead = readPersistentOhlcHistory({
+          sessionId: requestSessionId,
+          symbol,
+          timeframeMinutes,
+          limit: requestLimit,
+        }).then((bars) => bars as OHLCBar[]);
+        this.pendingPersistentHistoryReads.set(persistentReadKey, persistentRead);
+      }
+
+      const persistentBars = await persistentRead.finally(() => {
+        if (this.pendingPersistentHistoryReads.get(persistentReadKey) === persistentRead) {
+          this.pendingPersistentHistoryReads.delete(persistentReadKey);
+        }
+      });
+      if (
+        persistentBars.length > 0 &&
+        this.sessionId === requestSessionId &&
+        this.isCurrentSession(requestSessionId)
+      ) {
+        this._mergeHistory(key, persistentBars, bucketMs, requestRange, {
+          notifySubscribers: false,
+        });
+        const selectedPersistentBars = this._selectBarsForRequest(
+          this._getLocalHistory(key),
+          requestLimit,
+          requestRange,
+        );
+        const latestPersistentTime = persistentBars[persistentBars.length - 1]?.time ?? 0;
+        const refreshRange: HistoryRequestRange = {
+          ...requestRange,
+          cacheFirst: false,
+          fromUnixMs: Math.max(0, latestPersistentTime - bucketMs),
+        };
+        const refreshRequestKey = makeCanonicalHistoryRequestKey(
+          requestSessionId,
+          key,
+          requestLimit,
+          refreshRange,
+        );
+        this._refreshCachedHistoryInBackground(
+          refreshRequestKey,
+          symbol,
+          timeframeMinutes,
+          requestLimit,
+          refreshRange,
+          key,
+          bucketMs,
+        );
+        return selectedPersistentBars;
+      }
+    }
+
+    // IndexedDB is asynchronous. Another caller may have started the same network
+    // request while this caller was reading the persistent cache, so coalesce again
+    // before creating a request entry.
+    const pendingLatestAfterPersistentRead = semanticLatestKey
+      ? this._getReusablePendingLatestHistoryRequest(
+          semanticLatestKey,
+          requestLimit,
+          requestRange,
+          key,
+        )
+      : null;
+    if (pendingLatestAfterPersistentRead) {
+      if (
+        pendingLatestAfterPersistentRead.started &&
+        pendingLatestAfterPersistentRead.limit < requestLimit
+      ) {
+        return this._loadLargerLatestHistoryAfterPending(
+          pendingLatestAfterPersistentRead,
+          semanticLatestKey!,
+          symbol,
+          timeframeMinutes,
+          requestLimit,
+          requestRange,
+        );
+      }
+
+      return pendingLatestAfterPersistentRead.promise.then((bars) =>
+        this._selectBarsForRequest(bars, requestLimit, requestRange),
+      );
+    }
+
+    const pendingRequestAfterPersistentRead = this.pendingHistoryRequests.get(pendingRequestKey);
+    if (
+      pendingRequestAfterPersistentRead &&
+      this._pendingHistoryRequestMatchesReadScope(key, pendingRequestAfterPersistentRead)
+    ) {
+      return pendingRequestAfterPersistentRead.promise.then((bars) =>
+        this._selectBarsForRequest(bars, requestLimit, requestRange),
+      );
     }
 
     const pendingEntry: PendingHistoryRequest = {
@@ -3715,7 +3824,10 @@ class OhlcWebSocketService {
       range,
     );
     if (serverHistory && serverHistory.length > 0) {
-      this._mergeHistory(key, serverHistory, bucketMs, range, { barsAlreadyFiltered: true });
+      this._mergeHistory(key, serverHistory, bucketMs, range, {
+        barsAlreadyFiltered: true,
+        notifySubscribers: false,
+      });
 
 
       // Tail-gap fill: if the last history bar is 2+ buckets behind now, silently
@@ -4082,6 +4194,8 @@ class OhlcWebSocketService {
     this.backgroundHistoryRefreshPumpActive = false;
     this.backgroundHistoryRefreshLastStartedAt = 0;
     this.pendingClientAttachWaits.clear();
+    this.pendingPersistentHistoryReads.clear();
+    this._clearPersistentHistoryWriteTimers();
     this.resolvedRequestSymbols.clear();
     this.latestTicks.clear();
     this.rawOhlcHistory.clear();
@@ -5210,6 +5324,47 @@ class OhlcWebSocketService {
     }
   }
 
+  private _schedulePersistentHistoryWrite(key: SubKey): void {
+    if (!this.sessionId || typeof window === 'undefined') {
+      return;
+    }
+
+    const existingTimer = this.persistentHistoryWriteTimers.get(key);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+    }
+
+    const sessionId = this.sessionId;
+    const timer = setTimeout(() => {
+      this.persistentHistoryWriteTimers.delete(key);
+      if (this.sessionId !== sessionId) {
+        return;
+      }
+
+      const separatorIndex = key.lastIndexOf(':');
+      if (separatorIndex <= 0) {
+        return;
+      }
+
+      const symbol = key.slice(0, separatorIndex);
+      const timeframeMinutes = parseInt(key.slice(separatorIndex + 1), 10);
+      const bars = this.history.get(key) ?? [];
+      void writePersistentOhlcHistory({
+        sessionId,
+        symbol,
+        timeframeMinutes,
+        bars,
+      });
+    }, 250);
+
+    this.persistentHistoryWriteTimers.set(key, timer);
+  }
+
+  private _clearPersistentHistoryWriteTimers(): void {
+    this.persistentHistoryWriteTimers.forEach((timer) => clearTimeout(timer));
+    this.persistentHistoryWriteTimers.clear();
+  }
+
   private _touchHistoryCacheEntry(key: SubKey): void {
     const bars = this.history.get(key);
     if (!bars) {
@@ -5435,6 +5590,7 @@ class OhlcWebSocketService {
         notifyBySubscriberKey,
         baselineByTime,
       );
+      this._schedulePersistentHistoryWrite(mergeKey);
     }
 
     if (options.notifySubscribers === false || notifyBySubscriberKey.size === 0) {
@@ -5705,7 +5861,12 @@ class OhlcWebSocketService {
   private _replayLocalStateToCallback(
     key: SubKey,
     callback: OHLCCallback,
+    replayMode: OhlcSubscriptionReplayMode,
   ): () => void {
+    if (replayMode === 'none') {
+      return () => undefined;
+    }
+
     if (this._getLocalHistory(key).length === 0) {
       this._seedLocalHistoryFromRawCache(key);
     }
@@ -5716,9 +5877,32 @@ class OhlcWebSocketService {
         this._seedCurrentBarFromStorePrice(key, { allowWithHistory: true });
     }
 
-    const replayBars = this._getLocalHistory(key);
+    const localHistory = this._getLocalHistory(key);
+    const currentBar = this.currentBars.get(key);
+    const latestHistoryBar = localHistory[localHistory.length - 1];
+    const latestReplayBar = currentBar && (!latestHistoryBar || currentBar.time >= latestHistoryBar.time)
+      ? currentBar
+      : latestHistoryBar;
     let cancelled = false;
     let replayTimer: ReturnType<typeof setTimeout> | null = null;
+
+    if (replayMode === 'latest') {
+      if (latestReplayBar) {
+        const [symbol, tfStr] = key.split(':');
+        const timeframe = parseInt(tfStr, 10);
+        Promise.resolve().then(() => {
+          if (!cancelled && this.subscribers.get(key)?.has(callback)) {
+            callback(symbol, timeframe, { ...latestReplayBar });
+          }
+        });
+      }
+
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const replayBars = localHistory;
 
     if (replayBars.length === 0) {
       return () => {
@@ -6378,7 +6562,12 @@ class OhlcWebSocketService {
         snapshot.ask ?? 0,
         snapshot.last,
         snapshot.volume,
-        snapshot.receivedAtMs ?? snapshot.time,
+        snapshot.mt5_time_msc ??
+          snapshot.mt5TimeMsc ??
+          snapshot.mt5_time ??
+          snapshot.mt5Time ??
+          snapshot.time ??
+          snapshot.receivedAtMs,
       );
     };
 
@@ -6955,6 +7144,7 @@ class OhlcWebSocketService {
     const history = this.history.get(key) ?? [];
     const storedBar = this._upsertSortedBar(history, normalizedBar, MAX_NORMALIZED_OHLC_BARS, bucketMs);
     this._rememberHistoryCacheEntry(key, history);
+    this._schedulePersistentHistoryWrite(key);
 
     // Keep lastKnownCandleTimestampMs up to date for reconnect gap-fill.
     if (normalizedBar.time > 0) {

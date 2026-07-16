@@ -1,6 +1,6 @@
 'use client';
 
-import React, { memo, startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { memo, startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
     BarSeries,
     CandlestickSeries,
@@ -123,11 +123,16 @@ interface KlineChartContainerProps {
 
 type ResolutionOption = ChartResolutionOption;
 
+interface AtomicChartSwitchSeed {
+    streamKey: string;
+    bars: OHLCBar[];
+}
+
 const RESOLUTIONS: ResolutionOption[] = DEFAULT_CHART_RESOLUTIONS;
 
-const CHART_HISTORY_TARGET_BARS = 5000;
-const MAX_RENDERED_OHLC_BARS = 5000;
-const MAX_SCROLLBACK_RENDERED_OHLC_BARS = 5000;
+const CHART_HISTORY_TARGET_BARS = 1000;
+const MAX_RENDERED_OHLC_BARS = 1000;
+const MAX_SCROLLBACK_RENDERED_OHLC_BARS = 1000;
 const LIVE_CANDLE_ROLLOVER_POLL_MS = 1000;
 const LIVE_CANDLE_ROLLOVER_MAX_SNAPSHOT_AGE_MS = 5 * 60 * 1000;
 const LIVE_CANDLE_ROLLOVER_MAX_CATCHUP_BARS = 600;
@@ -150,13 +155,13 @@ function handleMt5SessionWarmupError(error: unknown) {
     console.error(error);
 }
 const INITIAL_CHART_HISTORY_LIMIT = INITIAL_CHART_FIRST_PAINT_BARS;
-const INITIAL_CHART_RENDER_BARS = INITIAL_CHART_FIRST_PAINT_BARS;
-const INSTANT_SYMBOL_SWITCH_RENDER_BARS = INITIAL_CHART_FIRST_PAINT_BARS;
+const INITIAL_CHART_RENDER_BARS = MAX_INITIAL_VISIBLE_BARS;
+const LIVE_FIRST_SYMBOL_SWITCH_HISTORY_BARS = MAX_INITIAL_VISIBLE_BARS;
 const PROVISIONAL_PREVIEW_DELAY_MS = 60; // was 150ms — show live bars faster while history loads
-const STAGED_LATEST_HISTORY_WARMUP_LIMITS = [500, 1500, 3000] as const;
+const STAGED_LATEST_HISTORY_WARMUP_LIMITS = [200, 500, 1000] as const;
 const CHART_HISTORY_TIMEOUT_MS = 4_000; // was 8s — fail fast so provisional preview shows sooner
 const BACKFILL_CHART_HISTORY_TIMEOUT_MS = 12_000; // was 20s
-const BACKFILL_CHART_HISTORY_LIMIT = 1000;
+const BACKFILL_CHART_HISTORY_LIMIT = 200;
 const BACKFILL_CHART_HISTORY_DELAY_MS = 200;
 // 150 attempts: more retries so sparse/delayed MT5 history eventually fills in (can take ~15s for new timeframes)
 const MAX_BACKGROUND_HISTORY_BACKFILL_ATTEMPTS = 200; // was 150 — more retries for slow MT5 history
@@ -1306,7 +1311,6 @@ function KlineChartContainer({
     const wrapperRef = useRef<HTMLDivElement>(null);
     const chartHostRef = useRef<HTMLDivElement>(null);
     const chartRef = useRef<IChartApi | null>(null);
-    const preservedChartRemovalTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     // Deferred loading indicator: only show blank/spinner after 400ms of
     // genuinely having no bars — avoids flash-of-blank on fast symbol switches.
     const gracefulLoadingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1360,6 +1364,20 @@ function KlineChartContainer({
         timeframeMinutes: 0,
     });
     const lastAppliedChartDataStreamKeyRef = useRef<string | null>(null);
+    const atomicChartSwitchSeedRef = useRef<AtomicChartSwitchSeed | null>(null);
+
+    // Chart disposal belongs to the component lifecycle, never to a symbol
+    // switch. The data controller can rebind while this canvas remains mounted.
+    useEffect(() => () => {
+        const chart = chartRef.current;
+        chartRef.current = null;
+        mainSeriesRef.current = null;
+        volumeSeriesRef.current = null;
+        atomicChartSwitchSeedRef.current = null;
+        if (chart) {
+            try { chart.remove(); } catch { /* already disposed */ }
+        }
+    }, []);
 
     useEffect(() => {
         onUpdatePositionRef.current = onUpdatePosition;
@@ -1498,6 +1516,138 @@ function KlineChartContainer({
             }
         };
     }, []);
+
+    // Symbol switches update only the existing series data before passive effects run.
+    // The chart canvas, scales, toolbar, overlays, and interaction layer remain mounted.
+    useLayoutEffect(() => {
+        const chart = chartRef.current;
+        const mainSeries = mainSeriesRef.current;
+        const volumeSeries = volumeSeriesRef.current;
+        if (!chart || !mainSeries || !volumeSeries) {
+            return;
+        }
+
+        const bucketMs = selectedResolution.minutes * 60 * 1000;
+        const cachedBars = normalizeChartBars(
+            ohlcService
+                .getSyncBars(symbol, selectedResolution.minutes, normalizedAccountSessionScopeId)
+                .filter((bar) =>
+                    isRenderableCachedOrHistoricalBar(bar) &&
+                    isRealMarketBar(bar) &&
+                    isBarInsideChartSymbolPriceDomain(symbol, bar),
+                ),
+            bucketMs,
+            LIVE_FIRST_SYMBOL_SWITCH_HISTORY_BARS,
+        );
+        const barsByTime = new Map(cachedBars.map((bar) => [bar.time, { ...bar }]));
+        const snapshot = getLivePriceSnapshotBySymbol(symbol);
+        const livePrice = snapshot ? getLiveQuotePrice(snapshot) : null;
+
+        if (livePrice !== null && Number.isFinite(livePrice) && livePrice > 0) {
+            const eventTime = getLiveQuoteEventTime(snapshot!, Date.now());
+            const liveBucketTime = bucketTimeMs(eventTime, bucketMs);
+            const sameBucketBar = barsByTime.get(liveBucketTime);
+            const previousBar = cachedBars[cachedBars.length - 1];
+            const liveOpen = sameBucketBar?.open ?? previousBar?.close ?? livePrice;
+            const liveBar: OHLCBar = {
+                ...(sameBucketBar ?? {}),
+                symbol,
+                timeframeMinutes: selectedResolution.minutes,
+                time: liveBucketTime,
+                open: liveOpen,
+                high: Math.max(sameBucketBar?.high ?? liveOpen, livePrice),
+                low: Math.min(sameBucketBar?.low ?? liveOpen, livePrice),
+                close: livePrice,
+                volume: Math.max(
+                    sameBucketBar?.volume ?? 0,
+                    getLiveQuoteVolumeIncrement(snapshot!),
+                    1,
+                ),
+                source: 'mt5_tick',
+                sourceTimeMs: eventTime,
+                closed: false,
+            };
+            barsByTime.set(liveBucketTime, liveBar);
+        }
+
+        const switchBars = alignOpenGapsToPreviousClose(
+            getRenderableMarketBars(
+                normalizeChartBars(
+                    [...barsByTime.values()],
+                    bucketMs,
+                    LIVE_FIRST_SYMBOL_SWITCH_HISTORY_BARS,
+                ),
+                LIVE_FIRST_SYMBOL_SWITCH_HISTORY_BARS,
+            ),
+        );
+        const compactEntries = buildCompactSeriesEntries(
+            switchBars,
+            bucketMs,
+            COMPACT_SERIES_EPOCH_MS,
+        );
+        const priceFormat = {
+            type: 'price' as const,
+            precision: Math.max(0, pricePrecision),
+            minMove: 1 / Math.pow(10, Math.max(0, pricePrecision)),
+        };
+
+        mainSeries.applyOptions({ priceFormat });
+        if (chartType === 'Line') {
+            mainSeries.setData(compactEntries.map(({ bar, seriesTime }) =>
+                toLineData(bar, seriesTime),
+            ));
+        } else {
+            let previousClose = 1;
+            mainSeries.setData(compactEntries.map(({ bar, seriesTime }) => {
+                const candle = toVisualCandleData(bar, pricePrecision, seriesTime, previousClose);
+                previousClose = candle.close;
+                return candle;
+            }));
+        }
+
+        const visualVolumeMax = getVisualVolumeScaleMax(switchBars.map((bar) => bar.volume));
+        volumeSeries.setData(compactEntries.map(({ bar, seriesTime }) =>
+            toVolumeData(bar, palette, seriesTime, visualVolumeMax),
+        ));
+
+        const latestBar = switchBars[switchBars.length - 1] ?? null;
+        currentBarRef.current = latestBar;
+        lastBarTimeRef.current = latestBar?.time ?? 0;
+        fallbackLiveAxisPriceRef.current = latestBar?.close ?? null;
+        livePriceRef.current = resolveLiveAxisPrice(latestBar?.close ?? null);
+        const chartDataStreamKey = [
+            normalizedAccountSessionScopeId ?? 'terminal',
+            symbol.trim().toUpperCase(),
+            selectedResolution.minutes,
+        ].join(':');
+        lastAppliedChartDataStreamKeyRef.current = chartDataStreamKey;
+        atomicChartSwitchSeedRef.current = {
+            streamKey: chartDataStreamKey,
+            bars: switchBars.map((bar) => ({ ...bar })),
+        };
+
+        if (latestBar) {
+            setNoDataMessage(null);
+            setActiveBarIfChanged(latestBar);
+            markChartHasCandles();
+            try {
+                chart.timeScale().scrollToPosition(getPreferredRightOffset(), false);
+            } catch {
+                // The chart can be disposed during an account/session replacement.
+            }
+        }
+    }, [
+        chartType,
+        getPreferredRightOffset,
+        markChartHasCandles,
+        normalizedAccountSessionScopeId,
+        palette,
+        pricePrecision,
+        resolveLiveAxisPrice,
+        selectedResolution.minutes,
+        setActiveBarIfChanged,
+        symbol,
+    ]);
 
     const notifyHistoryStatusChange = useCallback((status: {
         isLoading: boolean;
@@ -2455,7 +2605,6 @@ function KlineChartContainer({
         timeframeMinutes: selectedResolution.minutes,
         theme,
         chartType,
-        pricePrecision,
         tradingSessionId,
         refreshToken,
         activePriceScaleMargins,
@@ -2476,7 +2625,6 @@ function KlineChartContainer({
         chartType,
         crosshairDashed,
         normalizedAccountSessionScopeId,
-        pricePrecision,
         refreshToken,
         scaleFixOneToOne,
         selectedResolution.minutes,
@@ -2495,11 +2643,6 @@ function KlineChartContainer({
     // Rebuild after paint so the symbol list and the rest of the terminal can stay
     // responsive while the chart swaps symbols/timeframes.
     useEffect(() => {
-        if (preservedChartRemovalTimerRef.current !== null) {
-            clearTimeout(preservedChartRemovalTimerRef.current);
-            preservedChartRemovalTimerRef.current = null;
-        }
-
         let disposed = false;
         const chartSwitchId = chartSwitchSequenceRef.current + 1;
         chartSwitchSequenceRef.current = chartSwitchId;
@@ -2533,6 +2676,11 @@ function KlineChartContainer({
             symbol.trim().toUpperCase(),
             selectedResolution.minutes,
         ].join(':');
+        const atomicSwitchSeed = atomicChartSwitchSeedRef.current?.streamKey === chartDataStreamKey
+            ? atomicChartSwitchSeedRef.current
+            : null;
+        const atomicSwitchSeedBars = atomicSwitchSeed?.bars ?? [];
+        const hasAtomicSwitchSeed = atomicSwitchSeedBars.length > 0;
         const prepaintBucketMs = selectedResolution.minutes * 60 * 1000;
         const syncSeedBars = ohlcService.getSyncBars(
             symbol,
@@ -2609,6 +2757,8 @@ function KlineChartContainer({
         }
 
         const existingChart = chartRef.current;
+        const existingMainSeries = existingChart ? mainSeriesRef.current : null;
+        const existingVolumeSeries = existingChart ? volumeSeriesRef.current : null;
         if (!existingChart) {
             host.innerHTML = '';
         }
@@ -2827,11 +2977,19 @@ function KlineChartContainer({
         const initBear = visualColors.bearCandle;
         const initBarUp = visualColors.barUp;
         const initBarDown = visualColors.barDown;
+        const getOrCreateMainSeries = (seriesDefinition: any, options: Record<string, unknown>) => {
+            if (existingMainSeries) {
+                existingMainSeries.applyOptions(options as any);
+                return existingMainSeries;
+            }
+
+            return chart.addSeries(seriesDefinition, options as any);
+        };
 
         let mainSeries: ISeriesApi<any>;
         switch (chartType) {
             case 'Bars':
-                mainSeries = chart.addSeries(BarSeries, {
+                mainSeries = getOrCreateMainSeries(BarSeries, {
                     upColor: initBarUp,
                     downColor: initBarDown,
                     priceFormat: priceFormatOpts,
@@ -2841,7 +2999,7 @@ function KlineChartContainer({
                 });
                 break;
             case 'Hollow Candles':
-                mainSeries = chart.addSeries(CandlestickSeries, {
+                mainSeries = getOrCreateMainSeries(CandlestickSeries, {
                     upColor: visualConfig.transparentColor,
                     downColor: initBear,
                     borderVisible: true,
@@ -2857,7 +3015,7 @@ function KlineChartContainer({
                 });
                 break;
             case 'Line':
-                mainSeries = chart.addSeries(LineSeries, {
+                mainSeries = getOrCreateMainSeries(LineSeries, {
                     color: visualColors.lineChart,
                     lineWidth: visualConfig.lineWidths.lineSeries,
                     priceFormat: priceFormatOpts,
@@ -2868,7 +3026,7 @@ function KlineChartContainer({
                 break;
             case 'Candles':
             default:
-                mainSeries = chart.addSeries(CandlestickSeries, {
+                mainSeries = getOrCreateMainSeries(CandlestickSeries, {
                     upColor: initBull,
                     downColor: initBear,
                     borderVisible: true,
@@ -2916,14 +3074,18 @@ function KlineChartContainer({
             seriesMarkersPluginRef.current?.setMarkers(markers);
         };
 
-        const volSeries = chart.addSeries(HistogramSeries, {
+        const volumeSeriesOptions = {
             color: visualColors.volumeUp,
             priceScaleId: '',
             priceFormat: { type: 'volume' },
             lastValueVisible: false,
             priceLineVisible: false,
             visible: shouldShowVolumeSeries,
-        });
+        } as const;
+        const volSeries = existingVolumeSeries ?? chart.addSeries(HistogramSeries, volumeSeriesOptions);
+        if (existingVolumeSeries) {
+            existingVolumeSeries.applyOptions(volumeSeriesOptions);
+        }
         volSeries.priceScale().applyOptions({ scaleMargins: VOLUME_SCALE_MARGINS });
         volumeSeriesRef.current = volSeries;
 
@@ -3835,16 +3997,20 @@ function KlineChartContainer({
         // Defer until chart renders DOM.
         const priceAxisAttachTimer = setTimeout(attachPriceAxisHandlers, 200);
 
-        let isHistoryLoaded = false;
-        let hasRenderedAnyCandles = false;
+        const atomicSwitchSeedHasHistory = atomicSwitchSeedBars.some(
+            isRenderableCachedOrHistoricalBar,
+        );
+        let isHistoryLoaded = atomicSwitchSeedHasHistory;
+        let hasRenderedAnyCandles = hasAtomicSwitchSeed;
         // Tracks whether mainSeries.setData() has been successfully called at least once.
         // Prevents renderProvisionalLivePreview from short-circuiting on an actually-empty series
         // when hasRenderedAnyCandles was set by applyLiveBarToRenderedSeries before history loaded.
-        let chartHasSetData = false;
-        let renderedBarCount = 0;
+        let chartHasSetData = hasAtomicSwitchSeed;
+        let renderedBarCount = atomicSwitchSeedBars.length;
         let resizeFrame: number | null = null;
         let dataLayoutFrame: number | null = null;
         let liveRenderFrame: number | null = null;
+        let progressiveHistorySeedFrame: number | null = null;
         let historicalCacheRenderFrame: number | null = null;
         let cachedHostHeight = 0;         // refreshed on resize, avoids clientHeight layout-thrash per frame
         let noDataShown = false;          // gate: only dispatch setNoDataMessage when state actually changes
@@ -3859,7 +4025,7 @@ function KlineChartContainer({
         const latestHistoryGapCatchUpInFlightGate = createLatestHistoryGapCatchUpInFlightGate();
         let latestHistoryGapCatchUpRequestSignature: string | null = null;
         let hasProvisionalLivePreview = false;
-        let hasRenderedHistorySeed = false;
+        let hasRenderedHistorySeed = atomicSwitchSeedHasHistory;
         let pendingLiveFocusLatest = false;
         let pendingNewBarScrollToLatest = false;
         let pendingNewBarWasPinnedToLatest = false;
@@ -3873,6 +4039,31 @@ function KlineChartContainer({
             isNewBar: boolean;
             previousClose: number | null;
         }>();
+        if (hasAtomicSwitchSeed) {
+            const seedEntries = buildCompactSeriesEntries(
+                atomicSwitchSeedBars,
+                bucketMs,
+                COMPACT_SERIES_EPOCH_MS,
+            );
+            seedEntries.forEach(({ bar, seriesTime, logicalIndex }) => {
+                displayBarsBySeriesTime.set(seriesTime, bar);
+                realBarsBySeriesTime.set(seriesTime, bar);
+                seriesTimeToLogicalIndex.set(seriesTime, logicalIndex);
+                realTimeToSeriesTime.set(bar.time, seriesTime);
+                seriesTimeToRealTime.set(seriesTime, bar.time);
+                latestSeriesTime = seriesTime;
+
+                if (isOpenLiveTickBar(bar) || bar.closed === false) {
+                    liveBarsByTime.set(bar.time, bar);
+                } else {
+                    loadedHistoryBarsByTime.set(bar.time, bar);
+                }
+            });
+            latestCommittedSeriesTime = latestSeriesTime;
+            oldestLiveBarTime = liveBarsByTime.size > 0
+                ? Math.min(...liveBarsByTime.keys())
+                : null;
+        }
         const ohlcSanityGuard = createOhlcSanityReferenceTracker(symbol, 'KlineChartContainer');
         const completedOlderHistoryRangeKeys = new Set<string>();
         const olderHistoryRetryAfterByRangeKey = new Map<string, number>();
@@ -5174,6 +5365,9 @@ function KlineChartContainer({
                 : null;
             const shouldSuppressLiveCacheForPendingLatestHistory = latestHistoryBaselineDecision !== null &&
                 latestHistoryBaselineDecision.reason === 'history_live_price_gap';
+            const liveBarToRestoreAfterHistoryRender = shouldSuppressLiveCacheForPendingLatestHistory
+                ? acceptedLiveCacheBars[acceptedLiveCacheBars.length - 1] ?? null
+                : null;
             if (includeLiveCache && !shouldSuppressLiveCacheForPendingLatestHistory) {
                 for (const bucketedBar of acceptedLiveCacheBars) {
                     upsertPreferredBar(mergedByBucketTime, bucketedBar, bucketMs);
@@ -5237,6 +5431,12 @@ function KlineChartContainer({
                 bucketMs,
                 COMPACT_SERIES_EPOCH_MS,
             );
+            const seriesDataUnchanged = chartHasSetData
+                && compactEntries.length === displayBarsBySeriesTime.size
+                && compactEntries.every(({ bar, seriesTime }) => {
+                    const existingBar = displayBarsBySeriesTime.get(seriesTime);
+                    return Boolean(existingBar && hasSameOhlcvValues(existingBar, bar));
+                });
             renderedBarCount = compactEntries.length;
             displayBarsBySeriesTime.clear();
             realBarsBySeriesTime.clear();
@@ -5261,22 +5461,26 @@ function KlineChartContainer({
             }
 
             try {
-                if (chartType === 'Line') {
-                    mainSeries.setData(compactEntries.map(({ bar, seriesTime }) =>
-                        toLineData(bar, seriesTime),
-                    ));
-                } else {
-                    let lastCloseCompact = 1;
-                    mainSeries.setData(compactEntries.map(({ bar, seriesTime }) => {
-                        const visual = toVisualCandleData(bar, pricePrecision, seriesTime, lastCloseCompact);
-                        lastCloseCompact = visual.close;
-                        return visual;
-                    }));
+                if (!seriesDataUnchanged) {
+                    if (chartType === 'Line') {
+                        mainSeries.setData(compactEntries.map(({ bar, seriesTime }) =>
+                            toLineData(bar, seriesTime),
+                        ));
+                    } else {
+                        let lastCloseCompact = 1;
+                        mainSeries.setData(compactEntries.map(({ bar, seriesTime }) => {
+                            const visual = toVisualCandleData(bar, pricePrecision, seriesTime, lastCloseCompact);
+                            lastCloseCompact = visual.close;
+                            return visual;
+                        }));
+                    }
                 }
                 chartHasSetData = compactEntries.length > 0;
                 latestCommittedSeriesTime = chartHasSetData ? latestSeriesTime : null;
-                renderVolumeSeriesForCurrentRange();
-                syncMarkersRef.current?.();
+                if (!seriesDataUnchanged) {
+                    renderVolumeSeriesForCurrentRange();
+                    syncMarkersRef.current?.();
+                }
                 cancelPendingLiveSeriesUpdates();
             } catch (error) {
                 cancelPendingLiveSeriesUpdates();
@@ -5388,6 +5592,13 @@ function KlineChartContainer({
             } else if (markHistoryLoaded && includeLiveCache && renderResult.historySeedApplied) {
                 latestHistoryGapCatchUpAttempts = 0;
                 latestHistoryGapCatchUpInFlightGate.clearPending();
+            }
+
+            // A stale history response must never leave the chart tip behind the live feed.
+            // Keep the conservative full-history merge above, then append the already-sanity-
+            // checked live candle while the missing history range is repaired in the background.
+            if (liveBarToRestoreAfterHistoryRender && isRealMarketBar(liveBarToRestoreAfterHistoryRender)) {
+                applyLiveBarToRenderedSeries(liveBarToRestoreAfterHistoryRender, lastBarTimeRef.current);
             }
 
             return renderResult;
@@ -5998,26 +6209,11 @@ function KlineChartContainer({
                 incomingBar.time - previousLastBarTime >= RECONNECT_GAP_DETECTION_THRESHOLD_BUCKETS * bucketMs
             ) {
                 scheduleLatestHistoryGapCatchUp();
-                return;
             }
 
             if (!isHistoryLoaded) {
-                if (!hasRenderedHistorySeed && !hasProvisionalLivePreview) {
-                    // Only show the loading message - don't block rendering.
-                    // If we've accumulated any live bars already, force an immediate
-                    // live-only preview so the chart paints something visible right now.
-                    if (liveBarsByTime.size > 0) {
-                        const painted = renderProvisionalLivePreview(undefined, true);
-                        if (painted) {
-                            hasProvisionalLivePreview = true;
-                        }
-                    } else {
-                        setHistoryBackfillMessage('Loading MT5 candle history before drawing the chart...');
-                    }
-                    scheduleHistoryLoadWhenRealtimeReady();
-                    return;
-                }
-
+                // The live candle owns the chart tip. History loading and gap repair are
+                // background work and must not hold an accepted MT5 tick off-screen.
                 applyLiveBarToRenderedSeries(liveBar, previousLastBarTime);
                 scheduleHistoryLoadWhenRealtimeReady();
                 return;
@@ -6032,28 +6228,39 @@ function KlineChartContainer({
             }
 
             applyLiveBarToRenderedSeries(liveBar, previousLastBarTime);
-        });
+        }, { replay: 'latest' });
 
-        // Instant seed: if the ohlcService already has bars for this symbol in its
-        // in-memory cache (singleton persists across symbol switches), render them
-        // synchronously before the async history fetch even starts. This eliminates
-        // the blank-chart flash entirely when navigating between symbols or refreshing.
-        if (cleanRenderableSyncSeedBars.length > 0 && isCurrentChartSwitch()) {
-            const instantSeedBars = normalizeChartBars(
+        // Live-first progressive switch: the current quote above owns the first render.
+        // On the next frame, merge only the visible cached window behind it. The full
+        // 200-bar history request below remains background work and is guarded by the
+        // chart-switch sequence, so a late response cannot overwrite another symbol.
+        if (
+            !hasAtomicSwitchSeed &&
+            cleanRenderableSyncSeedBars.length > 0 &&
+            isCurrentChartSwitch()
+        ) {
+            const progressiveSeedBars = normalizeChartBars(
                 cleanRenderableSyncSeedBars,
                 bucketMs,
-                INSTANT_SYMBOL_SWITCH_RENDER_BARS,
+                LIVE_FIRST_SYMBOL_SWITCH_HISTORY_BARS,
             );
-            applyBars(
-                instantSeedBars,
-                undefined,
-                false,
-                INSTANT_SYMBOL_SWITCH_RENDER_BARS,
-                false,
-                false,
-                false,
-                'focus-latest',
-            );
+            progressiveHistorySeedFrame = window.requestAnimationFrame(() => {
+                progressiveHistorySeedFrame = null;
+                if (!isCurrentChartSwitch() || isHistoryLoaded) {
+                    return;
+                }
+
+                applyBars(
+                    progressiveSeedBars,
+                    undefined,
+                    false,
+                    LIVE_FIRST_SYMBOL_SWITCH_HISTORY_BARS,
+                    false,
+                    false,
+                    true,
+                    'focus-latest',
+                );
+            });
         }
 
         void loadHistory();
@@ -6083,6 +6290,10 @@ function KlineChartContainer({
             }
             if (dataLayoutFrame !== null) {
                 window.cancelAnimationFrame(dataLayoutFrame);
+            }
+            if (progressiveHistorySeedFrame !== null) {
+                window.cancelAnimationFrame(progressiveHistorySeedFrame);
+                progressiveHistorySeedFrame = null;
             }
             if (historicalCacheRenderFrame !== null) {
                 window.cancelAnimationFrame(historicalCacheRenderFrame);
@@ -6134,27 +6345,13 @@ function KlineChartContainer({
             const shouldPreserveChartInstanceForSymbolSwitch =
                 latestChartInstanceLifecycleKeyRef.current === chartInstanceLifecycleKey &&
                 chartRef.current === chart;
-            if (shouldPreserveChartInstanceForSymbolSwitch) {
-                try { chart.removeSeries(volSeries); } catch { /* noop */ }
-                try { chart.removeSeries(mainSeries); } catch { /* noop */ }
-            }
-            mainSeriesRef.current = null;
-            volumeSeriesRef.current = null;
-            if (shouldPreserveChartInstanceForSymbolSwitch) {
-                if (preservedChartRemovalTimerRef.current !== null) {
-                    clearTimeout(preservedChartRemovalTimerRef.current);
-                }
-                preservedChartRemovalTimerRef.current = setTimeout(() => {
-                    preservedChartRemovalTimerRef.current = null;
-                    if (chartRef.current !== chart) {
-                        return;
-                    }
+            if (!shouldPreserveChartInstanceForSymbolSwitch) {
+                mainSeriesRef.current = null;
+                volumeSeriesRef.current = null;
+                if (chartRef.current === chart) {
                     chartRef.current = null;
                     try { chart.remove(); } catch { host.innerHTML = ''; }
-                }, 0);
-            } else {
-                chartRef.current = null;
-                try { chart.remove(); } catch { host.innerHTML = ''; }
+                }
             }
         };
     }, [

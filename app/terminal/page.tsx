@@ -151,16 +151,19 @@ const TERMINAL_POST_TRADE_RECONCILE_REFRESH_DELAYS_MS = [0, 500, 1_200, 2_500, 5
 const TERMINAL_OPTIMISTIC_POSITION_TTL_MS = 30_000;
 const TERMINAL_CLOSED_HISTORY_LOOKBACK_DAYS = 30;
 const TERMINAL_CLOSED_HISTORY_MAX_ROWS = 500;
-const TERMINAL_SELECTED_OHLC_HISTORY_PRIME_LIMIT = 500;   // 500 bars Γëê 8h of M1 ΓÇö fills chart instantly
-const TERMINAL_SELECTED_OHLC_HISTORY_BACKFILL_LIMIT = 5000;
-const TERMINAL_BOOTSTRAP_OHLC_HISTORY_PRIME_LIMIT = 1500;
+const TERMINAL_SELECTED_OHLC_HISTORY_PRIME_LIMIT = 200;
+const TERMINAL_SELECTED_OHLC_HISTORY_BACKFILL_LIMIT = 200;
+const TERMINAL_BOOTSTRAP_OHLC_HISTORY_PRIME_LIMIT = 200;
 const TERMINAL_BOOTSTRAP_OHLC_HISTORY_SYMBOL_LIMIT = DEFAULT_FIRST_RUN_TERMINAL_SYMBOLS.length + 1;
 const TERMINAL_SELECTED_OHLC_HISTORY_BACKFILL_DELAY_MS = 700;
 const TERMINAL_OHLC_HISTORY_WARMUP_STAGGER_MS = 1_200;
 const TERMINAL_BOOTSTRAP_QUOTE_PREWARM_DELAY_MS = 250;
 const TERMINAL_BOOTSTRAP_OHLC_HISTORY_PREWARM_DELAY_MS = 1_500;
 const TERMINAL_REACTIVE_OHLC_HISTORY_PREWARM_DELAY_MS = 2_500;
-const TERMINAL_BACKGROUND_OHLC_PREWARM_LIMIT = 300;
+const TERMINAL_BACKGROUND_OHLC_PREWARM_LIMIT = 100;
+const TERMINAL_OPEN_TAB_OHLC_PREWARM_LIMIT = 8;
+const TERMINAL_OPEN_TAB_OHLC_PREWARM_DELAY_MS = 120;
+const TERMINAL_SYMBOL_HOVER_OHLC_PREWARM_DELAY_MS = 90;
 const TERMINAL_DEFAULT_TIMEFRAME_MINUTES = 1;
 const TERMINAL_OHLC_REPAIR_FETCH_TIMEOUT_MS = 17_000;
 const TERMINAL_OHLC_REPAIR_REQUEST_DEDUPE_MS = 15_000;
@@ -3243,7 +3246,6 @@ function TradingDashboardInner() {
     const [chartType, setChartType] = useState<TerminalChartType>('Candles');
     const [chartLayoutPanes, setChartLayoutPanes] = useState<TerminalChartLayoutPanes>(1);
     const [chartBarSpacing, setChartBarSpacing] = useState<number | null>(null);
-    const prevSymbolForBarSpacingRef = useRef<string | null>(null);
 
     const terminalStoreFallbackSymbols = useMemo(
         () => getTerminalFallbackSymbolInfos(terminalPreferences ?? undefined),
@@ -3258,6 +3260,8 @@ function TradingDashboardInner() {
     const terminalBootstrapQuotePrewarmKeyRef = useRef<string | null>(null);
     const terminalBootstrapHistoryPrewarmKeyRef = useRef<string | null>(null);
     const watchlistOhlcPrewarmKeyRef = useRef<string | null>(null);
+    const symbolHoverHistoryPrewarmTimeoutRef = useRef<number | null>(null);
+    const lastHoveredHistoryPrewarmKeyRef = useRef<string | null>(null);
     const latestStorePricesRef = useRef(useWebtraderStore.getState().prices);
     const latestStoreSymbolsRef = useRef(storeSymbols);
     const requestedOhlcHistoryRef = useRef<Map<string, number>>(new Map());
@@ -3271,24 +3275,17 @@ function TradingDashboardInner() {
         key: string;
         timeoutId: number;
     } | null>(null);
-    const symbolSwitchWarmupFrameRef = useRef<number | null>(null);
-    const symbolSwitchWarmupTimerRef = useRef<number | null>(null);
     const symbolCatalogRefreshInFlightRef = useRef(false);
     const hasAnyLiveQuote = livePriceSymbolKey.length > 0;
     const clearOhlcWarmupTimers = useCallback(() => {
+        if (symbolHoverHistoryPrewarmTimeoutRef.current !== null) {
+            window.clearTimeout(symbolHoverHistoryPrewarmTimeoutRef.current);
+            symbolHoverHistoryPrewarmTimeoutRef.current = null;
+        }
         ohlcHistoryWarmupRetryTimeoutsRef.current.forEach((timeoutId) => {
             window.clearTimeout(timeoutId);
         });
         ohlcHistoryWarmupRetryTimeoutsRef.current.clear();
-
-        if (symbolSwitchWarmupFrameRef.current !== null) {
-            window.cancelAnimationFrame(symbolSwitchWarmupFrameRef.current);
-            symbolSwitchWarmupFrameRef.current = null;
-        }
-        if (symbolSwitchWarmupTimerRef.current !== null) {
-            window.clearTimeout(symbolSwitchWarmupTimerRef.current);
-            symbolSwitchWarmupTimerRef.current = null;
-        }
     }, []);
     useEffect(() => {
         markTerminalBootMilestone('mounted', {
@@ -4168,7 +4165,9 @@ function TradingDashboardInner() {
             return;
         }
 
-        setChartHistoryStatus(nextStatus);
+        startTransition(() => {
+            setChartHistoryStatus(nextStatus);
+        });
     }, []);
 
     useEffect(() => {
@@ -5485,17 +5484,6 @@ function TradingDashboardInner() {
         selectedHistoryTimeframeMinutes,
     ]);
 
-    // Reset bar spacing to the global default whenever the user switches to a different symbol.
-    // This ensures every pair opens at the same consistent candle width instead of inheriting
-    // the zoom level the user had set on the previous pair.
-    useEffect(() => {
-        const prev = prevSymbolForBarSpacingRef.current;
-        prevSymbolForBarSpacingRef.current = selectedSymbol;
-        if (prev !== null && prev !== selectedSymbol && selectedSymbol) {
-            setChartBarSpacing(null);
-        }
-    }, [selectedSymbol]);
-
     const primeTerminalMarketData = useCallback((
         symbols: string[],
         options: { requestHistory?: boolean; historyLimit?: number } = {},
@@ -5519,6 +5507,36 @@ function TradingDashboardInner() {
             );
         }
     }, [chartTimeframeMinutes, requestOhlcHistoryForSymbols, storeSymbols, subscribeRealtimeSymbols]);
+
+    // Keep already-open charts hot in the service's bounded in-memory LRU. This
+    // runs outside the click path so switching tabs can synchronously paint both
+    // the live candle and the visible history window.
+    useEffect(() => {
+        if (!isOhlcHistoryClientReady || openTabs.length === 0) {
+            return;
+        }
+
+        const backgroundTabs = uniqueTerminalSymbols(openTabs)
+            .filter((tabSymbol) => !selectedSymbol || !symbolsMatch(tabSymbol, selectedSymbol))
+            .slice(-TERMINAL_OPEN_TAB_OHLC_PREWARM_LIMIT);
+        if (backgroundTabs.length === 0) {
+            return;
+        }
+
+        const timer = window.setTimeout(() => {
+            primeTerminalMarketData(backgroundTabs, {
+                requestHistory: true,
+                historyLimit: TERMINAL_BACKGROUND_OHLC_PREWARM_LIMIT,
+            });
+        }, TERMINAL_OPEN_TAB_OHLC_PREWARM_DELAY_MS);
+
+        return () => window.clearTimeout(timer);
+    }, [
+        isOhlcHistoryClientReady,
+        openTabs,
+        primeTerminalMarketData,
+        selectedSymbol,
+    ]);
 
     const refreshTerminalSymbolCatalog = useCallback(async () => {
         const client = storeWsClient;
@@ -5988,7 +6006,7 @@ function TradingDashboardInner() {
             const historyTimer = window.setTimeout(() => {
                 requestOhlcHistoryForSymbols(
                     backgroundHistorySymbols,
-                    TERMINAL_SELECTED_OHLC_HISTORY_PRIME_LIMIT,
+                    TERMINAL_BACKGROUND_OHLC_PREWARM_LIMIT,
                     chartTimeframeMinutes,
                 );
                 terminalBootstrapHistoryPrewarmKeyRef.current = bootstrapHistoryPrewarmKey;
@@ -7631,6 +7649,14 @@ function TradingDashboardInner() {
             return;
         }
 
+        // Start both independent market-data lanes before React commits the chart
+        // switch. This gives the new chart a live snapshot and cache request in flight
+        // during render instead of one animation frame after it becomes visible.
+        primeTerminalMarketData([exactSymbol], {
+            requestHistory: true,
+            historyLimit: TERMINAL_SELECTED_OHLC_HISTORY_PRIME_LIMIT,
+        });
+
         setSelectedSymbol(exactSymbol);
         setSelectedSymbolAccountId(connectAccountId ?? null);
         startTransition(() => {
@@ -7640,29 +7666,6 @@ function TradingDashboardInner() {
                 setActivePanel(null);
             }
         });
-        if (symbolSwitchWarmupFrameRef.current !== null) {
-            window.cancelAnimationFrame(symbolSwitchWarmupFrameRef.current);
-            symbolSwitchWarmupFrameRef.current = null;
-        }
-        if (symbolSwitchWarmupTimerRef.current !== null) {
-            window.clearTimeout(symbolSwitchWarmupTimerRef.current);
-            symbolSwitchWarmupTimerRef.current = null;
-        }
-        symbolSwitchWarmupFrameRef.current = window.requestAnimationFrame(() => {
-            symbolSwitchWarmupFrameRef.current = null;
-            symbolSwitchWarmupTimerRef.current = window.setTimeout(() => {
-                symbolSwitchWarmupTimerRef.current = null;
-                const activeSymbol = activeChartSymbolRef.current;
-                if (activeSymbol && !symbolsMatch(activeSymbol, exactSymbol)) {
-                    return;
-                }
-                primeTerminalMarketData([exactSymbol], {
-                    requestHistory: true,
-                    historyLimit: TERMINAL_SELECTED_OHLC_HISTORY_PRIME_LIMIT,
-                });
-            }, 0);
-        });
-
         const normalizedTimeframeMinutes = normalizeTerminalTimeframeMinutes(chartTimeframeMinutes);
         const selectedDiagnosticsApplies = Boolean(
             selectedHistoryDiagnostics &&
@@ -7692,10 +7695,40 @@ function TradingDashboardInner() {
         storeSymbols,
     ]);
 
-    const handleHoverSymbol = useCallback((_symbol: string) => {
-        // Hover rows are display-only; explicit selection is the subscription/history trigger.
-        void _symbol;
-    }, []);
+    const handleHoverSymbol = useCallback((symbol: string) => {
+        const exactSymbol = resolveCatalogSymbolName(
+            storeSymbols,
+            symbol,
+            latestStorePricesRef.current,
+            { preserveExact: true },
+        );
+        if (!exactSymbol || symbolsMatch(exactSymbol, selectedSymbol)) {
+            return;
+        }
+
+        const hoverKey = `${connectAccountId ?? 'terminal'}:${exactSymbol}:${chartTimeframeMinutes}`;
+        if (lastHoveredHistoryPrewarmKeyRef.current === hoverKey) {
+            return;
+        }
+        if (symbolHoverHistoryPrewarmTimeoutRef.current !== null) {
+            window.clearTimeout(symbolHoverHistoryPrewarmTimeoutRef.current);
+        }
+
+        symbolHoverHistoryPrewarmTimeoutRef.current = window.setTimeout(() => {
+            symbolHoverHistoryPrewarmTimeoutRef.current = null;
+            lastHoveredHistoryPrewarmKeyRef.current = hoverKey;
+            primeTerminalMarketData([exactSymbol], {
+                requestHistory: true,
+                historyLimit: TERMINAL_BACKGROUND_OHLC_PREWARM_LIMIT,
+            });
+        }, TERMINAL_SYMBOL_HOVER_OHLC_PREWARM_DELAY_MS);
+    }, [
+        chartTimeframeMinutes,
+        connectAccountId,
+        primeTerminalMarketData,
+        selectedSymbol,
+        storeSymbols,
+    ]);
 
     const handleCloseTab = useCallback((symbol: string) => {
         startTransition(() => {
