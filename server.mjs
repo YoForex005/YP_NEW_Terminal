@@ -148,11 +148,17 @@ const normalizeBridgePath = (value) => {
   }
 };
 
+const configuredBridgePathValues = [
+  ...(process.env.NODE_WS_PATHS || "/ws,/api/ws,/stream,/realtime,/").split(","),
+  process.env.NEXT_PUBLIC_WS_URL,
+  process.env.NEXT_PUBLIC_WS_MARKET_URL,
+  process.env.NEXT_PUBLIC_WS_OHLC_URL,
+  process.env.NEXT_PUBLIC_WS_ACCOUNT_URL,
+  process.env.NEXT_PUBLIC_WS_TRADE_URL,
+];
+
 const bridgePaths = new Set(
-  (process.env.NODE_WS_PATHS || "/ws,/api/ws,/stream,/realtime,/")
-    .split(",")
-    .map(normalizeBridgePath)
-    .filter(Boolean),
+  configuredBridgePathValues.map(normalizeBridgePath).filter(Boolean),
 );
 
 const parseComparableWsUrl = (value) => {
