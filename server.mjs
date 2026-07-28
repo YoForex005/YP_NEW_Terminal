@@ -1,5 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { createReadStream, existsSync, readdirSync, readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -950,6 +950,61 @@ const handleUpgrade =
   typeof app.getUpgradeHandler === "function" ? app.getUpgradeHandler() : null;
 let nextHttpRequestSeen = false;
 
+const findBuiltChunk = (...segments) => {
+  const chunkPath = path.join(__dirname, ".next", "static", "chunks", ...segments);
+  const directory = path.dirname(chunkPath);
+  const basename = path.basename(chunkPath, ".js");
+
+  if (existsSync(chunkPath)) {
+    return chunkPath;
+  }
+
+  if (!existsSync(directory)) {
+    return null;
+  }
+
+  const match = readdirSync(directory).find(
+    (entry) => entry === `${basename}.js` || entry.startsWith(`${basename}-`),
+  );
+  return match ? path.join(directory, match) : null;
+};
+
+const staleNextChunkFallbacks = new Map(
+  [
+    ["/_next/static/chunks/main.js", findBuiltChunk("main.js")],
+    ["/_next/static/chunks/pages/_app.js", findBuiltChunk("pages", "_app.js")],
+    [
+      "/_next/static/chunks/pages/_error.js",
+      findBuiltChunk("pages", "_error.js"),
+    ],
+  ].filter(([, filePath]) => Boolean(filePath)),
+);
+
+const handleStaleNextChunkRequest = (pathname, response) => {
+  if (pathname === "/_next/static/chunks/react-refresh.js") {
+    response.writeHead(200, {
+      "content-type": "application/javascript; charset=utf-8",
+      "cache-control": "no-store",
+      "x-next-stale-chunk-fallback": "empty-react-refresh",
+    });
+    response.end("self.$RefreshReg$=self.$RefreshReg$||function(){};self.$RefreshSig$=self.$RefreshSig$||function(){return function(type){return type}};\n");
+    return true;
+  }
+
+  const filePath = staleNextChunkFallbacks.get(pathname);
+  if (!filePath) {
+    return false;
+  }
+
+  response.writeHead(200, {
+    "content-type": "application/javascript; charset=utf-8",
+    "cache-control": "no-store",
+    "x-next-stale-chunk-fallback": "hashed-build-chunk",
+  });
+  createReadStream(filePath).pipe(response);
+  return true;
+};
+
 const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
 
 const bridgeHealthPayload = () => {
@@ -1100,6 +1155,10 @@ const server = createServer((request, response) => {
   if (url.pathname === "/api/node-bridge/health") {
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify(bridgeHealthPayload()));
+    return;
+  }
+
+  if (handleStaleNextChunkRequest(url.pathname, response)) {
     return;
   }
 
