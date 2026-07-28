@@ -18,8 +18,7 @@ jobs:
   deploy:
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (vars.ENABLE_AUTO_PRODUCTION_DEPLOY == 'true' &&
-      github.event.workflow_run.conclusion == 'success')
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment:
