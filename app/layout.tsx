@@ -1,16 +1,10 @@
 import type { Metadata } from "next";
-import { Inter } from "next/font/google";
 
 import "./globals.css";
 import { AuthProvider } from "@/components/auth/auth-provider";
 import { PageLoader } from "@/components/ui/page-loader";
 import { ThemeProvider } from "@/components/theme-provider";
 import { GlobalLayoutWrapper } from "@/components/layout/global-layout-wrapper";
-
-const inter = Inter({
-  subsets: ["latin"],
-  variable: "--font-inter",
-});
 
 export const metadata: Metadata = {
   title: {
@@ -31,7 +25,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" className="dark" style={{ colorScheme: "dark" }} suppressHydrationWarning>
-      <body className={`${inter.variable} bg-background font-sans text-foreground antialiased`}>
+      <body className="bg-background font-sans text-foreground antialiased">
         <ThemeProvider
           attribute="class"
           defaultTheme="dark"

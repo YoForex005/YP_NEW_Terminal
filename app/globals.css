@@ -8,6 +8,8 @@
 
 @layer base {
   :root {
+    --font-inter: "Inter";
+
     /* ─── LIGHT THEME: Authentic Exness Light ─── */
     --background: 210 20% 98%;        /* #f8f9fa — Light gray background / gaps */
     --foreground: 222 47% 11%;        /* #0f172a — Near black text */
