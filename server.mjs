@@ -1,6 +1,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { createReadStream, existsSync, readdirSync, readFileSync } from "node:fs";
 import { createServer } from "node:http";
+import { createConnection } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -298,6 +299,8 @@ const bridgeStats = {
   lastUpstreamCloseAt: null,
   lastUpstreamCloseCode: null,
   lastUpstreamCloseReason: null,
+  lastClientErrorAt: null,
+  lastClientErrorMessage: null,
 };
 
 const upstreamDiagnosticMessage = (problem) =>
@@ -943,6 +946,8 @@ const createBridgeConnection = (client, request) => {
       remote,
       message: error.message,
     });
+    bridgeStats.lastClientErrorAt = new Date().toISOString();
+    bridgeStats.lastClientErrorMessage = error.message;
     cleanup();
   });
 };
@@ -1010,6 +1015,135 @@ const handleStaleNextChunkRequest = (pathname, response) => {
   createReadStream(filePath).pipe(response);
   return true;
 };
+
+const createMaskedTextFrame = (text) => {
+  const payload = Buffer.from(text);
+  if (payload.length >= 126) {
+    throw new Error("Self-test payload is too large.");
+  }
+
+  const mask = Buffer.from([0x12, 0x34, 0x56, 0x78]);
+  const frame = Buffer.alloc(2 + mask.length + payload.length);
+  frame[0] = 0x81;
+  frame[1] = 0x80 | payload.length;
+  mask.copy(frame, 2);
+
+  for (let index = 0; index < payload.length; index += 1) {
+    frame[6 + index] = payload[index] ^ mask[index % mask.length];
+  }
+
+  return frame;
+};
+
+const runLoopbackWebSocketSelfTest = (pathname = defaultPublicBridgePath) =>
+  new Promise((resolve) => {
+    const startedAt = Date.now();
+    const key = "dGhlIHNhbXBsZSBub25jZQ==";
+    const socket = createConnection({ host: "127.0.0.1", port });
+    let buffer = Buffer.alloc(0);
+    let sentAuthFrame = false;
+    let settled = false;
+
+    const finish = (result) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve({
+        path: pathname,
+        elapsedMs: Date.now() - startedAt,
+        ...result,
+      });
+    };
+
+    const timer = setTimeout(
+      () =>
+        finish({
+          ok: false,
+          phase: sentAuthFrame ? "awaiting_frame" : "awaiting_upgrade",
+          error: "Timed out waiting for loopback WebSocket self-test.",
+        }),
+      5_000,
+    );
+
+    socket.on("connect", () => {
+      socket.write(
+        [
+          `GET ${pathname} HTTP/1.1`,
+          `Host: 127.0.0.1:${port}`,
+          "Upgrade: websocket",
+          "Connection: Upgrade",
+          `Sec-WebSocket-Key: ${key}`,
+          "Sec-WebSocket-Version: 13",
+          "",
+          "",
+        ].join("\r\n"),
+      );
+    });
+
+    socket.on("data", (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
+
+      if (!sentAuthFrame) {
+        const headerEnd = buffer.indexOf("\r\n\r\n");
+        if (headerEnd < 0) {
+          return;
+        }
+
+        const headers = buffer.slice(0, headerEnd).toString("latin1");
+        const statusLine = headers.split("\r\n")[0] || "";
+        if (!statusLine.includes("101")) {
+          finish({ ok: false, phase: "upgrade", statusLine });
+          return;
+        }
+
+        buffer = buffer.slice(headerEnd + 4);
+        sentAuthFrame = true;
+        socket.write(
+          createMaskedTextFrame(
+            JSON.stringify({
+              action: "auth_with_token",
+              requestId: "loopback-self-test",
+              data: { token: "bad-token" },
+            }),
+          ),
+        );
+      }
+
+      if (sentAuthFrame && buffer.length > 0) {
+        const firstByte = buffer[0];
+        const opcode = firstByte & 0x0f;
+        const rsv1 = Boolean(firstByte & 0x40);
+        const asciiPreview = buffer
+          .slice(0, 96)
+          .toString("latin1")
+          .replace(/\r/g, "\\r")
+          .replace(/\n/g, "\\n");
+        finish({
+          ok: !rsv1 && (opcode === 1 || opcode === 8),
+          phase: "first_frame",
+          firstByte,
+          opcode,
+          rsv1,
+          hexPreview: buffer.slice(0, 32).toString("hex"),
+          asciiPreview,
+        });
+      }
+    });
+
+    socket.on("error", (error) => {
+      finish({ ok: false, phase: "socket", error: error.message });
+    });
+
+    socket.on("close", () => {
+      finish({
+        ok: false,
+        phase: sentAuthFrame ? "closed_after_auth" : "closed_before_upgrade",
+      });
+    });
+  });
 
 const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
 
@@ -1083,6 +1217,8 @@ const bridgeHealthPayload = () => {
       lastUpstreamCloseAt: bridgeStats.lastUpstreamCloseAt,
       lastUpstreamCloseCode: bridgeStats.lastUpstreamCloseCode,
       lastUpstreamCloseReason: bridgeStats.lastUpstreamCloseReason,
+      lastClientErrorAt: bridgeStats.lastClientErrorAt,
+      lastClientErrorMessage: bridgeStats.lastClientErrorMessage,
     },
     diagnostics: {
       browserShouldConnectTo: publicWebSocketUrl,
@@ -1155,12 +1291,29 @@ const delegateNextUpgrade = (request, socket, head) => {
   });
 };
 
-const server = createServer((request, response) => {
+const server = createServer(async (request, response) => {
   const url = getRequestUrl(request);
 
   if (url.pathname === "/api/node-bridge/health") {
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify(bridgeHealthPayload()));
+    return;
+  }
+
+  if (url.pathname === "/api/node-bridge/ws-self-test") {
+    const requestedPath = normalizeBridgePath(
+      url.searchParams.get("path") || defaultPublicBridgePath,
+    );
+    const testPath =
+      requestedPath && bridgePaths.has(requestedPath)
+        ? requestedPath
+        : defaultPublicBridgePath;
+    const result = await runLoopbackWebSocketSelfTest(testPath);
+    response.writeHead(result.ok ? 200 : 502, {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+    });
+    response.end(JSON.stringify(result));
     return;
   }
 
