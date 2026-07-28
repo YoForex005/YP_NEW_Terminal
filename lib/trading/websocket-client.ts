@@ -291,7 +291,8 @@ const REALTIME_EVENT_DEDUP_TTL_MS = 50;
 const REALTIME_EVENT_DEDUP_CACHE_LIMIT = 512;
 const REALTIME_EVENT_DEDUP_CLEANUP_INTERVAL = 64;
 const OHLC_HISTORY_METADATA_PROPERTY = '__ohlcHistoryMetadata';
-export const DEFAULT_OHLC_HISTORY_LIMIT = 5_000;
+export const DEFAULT_OHLC_HISTORY_LIMIT = 1_000;
+export const MAX_OHLC_HISTORY_LIMIT = 5_000;
 const SLOW_RECONNECT_INITIAL_INTERVAL_MS = 3_000;
 const SLOW_RECONNECT_MAX_INTERVAL_MS = 15_000;
 const TOKEN_REFRESH_SAFETY_MARGIN_MS = 60_000;
@@ -3268,7 +3269,7 @@ export class WebSocketTradingClient {
     range: OhlcHistoryRange = {},
   ): Promise<OhlcHistoryResponse> {
     const normalizedLimit = Math.min(
-      DEFAULT_OHLC_HISTORY_LIMIT,
+      MAX_OHLC_HISTORY_LIMIT,
       Math.max(1, parseInteger(limit, DEFAULT_OHLC_HISTORY_LIMIT)),
     );
     const fromUnixMs = this.normalizeOptionalUnixMs(range.fromUnixMs);

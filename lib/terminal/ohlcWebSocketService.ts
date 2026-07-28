@@ -5,6 +5,7 @@ import {
 } from '@/store/webtrader-store';
 import {
   DEFAULT_OHLC_HISTORY_LIMIT,
+  MAX_OHLC_HISTORY_LIMIT,
   getOhlcHistoryMetadata,
   OhlcHistoryResponseMetadata,
   WebSocketTradingClient,
@@ -194,10 +195,15 @@ const HISTORY_CLIENT_ATTACH_WAIT_MS = 1_200;
 const LIVE_CLIENT_ATTACH_POLL_MS = 80;
 const LOCAL_HISTORY_POLL_MS = 100;
 const LOCAL_REPLAY_BATCH_SIZE = 100;
-const MAX_NORMALIZED_OHLC_BARS = DEFAULT_OHLC_HISTORY_LIMIT;
+const MAX_NORMALIZED_OHLC_BARS = MAX_OHLC_HISTORY_LIMIT;
 const SYNC_HISTORY_CACHE_LIMIT = 1_000;
 const IN_MEMORY_HISTORY_MAX_KEYS = 64;
-const MAX_ACCEPTED_FUTURE_TICK_SKEW_MS = 60_000;
+// MT5 timestamps are expressed on the broker server clock. Brokers commonly run
+// UTC+2/UTC+3, so comparing them to the browser clock with a one-minute ceiling
+// incorrectly rewrites valid ticks onto a different bucket grid than MT5 history.
+// Fourteen hours covers the full civil-timezone range while still rejecting
+// clearly corrupt future timestamps.
+const MAX_ACCEPTED_BROKER_CLOCK_OFFSET_MS = 14 * 60 * 60_000;
 const MAX_ACCEPTED_PAST_LIVE_TICK_SKEW_MS = 2 * 60_000;
 const RAW_OHLC_HISTORY_LIMIT = 512;
 const RAW_OHLC_HISTORY_MAX_KEYS = 128;
@@ -1189,11 +1195,12 @@ function normalizeIncomingTickTimestampMs(
     return normalizedReceivedAt;
   }
 
-  // Only reject significantly future-skewed timestamps (MT5 clock misconfiguration / drift).
+  // Preserve valid MT5 broker-time offsets so live ticks share the same bucket
+  // grid as ChartRequest history. Reject only timestamps beyond any civil-timezone offset.
   // Past timestamps MUST preserve the original MT5/server source time so candle buckets stay
   // correct after a backend gateway restart or reconnect tick replay. Using browser receive
   // time for old ticks collapses all replayed ticks into the current bucket, corrupting candles.
-  if (parsedTimestamp > normalizedReceivedAt + MAX_ACCEPTED_FUTURE_TICK_SKEW_MS) {
+  if (parsedTimestamp > normalizedReceivedAt + MAX_ACCEPTED_BROKER_CLOCK_OFFSET_MS) {
     return normalizedReceivedAt;
   }
 
@@ -2854,7 +2861,7 @@ class OhlcWebSocketService {
       ? Math.trunc(limit)
       : DEFAULT_OHLC_HISTORY_LIMIT;
     const requestLimit = Math.min(
-      DEFAULT_OHLC_HISTORY_LIMIT,
+      MAX_OHLC_HISTORY_LIMIT,
       Math.max(1, parsedLimit),
     );
     const requestRange = normalizeHistoryRange(range);
@@ -6022,8 +6029,22 @@ class OhlcWebSocketService {
     const seedTime = currentBucketTime > previousBar.time
       ? currentBucketTime
       : previousBar.time;
+    const hasBucketGap = seedTime > previousBar.time + bucketMs;
     const seedBar = seedTime > previousBar.time
-      ? this._liveRolloverBar(seedTime, price, previousBar)
+      ? hasBucketGap
+        ? {
+            symbol: previousBar.symbol,
+            timeframeMinutes: previousBar.timeframeMinutes,
+            time: seedTime,
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            volume: 1,
+            source: 'mt5_tick',
+            sourceTimeMs: latestTick?.timestampMs ?? seedTime,
+          }
+        : this._liveRolloverBar(seedTime, price, previousBar)
       : {
           ...previousBar,
           sourceTimeMs: previousBar.sourceTimeMs ?? previousBar.time,
@@ -6175,10 +6196,12 @@ class OhlcWebSocketService {
     this._bucketExpiryTimer = setInterval(() => {
       // Server clock, not Date.now() — buckets are keyed on the broker clock, so
       // a broker timezone offset would otherwise stop this timer from ever rolling.
-      const nowMs = Math.max(this.getServerNowMs(), Date.now());
+      const nowMs = this.getServerNowMs();
       for (const key of this.subscribers.keys()) {
         if (!this.currentBars.has(key)) {
-          this._seedCurrentBarFromLatestHistory(key, nowMs);
+          this._seedCurrentBarFromLatestHistory(key, nowMs) ||
+            this._seedCurrentBarFromLatestTick(key, { allowWithHistory: true }) ||
+            this._seedCurrentBarFromStorePrice(key, { allowWithHistory: true });
         }
       }
       for (const [key, current] of this.currentBars.entries()) {
@@ -6297,7 +6320,11 @@ class OhlcWebSocketService {
       const latestCurrentTickMs = this.currentBarLatestTickMs.get(key) ?? 0;
       let effectiveTickMs = bucketTimestampMs;
       const receivedTimestampMs = normalizeIncomingTickTimestampMs(receivedAtMs, Date.now());
-      const serverNowMs = Math.max(tsMs, this.getLatestKnownMt5TimestampMs(), Date.now());
+      const serverNowMs = Math.max(
+        tsMs,
+        this.getLatestKnownMt5TimestampMs(),
+        this.getServerNowMs(),
+      );
       const receivedBucketStart = Math.floor(receivedTimestampMs / bucketMs) * bucketMs;
       const currentClockBucketStart = Math.max(
         receivedBucketStart,
@@ -6343,10 +6370,14 @@ class OhlcWebSocketService {
           return;
         }
 
+        // Only drop true out-of-order ticks that do not move price. Gateways often
+        // re-send a stale MT5 timestamp with a newer bid/ask — those must still
+        // update the forming candle close in real time.
         if (
           bucketStart === current.time &&
           latestCurrentTickMs > 0 &&
-          effectiveTickMs < latestCurrentTickMs
+          effectiveTickMs < latestCurrentTickMs &&
+          Math.abs(price - current.close) < Math.max(1e-12, Math.abs(current.close) * 1e-12)
         ) {
           return;
         }
@@ -6368,7 +6399,7 @@ class OhlcWebSocketService {
         // For the history/live seam, inherit the previous close as the provisional
         // open only when there is no missing candle bucket. If one or more
         // buckets are missing, the first live tick opens the new candle.
-        const open = previousBar ? previousBar.close : price;
+        const open = previousBar && !hasBucketGap ? previousBar.close : price;
         const newBar: OHLCBar = {
           time: bucketStart,
           open,
@@ -7576,7 +7607,7 @@ class OhlcWebSocketService {
       ? Math.trunc(limit)
       : DEFAULT_OHLC_HISTORY_LIMIT;
     const requestLimit = Math.min(
-      DEFAULT_OHLC_HISTORY_LIMIT,
+      MAX_OHLC_HISTORY_LIMIT,
       Math.max(1, parsedLimit),
     );
     const { beforeUnixMs, fromUnixMs, toUnixMs } = range;

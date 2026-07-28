@@ -26,7 +26,7 @@ import {
 import { useGroupActiveSymbols } from '@/lib/trading/use-group-active-symbols';
 import type { Instrument, Position, PriceAlert, ClosedTrade } from '@/lib/terminal/types';
 import { useTradingStore } from '@/store/trading-store';
-import { getLivePriceSnapshotBySymbol, usePriceBySymbol, useWebtraderStore } from '@/store/webtrader-store';
+import { getLivePriceSnapshotBySymbol, useLivePriceUniverse, useWebtraderStore } from '@/store/webtrader-store';
 import { buildOhlcSessionScopeId, useAutoConnectTrading } from '@/lib/trading/use-auto-connect';
 import type { WebSocketTradingClient } from '@/lib/trading/websocket-client';
 import type { TradingAccount as DashboardTradingAccount } from '@/types/dashboard';
@@ -49,6 +49,10 @@ import {
     writeTerminalFrontendLaunchSnapshot,
 } from '@/lib/terminal/terminal-launch-cache';
 import { DEFAULT_CHART_TYPES, type ChartType as TerminalChartType } from '@/lib/terminal/chart-visual-config';
+import {
+    precomputeTerminalChartSwitchSeed,
+    TERMINAL_CHART_SWITCH_SEED_LIMIT,
+} from '@/lib/terminal/chart-switch-seed-cache';
 import { getMt5ServerTimeMs, toMt5IsoString } from '@/lib/mt5-time';
 
 export interface ToastNotificationData {
@@ -1219,15 +1223,6 @@ function hasLivePriceForSymbol(prices: Record<string, { symbol?: string; bid?: n
     return Boolean(price && ((price.bid ?? 0) > 0 || (price.ask ?? 0) > 0 || (price.last ?? 0) > 0));
 }
 
-function getLivePriceSymbolKey(prices: Record<string, { bid?: number; ask?: number; last?: number }>) {
-    return getSymbolListKey(
-        Object.entries(prices)
-            .filter(([, price]) => (price.bid ?? 0) > 0 || (price.ask ?? 0) > 0 || (price.last ?? 0) > 0)
-            .map(([symbol]) => symbol)
-            .sort(),
-    );
-}
-
 function isSoftQuoteFeedNotice(message?: string | null) {
     return /waiting for the first mt5 tick|chart history can load/i.test(message ?? '');
 }
@@ -2394,6 +2389,65 @@ function scheduleTerminalIdleTask(callback: () => void, delayMs = 0) {
     };
 }
 
+function isTerminalChartPerfDebugEnabled(): boolean {
+    if (process.env.NODE_ENV === 'production' || typeof window === 'undefined') {
+        return false;
+    }
+
+    try {
+        return new URLSearchParams(window.location.search).get('chartPerfDebug') === '1';
+    } catch {
+        return false;
+    }
+}
+
+function markTerminalChartSwitchPerf(label: string, detail?: Record<string, unknown>) {
+    if (!isTerminalChartPerfDebugEnabled() || typeof window === 'undefined' || !window.performance?.mark) {
+        return;
+    }
+
+    const markName = `yopips:chart-switch:${label}`;
+    try {
+        window.performance.mark(markName, detail ? { detail } : undefined);
+    } catch {
+        window.performance.mark(markName);
+    }
+    console.debug('[ChartPerf]', label, detail ?? {});
+}
+
+function prewarmTerminalChartSwitchSeed(input: {
+    accountSessionScopeId?: string | null;
+    symbol: string;
+    timeframeMinutes: number;
+}) {
+    const bars = ohlcService
+        .getSyncBars(input.symbol, input.timeframeMinutes, input.accountSessionScopeId)
+        .filter((bar) =>
+            !isContinuityBar(bar) &&
+            Number.isFinite(bar.time) &&
+            Number.isFinite(bar.open) &&
+            Number.isFinite(bar.high) &&
+            Number.isFinite(bar.low) &&
+            Number.isFinite(bar.close) &&
+            bar.close > 0,
+        );
+    const seed = precomputeTerminalChartSwitchSeed({
+        accountSessionScopeId: input.accountSessionScopeId,
+        symbol: input.symbol,
+        timeframeMinutes: input.timeframeMinutes,
+        bars,
+        limit: TERMINAL_CHART_SWITCH_SEED_LIMIT,
+    });
+
+    markTerminalChartSwitchPerf('prewarm-seed', {
+        symbol: input.symbol,
+        timeframeMinutes: input.timeframeMinutes,
+        bars: seed?.bars.length ?? 0,
+    });
+
+    return seed;
+}
+
 function resolveOrderType(
     side: 'buy' | 'sell',
     orderType: 'market' | 'limit' | 'stop',
@@ -2868,8 +2922,9 @@ function TradingDashboardInner() {
     const storeMarketWsClient = useWebtraderStore(state => state.marketWsClient);
     const storeOhlcWsClient = useWebtraderStore(state => state.ohlcWsClient);
     const storeSymbolCount = useWebtraderStore((state) => state.symbols.length);
-    const storePriceCount = useWebtraderStore((state) => Object.keys(state.prices).length);
-    const livePriceSymbolKey = useWebtraderStore((state) => getLivePriceSymbolKey(state.prices));
+    const livePriceUniverse = useLivePriceUniverse();
+    const storePriceCount = livePriceUniverse.count;
+    const livePriceSymbolKey = livePriceUniverse.symbolKey;
     const hasStoreAccountInfo = useWebtraderStore((state) => Boolean(state.accountInfo));
     const storePositionCount = useWebtraderStore((state) => state.positions.length);
     const setStoreAccountInfo = useWebtraderStore(state => state.setAccountInfo);
@@ -3262,6 +3317,7 @@ function TradingDashboardInner() {
     const watchlistOhlcPrewarmKeyRef = useRef<string | null>(null);
     const symbolHoverHistoryPrewarmTimeoutRef = useRef<number | null>(null);
     const lastHoveredHistoryPrewarmKeyRef = useRef<string | null>(null);
+    const selectedSymbolMarketPrimeCancelRef = useRef<(() => void) | undefined>(undefined);
     const latestStorePricesRef = useRef(useWebtraderStore.getState().prices);
     const latestStoreSymbolsRef = useRef(storeSymbols);
     const requestedOhlcHistoryRef = useRef<Map<string, number>>(new Map());
@@ -3282,6 +3338,8 @@ function TradingDashboardInner() {
             window.clearTimeout(symbolHoverHistoryPrewarmTimeoutRef.current);
             symbolHoverHistoryPrewarmTimeoutRef.current = null;
         }
+        selectedSymbolMarketPrimeCancelRef.current?.();
+        selectedSymbolMarketPrimeCancelRef.current = undefined;
         ohlcHistoryWarmupRetryTimeoutsRef.current.forEach((timeoutId) => {
             window.clearTimeout(timeoutId);
         });
@@ -4322,6 +4380,24 @@ function TradingDashboardInner() {
     }, []);
 
     useEffect(() => {
+        const hasLaunchCodeInHash = (() => {
+            if (typeof window === 'undefined') {
+                return false;
+            }
+
+            try {
+                const params = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+                return params.has('launch_code') || params.has('launchCode') || params.has('code');
+            } catch {
+                return false;
+            }
+        })();
+
+        if (terminalLaunchSession.isActive || hasLaunchCodeInHash) {
+            setIsSnapshotLoading(false);
+            return;
+        }
+
         let isCancelled = false;
 
         const loadSnapshot = async () => {
@@ -4370,7 +4446,7 @@ function TradingDashboardInner() {
         return () => {
             isCancelled = true;
         };
-    }, [handleShowToast, hydrateFromSnapshot, markTerminalBootMilestone]);
+    }, [handleShowToast, hydrateFromSnapshot, markTerminalBootMilestone, terminalLaunchSession.isActive]);
 
     useEffect(() => {
         if (!connectAccountId) {
@@ -5524,6 +5600,14 @@ function TradingDashboardInner() {
         }
 
         const timer = window.setTimeout(() => {
+            const normalizedTf = normalizeTerminalTimeframeMinutes(chartTimeframeMinutes);
+            for (const tabSymbol of backgroundTabs) {
+                prewarmTerminalChartSwitchSeed({
+                    accountSessionScopeId,
+                    symbol: tabSymbol,
+                    timeframeMinutes: normalizedTf,
+                });
+            }
             primeTerminalMarketData(backgroundTabs, {
                 requestHistory: true,
                 historyLimit: TERMINAL_BACKGROUND_OHLC_PREWARM_LIMIT,
@@ -5532,6 +5616,8 @@ function TradingDashboardInner() {
 
         return () => window.clearTimeout(timer);
     }, [
+        accountSessionScopeId,
+        chartTimeframeMinutes,
         isOhlcHistoryClientReady,
         openTabs,
         primeTerminalMarketData,
@@ -7649,14 +7735,10 @@ function TradingDashboardInner() {
             return;
         }
 
-        // Start both independent market-data lanes before React commits the chart
-        // switch. This gives the new chart a live snapshot and cache request in flight
-        // during render instead of one animation frame after it becomes visible.
-        primeTerminalMarketData([exactSymbol], {
-            requestHistory: true,
-            historyLimit: TERMINAL_SELECTED_OHLC_HISTORY_PRIME_LIMIT,
+        markTerminalChartSwitchPerf('handleSelectSymbol', {
+            symbol: exactSymbol,
+            timeframeMinutes: chartTimeframeMinutes,
         });
-
         setSelectedSymbol(exactSymbol);
         setSelectedSymbolAccountId(connectAccountId ?? null);
         startTransition(() => {
@@ -7666,26 +7748,40 @@ function TradingDashboardInner() {
                 setActivePanel(null);
             }
         });
-        const normalizedTimeframeMinutes = normalizeTerminalTimeframeMinutes(chartTimeframeMinutes);
-        const selectedDiagnosticsApplies = Boolean(
-            selectedHistoryDiagnostics &&
-            selectedHistoryDiagnostics.timeframeMinutes === normalizedTimeframeMinutes &&
-            (
-                symbolsMatch(selectedHistoryDiagnostics.symbol, exactSymbol) ||
-                symbolsMatch(selectedHistoryDiagnostics.requestedSymbol ?? '', exactSymbol)
-            ),
-        );
-        const selectedDiagnosticsNeedsHistory =
-            selectedDiagnosticsApplies &&
-            terminalOhlcHistoryDiagnosticsNeedsRepair(selectedHistoryDiagnostics);
+        selectedSymbolMarketPrimeCancelRef.current?.();
+        selectedSymbolMarketPrimeCancelRef.current = scheduleTerminalIdleTask(() => {
+            selectedSymbolMarketPrimeCancelRef.current = undefined;
+            const normalizedTimeframeMinutes = normalizeTerminalTimeframeMinutes(chartTimeframeMinutes);
+            primeTerminalMarketData([exactSymbol], {
+                requestHistory: true,
+                historyLimit: TERMINAL_SELECTED_OHLC_HISTORY_PRIME_LIMIT,
+            });
 
-        if (selectedDiagnosticsNeedsHistory) {
-            requestSelectedOhlcHistoryRef.current(
-                exactSymbol,
-                TERMINAL_SELECTED_OHLC_HISTORY_PRIME_LIMIT,
-                normalizedTimeframeMinutes,
+            const selectedDiagnosticsApplies = Boolean(
+                selectedHistoryDiagnostics &&
+                selectedHistoryDiagnostics.timeframeMinutes === normalizedTimeframeMinutes &&
+                (
+                    symbolsMatch(selectedHistoryDiagnostics.symbol, exactSymbol) ||
+                    symbolsMatch(selectedHistoryDiagnostics.requestedSymbol ?? '', exactSymbol)
+                ),
             );
-        }
+            const selectedDiagnosticsNeedsHistory =
+                selectedDiagnosticsApplies &&
+                terminalOhlcHistoryDiagnosticsNeedsRepair(selectedHistoryDiagnostics);
+
+            if (selectedDiagnosticsNeedsHistory) {
+                requestSelectedOhlcHistoryRef.current(
+                    exactSymbol,
+                    TERMINAL_SELECTED_OHLC_HISTORY_PRIME_LIMIT,
+                    normalizedTimeframeMinutes,
+                );
+            }
+
+            markTerminalChartSwitchPerf('handleSelectSymbol:background-prime', {
+                symbol: exactSymbol,
+                timeframeMinutes: normalizedTimeframeMinutes,
+            });
+        });
     }, [
         chartTimeframeMinutes,
         connectAccountId,
@@ -7717,12 +7813,19 @@ function TradingDashboardInner() {
         symbolHoverHistoryPrewarmTimeoutRef.current = window.setTimeout(() => {
             symbolHoverHistoryPrewarmTimeoutRef.current = null;
             lastHoveredHistoryPrewarmKeyRef.current = hoverKey;
+            const normalizedTf = normalizeTerminalTimeframeMinutes(chartTimeframeMinutes);
+            prewarmTerminalChartSwitchSeed({
+                accountSessionScopeId,
+                symbol: exactSymbol,
+                timeframeMinutes: normalizedTf,
+            });
             primeTerminalMarketData([exactSymbol], {
                 requestHistory: true,
                 historyLimit: TERMINAL_BACKGROUND_OHLC_PREWARM_LIMIT,
             });
         }, TERMINAL_SYMBOL_HOVER_OHLC_PREWARM_DELAY_MS);
     }, [
+        accountSessionScopeId,
         chartTimeframeMinutes,
         connectAccountId,
         primeTerminalMarketData,
@@ -8535,6 +8638,10 @@ function TradingDashboardInner() {
         setIsOrderPanelOpen(false);
     }, []);
 
+    const handleToggleOrderPanel = useCallback(() => {
+        setIsOrderPanelOpen((open) => !open);
+    }, []);
+
     const handleSelectedSell = useCallback(() => {
         if (!selectedInstrument) {
             return;
@@ -8765,7 +8872,7 @@ function TradingDashboardInner() {
                                                 onBuy={handleSelectedBuy}
                                                 onOpenOrderPanel={handleOpenTradePanel}
                                                 isOrderPanelOpen={isOrderPanelOpen}
-                                                onToggleOrderPanel={() => setIsOrderPanelOpen(!isOrderPanelOpen)}
+                                                onToggleOrderPanel={handleToggleOrderPanel}
                                                 onHistoryStatusChange={handleChartHistoryStatusChange}
                                                 timeframeMinutes={chartTimeframeMinutes}
                                                 onTimeframeChange={setChartTimeframeMinutes}

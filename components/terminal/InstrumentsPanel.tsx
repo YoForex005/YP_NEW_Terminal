@@ -340,9 +340,11 @@ const InstrumentRow = memo(function InstrumentRow({
                         expiresAt: Date.now() + MARKET_ROW_FLASH_DURATION_MS,
                     };
                     el.classList.remove(...MARKET_ROW_FLASH_CLASSES);
-                    // Force reflow so re-adding works
-                    void el.offsetWidth;
-                    el.classList.add(cls);
+                    // Restart flash on next frame without forced reflow (void el.offsetWidth).
+                    requestAnimationFrame(() => {
+                        if (!el.isConnected) return;
+                        el.classList.add(cls);
+                    });
                 };
                 flash(bidCellRef.current, activeBidFlashRef, bidDir);
                 flash(askCellRef.current, activeAskFlashRef, askDir);

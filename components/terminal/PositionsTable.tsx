@@ -5,7 +5,7 @@ import type { Order } from '@/types/webtrader';
 import dynamic from 'next/dynamic';
 import { X, Layers, MoreVertical, Briefcase, XCircle, Droplet, Edit2, Database, GripVertical, AlertTriangle, Loader2, RefreshCw } from 'lucide-react';
 import { memo, useCallback, useState, useEffect, useRef, useMemo, type Dispatch, type SetStateAction } from 'react';
-import { usePriceBySymbol } from '@/store/webtrader-store';
+import { subscribeToLivePriceBySymbol, getLivePriceSnapshotBySymbol } from '@/store/webtrader-store';
 import { SymbolIcon } from './SymbolIcon';
 import { getSafePriceDigits } from '@/lib/terminal/price-digits';
 import { formatMt5DateTimeShort } from '@/lib/mt5-time';
@@ -578,6 +578,36 @@ interface OpenPositionRowProps {
     isChild?: boolean;
 }
 
+const POSITION_PRICE_FLASH_CLASSES = ['quote-flash-up', 'quote-flash-down'] as const;
+
+function computeOpenPositionLivePrice(
+    pos: Pick<DisplayPosition, 'type' | 'isHedged' | 'currentPrice'>,
+    snap: ReturnType<typeof getLivePriceSnapshotBySymbol> | undefined,
+) {
+    // Live closing price: bid for buy (sell to close), ask for sell (buy to close).
+    // Hedged rows fall back to server currentPrice.
+    if (!pos.isHedged && snap) {
+        return pos.type === 'buy' ? snap.bid : snap.ask;
+    }
+    return pos.currentPrice;
+}
+
+function computeOpenPositionLiveProfit(
+    pos: Pick<DisplayPosition, 'type' | 'isAggregated' | 'contractSize' | 'openPrice' | 'volume' | 'swap' | 'profit'>,
+    liveCurrentPrice: number,
+    snap: ReturnType<typeof getLivePriceSnapshotBySymbol> | undefined,
+) {
+    // Client-side floating P&L when contractSize is available; include static swap.
+    if (!pos.isAggregated && pos.contractSize && snap) {
+        const directional =
+            pos.type === 'buy'
+                ? (liveCurrentPrice - pos.openPrice) * pos.volume * pos.contractSize
+                : (pos.openPrice - liveCurrentPrice) * pos.volume * pos.contractSize;
+        return directional + pos.swap;
+    }
+    return pos.profit;
+}
+
 function OpenPositionRowComponent({
     pos,
     isVisible,
@@ -588,40 +618,73 @@ function OpenPositionRowComponent({
     onClosePosition,
     isChild = false,
 }: OpenPositionRowProps) {
-    const rawLivePrice = usePriceBySymbol(pos.symbol);
+    // Direct DOM writes for live price/profit — zero React re-renders on every tick.
+    const priceTextRef = useRef<HTMLSpanElement>(null);
+    const profitTextRef = useRef<HTMLDivElement>(null);
+    const flashOverlayRef = useRef<HTMLDivElement>(null);
+    const prevPriceRef = useRef(pos.currentPrice);
+    const posRef = useRef(pos);
+    posRef.current = pos;
 
-    // Live closing price: bid for buy positions (you sell to close), ask for sell positions (you buy to close).
-    // For hedged/aggregated rows where type is ambiguous, fall back to server currentPrice.
-    const liveCurrentPrice = (!pos.isHedged && rawLivePrice)
-        ? (pos.type === 'buy' ? rawLivePrice.bid : rawLivePrice.ask)
-        : pos.currentPrice;
+    useEffect(() => {
+        const symbol = pos.symbol;
 
-    // Client-side floating P&L when the server provides contractSize on the position.
-    // swap is static tick-to-tick, so we include it from the last server value.
-    const liveProfit = (!pos.isAggregated && pos.contractSize && rawLivePrice)
-        ? ((pos.type === 'buy'
-            ? (liveCurrentPrice - pos.openPrice) * pos.volume * pos.contractSize
-            : (pos.openPrice - liveCurrentPrice) * pos.volume * pos.contractSize)
-            + pos.swap)
-        : pos.profit;
+        const apply = () => {
+            const p = posRef.current;
+            const snap = getLivePriceSnapshotBySymbol(symbol);
+            const priceDigits = getSafePriceDigits(p.digits);
+            const liveCurrentPrice = computeOpenPositionLivePrice(p, snap);
+            const liveProfit = computeOpenPositionLiveProfit(p, liveCurrentPrice, snap);
 
-    const displayCurrentPrice = liveCurrentPrice;
-    const displayProfit = liveProfit;
+            if (!p.isHedged && priceTextRef.current) {
+                const prev = prevPriceRef.current;
+                const dir =
+                    liveCurrentPrice > prev ? 'up' as const
+                        : liveCurrentPrice < prev ? 'down' as const
+                            : undefined;
+
+                priceTextRef.current.textContent =
+                    liveCurrentPrice > 0 ? liveCurrentPrice.toFixed(priceDigits) : '--';
+
+                priceTextRef.current.classList.remove('text-success', 'text-destructive', 'text-foreground');
+                if (dir === 'up') priceTextRef.current.classList.add('text-success');
+                else if (dir === 'down') priceTextRef.current.classList.add('text-destructive');
+                else priceTextRef.current.classList.add('text-foreground');
+
+                if (dir && flashOverlayRef.current) {
+                    const el = flashOverlayRef.current;
+                    const cls = dir === 'up' ? 'quote-flash-up' : 'quote-flash-down';
+                    el.classList.remove(...POSITION_PRICE_FLASH_CLASSES);
+                    requestAnimationFrame(() => {
+                        if (!el.isConnected) return;
+                        el.classList.add(cls);
+                    });
+                }
+
+                if (liveCurrentPrice !== prev) {
+                    prevPriceRef.current = liveCurrentPrice;
+                }
+            }
+
+            if (profitTextRef.current) {
+                profitTextRef.current.textContent = liveProfit.toFixed(2);
+                profitTextRef.current.classList.remove('text-success', 'text-destructive');
+                profitTextRef.current.classList.add(liveProfit >= 0 ? 'text-success' : 'text-destructive');
+            }
+        };
+
+        apply();
+        return subscribeToLivePriceBySymbol(symbol, apply);
+    }, [pos.symbol]);
+
+    // Seed values for initial paint / non-tick React re-renders (edit TP/SL, expand, etc.).
+    const snap0 = getLivePriceSnapshotBySymbol(pos.symbol);
+    const displayCurrentPrice = computeOpenPositionLivePrice(pos, snap0);
+    const displayProfit = computeOpenPositionLiveProfit(pos, displayCurrentPrice, snap0);
     const priceDigits = getSafePriceDigits(pos.digits);
-    const priceFlashKey = `${pos.id}:${displayCurrentPrice}`;
-    const prevPrice = useRef(displayCurrentPrice);
-    const priceFlash = displayCurrentPrice > prevPrice.current
-        ? 'up'
-        : displayCurrentPrice < prevPrice.current
-            ? 'down'
-            : undefined;
     const isHedged = pos.isHedged;
     const isAggregated = pos.isAggregated;
     const isOptimistic = pos.id.startsWith('optimistic-') || pos.ticket === 'Syncing' || (pos as Position & { isOptimistic?: boolean }).isOptimistic === true;
-
-    useEffect(() => {
-        prevPrice.current = displayCurrentPrice;
-    }, [displayCurrentPrice]);
 
     const [isExpanded, setIsExpanded] = useState(false);
 
@@ -682,13 +745,14 @@ function OpenPositionRowComponent({
                 <td className="py-0 font-mono text-foreground relative">
                     {!isHedged && (
                         <>
-                            {priceFlash && (
-                                <div
-                                    key={priceFlashKey}
-                                    className={`quote-flash-overlay ${priceFlash === 'up' ? 'quote-flash-up' : 'quote-flash-down'} -mx-1 rounded-none`}
-                                />
-                            )}
-                            <span className={`relative z-10 transition-colors duration-300 ${priceFlash === 'up' ? 'text-success' : priceFlash === 'down' ? 'text-destructive' : 'text-foreground'}`}>
+                            <div
+                                ref={flashOverlayRef}
+                                className="quote-flash-overlay -mx-1 rounded-none"
+                            />
+                            <span
+                                ref={priceTextRef}
+                                className="relative z-10 transition-colors duration-300 text-foreground"
+                            >
                                 {displayCurrentPrice > 0
                                     ? displayCurrentPrice.toFixed(priceDigits)
                                     : '--'}
@@ -770,7 +834,10 @@ function OpenPositionRowComponent({
             {isVisible('marketCloses') && <td className="py-0 font-mono text-muted-foreground">{typeof pos === 'object' ? '12h 45m' : '--'}</td>}
             
             <td className={`p-0 sticky right-[60px] z-10 bg-background border-b border-border/40 w-[100px] min-w-[100px]`}>
-                <div className={`flex items-center justify-end w-full h-full min-h-[30px] pr-3 font-mono font-medium ${displayProfit >= 0 ? 'text-success' : 'text-destructive'} ${isChild ? 'bg-accent/10' : isAggregated ? 'bg-accent/20' : 'bg-transparent'} group-hover:bg-accent/40 transition-colors`}>
+                <div
+                    ref={profitTextRef}
+                    className={`flex items-center justify-end w-full h-full min-h-[30px] pr-3 font-mono font-medium ${displayProfit >= 0 ? 'text-success' : 'text-destructive'} ${isChild ? 'bg-accent/10' : isAggregated ? 'bg-accent/20' : 'bg-transparent'} group-hover:bg-accent/40 transition-colors`}
+                >
                     {displayProfit.toFixed(2)}
                 </div>
             </td>
@@ -844,15 +911,48 @@ const formatPendingOrderType = (type: Order['type']) => (
         .join(' ')
 );
 
-function PendingOrderRowComponent({ order, isVisible }: PendingOrderRowProps) {
-    const rawLivePrice = usePriceBySymbol(order.symbol);
+function computePendingOrderLivePrice(
+    order: Pick<Order, 'type' | 'priceCurrent'>,
+    snap: ReturnType<typeof getLivePriceSnapshotBySymbol> | undefined,
+) {
     const side = getPendingOrderSide(order.type);
-    const currentPrice = rawLivePrice
-        ? (side === 'buy' ? rawLivePrice.ask : rawLivePrice.bid)
+    const currentPrice = snap
+        ? (side === 'buy' ? snap.ask : snap.bid)
         : order.priceCurrent;
+    return Number.isFinite(currentPrice) ? currentPrice : 0;
+}
+
+function PendingOrderRowComponent({ order, isVisible }: PendingOrderRowProps) {
+    // Direct DOM writes for current price — no React re-render per tick.
+    const priceTextRef = useRef<HTMLSpanElement>(null);
+    const orderRef = useRef(order);
+    orderRef.current = order;
+
+    useEffect(() => {
+        const symbol = order.symbol;
+
+        const apply = () => {
+            const o = orderRef.current;
+            const snap = getLivePriceSnapshotBySymbol(symbol);
+            const priceDigits = getSafePriceDigits(undefined);
+            const livePrice = computePendingOrderLivePrice(o, snap);
+            if (priceTextRef.current) {
+                priceTextRef.current.textContent =
+                    livePrice > 0 ? livePrice.toFixed(priceDigits) : '--';
+            }
+        };
+
+        apply();
+        return subscribeToLivePriceBySymbol(symbol, apply);
+    }, [order.symbol]);
+
+    const side = getPendingOrderSide(order.type);
     const priceDigits = getSafePriceDigits(undefined);
     const openPrice = Number.isFinite(order.openPrice) ? order.openPrice : 0;
-    const displayCurrentPrice = Number.isFinite(currentPrice) ? currentPrice : 0;
+    const displayCurrentPrice = computePendingOrderLivePrice(
+        order,
+        getLivePriceSnapshotBySymbol(order.symbol),
+    );
     const volume = Number.isFinite(order.volumeCurrent) && order.volumeCurrent > 0
         ? order.volumeCurrent
         : order.volume;
@@ -889,7 +989,9 @@ function PendingOrderRowComponent({ order, isVisible }: PendingOrderRowProps) {
             )}
             {isVisible('currentPrice') && (
                 <td className="py-0 font-mono text-foreground">
-                    {displayCurrentPrice > 0 ? displayCurrentPrice.toFixed(priceDigits) : '--'}
+                    <span ref={priceTextRef}>
+                        {displayCurrentPrice > 0 ? displayCurrentPrice.toFixed(priceDigits) : '--'}
+                    </span>
                 </td>
             )}
             {isVisible('tp') && (

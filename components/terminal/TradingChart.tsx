@@ -239,16 +239,6 @@ const getQuoteFlashClass = (
     return 'quote-flash-tick';
 };
 
-const getQuoteFlashKey = (symbol: string, side: 'bid' | 'ask', value: number, time: unknown) => {
-    const tickTime = time instanceof Date
-        ? time.getTime()
-        : typeof time === 'string' || typeof time === 'number'
-            ? time
-            : '';
-    return `${symbol}:${side}:${value}:${tickTime}`;
-};
-
-
 function TopQuoteActions({
     instrument,
     onSell,
@@ -276,7 +266,6 @@ function TopQuoteActions({
     const askDir = hasLiveQuote ? rawLivePrice?.askDirection : undefined;
     const bidFlashClass = hasLiveQuote && bid > 0 ? getQuoteFlashClass(bidDir, 'bid') : '';
     const askFlashClass = hasLiveQuote && ask > 0 ? getQuoteFlashClass(askDir, 'ask') : '';
-    const quoteFlashTickKey = rawLivePrice?.receivedSequence ?? rawLivePrice?.receivedAtMs ?? rawLivePrice?.time;
     const topQuoteTitle = isIndicativeQuote
         ? 'Indicative price from latest OHLC candle. Market orders require a live MT5 bid/ask.'
         : !hasLiveQuote
@@ -298,7 +287,10 @@ function TopQuoteActions({
                         title={topQuoteTitle}
                     >
                         {bidFlashClass && (
-                            <span key={getQuoteFlashKey(instrument.symbol, 'bid', bid, quoteFlashTickKey)} className={`quote-flash-overlay ${bidFlashClass}`} />
+                            <span
+                                key={`bid-flash-${bidDir ?? 'none'}`}
+                                className={`quote-flash-overlay ${bidFlashClass}`}
+                            />
                         )}
                         <span className="qa-label quote-flash-content text-white/90 mr-[2px]">Sell</span>
                         <span className="qa-val quote-flash-content text-white">{formatQuote(bid)}</span>
@@ -315,7 +307,10 @@ function TopQuoteActions({
                         title={topQuoteTitle}
                     >
                         {askFlashClass && (
-                            <span key={getQuoteFlashKey(instrument.symbol, 'ask', ask, quoteFlashTickKey)} className={`quote-flash-overlay ${askFlashClass}`} />
+                            <span
+                                key={`ask-flash-${askDir ?? 'none'}`}
+                                className={`quote-flash-overlay ${askFlashClass}`}
+                            />
                         )}
                         <span className="qa-label quote-flash-content text-white/90 mr-[2px]">Buy</span>
                         <span className="qa-val quote-flash-content text-white">{formatQuote(ask)}</span>
@@ -349,6 +344,7 @@ function ChartPaneWithPriceSeed({
     onChartBarSpacingChange,
     showTitle,
     hydrationDelayMs = 0,
+    isPrimaryPane = true,
 }: {
     symbol: string;
     accountSessionScopeId?: string | null;
@@ -368,6 +364,7 @@ function ChartPaneWithPriceSeed({
     onChartBarSpacingChange?: (barSpacing: number) => void;
     showTitle?: boolean;
     hydrationDelayMs?: number;
+    isPrimaryPane?: boolean;
 }) {
     const [isChartRuntimeReady, setIsChartRuntimeReady] = useState(false);
 
@@ -402,6 +399,7 @@ function ChartPaneWithPriceSeed({
             chartBarSpacing={chartBarSpacing}
             onChartBarSpacingChange={onChartBarSpacingChange}
             showTitle={showTitle}
+            isPrimaryPane={isPrimaryPane}
         />
     );
 }
@@ -424,6 +422,7 @@ function KlineFallbackChartPane({
     chartBarSpacing,
     onChartBarSpacingChange,
     showTitle,
+    isPrimaryPane = true,
 }: {
     symbol: string;
     accountSessionScopeId?: string | null;
@@ -442,6 +441,7 @@ function KlineFallbackChartPane({
     chartBarSpacing?: number | null;
     onChartBarSpacingChange?: (barSpacing: number) => void;
     showTitle?: boolean;
+    isPrimaryPane?: boolean;
 }) {
     return (
         <KlineChartContainer
@@ -463,6 +463,7 @@ function KlineFallbackChartPane({
             chartBarSpacing={chartBarSpacing}
             onChartBarSpacingChange={onChartBarSpacingChange}
             showTitle={showTitle}
+            isPrimaryPane={isPrimaryPane}
         />
     );
 }
@@ -677,6 +678,7 @@ function TradingChart({
                     onClosePosition={onClosePosition}
                     controlRef={paneIndex === 0 ? chartControlRef : undefined}
                     onHistoryStatusChange={paneIndex === 0 ? onHistoryStatusChange : undefined}
+                    isPrimaryPane={paneIndex === 0}
                     showTitle={false}
                     headerActions={paneIndex !== 0 ? undefined :
                         <div className="no-scrollbar" style={{ display: 'flex', alignItems: 'center', flexWrap: 'nowrap', justifyContent: 'flex-end', height: '32px', maxWidth: '100%', gap: '8px', overflowX: 'auto', overflowY: 'hidden', padding: '0 4px', pointerEvents: 'auto' }}>

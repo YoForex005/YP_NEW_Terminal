@@ -34,7 +34,7 @@ import { memo, startTransition, useDeferredValue, useEffect, useMemo, useRef, us
 import { PriceAlertModal } from './PriceAlertModal';
 import { LoginModal } from './LoginModal';
 import { useAuth } from '@/components/auth/auth-provider';
-import { usePriceBySymbol } from '@/store/webtrader-store';
+import { getLivePriceSnapshotBySymbol, usePriceBySymbol } from '@/store/webtrader-store';
 
 export interface UserProfile {
     name: string;
@@ -143,6 +143,31 @@ const HeaderInstrumentMenuRow = memo(function HeaderInstrumentMenuRow({
     );
 });
 
+/** Only mounted while the price-alert modal is open so Header body does not re-render on ticks. */
+function PriceAlertModalLive({
+    symbol,
+    digits,
+    onClose,
+    onSubmit,
+}: {
+    symbol: string;
+    digits?: number;
+    onClose: () => void;
+    onSubmit?: (symbol: string, price: number) => void;
+}) {
+    const livePrice = usePriceBySymbol(symbol);
+    return (
+        <PriceAlertModal
+            symbol={symbol}
+            currentBid={livePrice?.bid}
+            currentAsk={livePrice?.ask}
+            digits={digits}
+            onClose={onClose}
+            onSubmit={onSubmit}
+        />
+    );
+}
+
 function Header({ account, selectedSymbol, openTabs, userProfile, notifications, availableInstruments = [], accounts, activeAccountId, onSwitchAccount, onSelectTab, onCloseTab, onToggleSidebar, onReorderTabs, onTopUp, onMarkNotificationsRead, onAddPriceAlert, onShowToast, onOpenOrderPanel }: HeaderProps) {
     const { theme } = useTheme();
     const { logout } = useAuth();
@@ -190,7 +215,6 @@ function Header({ account, selectedSymbol, openTabs, userProfile, notifications,
         () => availableInstruments.find((instrument) => instrument.symbol === selectedSymbol) ?? null,
         [availableInstruments, selectedSymbol],
     );
-    const selectedInstrumentPrice = usePriceBySymbol(selectedInstrument?.symbol ?? selectedSymbol);
 
     const openPriceAlertModal = () => {
         if (!selectedInstrument) {
@@ -198,7 +222,8 @@ function Header({ account, selectedSymbol, openTabs, userProfile, notifications,
             return;
         }
 
-        if ((selectedInstrumentPrice?.bid ?? 0) <= 0 && (selectedInstrumentPrice?.ask ?? 0) <= 0) {
+        const snap = getLivePriceSnapshotBySymbol(selectedInstrument.symbol);
+        if ((snap?.bid ?? 0) <= 0 && (snap?.ask ?? 0) <= 0) {
             onShowToast?.('warning', 'No live quote yet', 'Wait for the selected instrument to receive a live quote before creating an alert.');
             return;
         }
@@ -1047,10 +1072,8 @@ function Header({ account, selectedSymbol, openTabs, userProfile, notifications,
         </header>
 
         {isPriceAlertModalOpen && (
-            <PriceAlertModal
+            <PriceAlertModalLive
                 symbol={selectedInstrument?.symbol ?? selectedSymbol}
-                currentBid={selectedInstrumentPrice?.bid}
-                currentAsk={selectedInstrumentPrice?.ask}
                 digits={selectedInstrument?.digits}
                 onClose={() => setIsPriceAlertModalOpen(false)}
                 onSubmit={onAddPriceAlert}

@@ -39,7 +39,7 @@ type PersistentOhlcHistoryRequest = {
 };
 
 const DB_NAME = 'yopips-terminal-market-cache';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const HISTORY_STORE = 'ohlc-history';
 const SAVED_AT_INDEX = 'saved-at';
 const MAX_PERSISTED_HISTORY_KEYS = 48;
@@ -131,11 +131,16 @@ function openDatabase(): Promise<IDBDatabase | null> {
   openDatabasePromise = new Promise<IDBDatabase | null>((resolve) => {
     const request = window.indexedDB.open(DB_NAME, DB_VERSION);
 
-    request.onupgradeneeded = () => {
+    request.onupgradeneeded = (event) => {
       const database = request.result;
       const store = database.objectStoreNames.contains(HISTORY_STORE)
         ? request.transaction!.objectStore(HISTORY_STORE)
         : database.createObjectStore(HISTORY_STORE, { keyPath: 'id' });
+
+      // Version 2 invalidates candles written before gap-aware live seeding.
+      if (event.oldVersion > 0 && event.oldVersion < 2) {
+        store.clear();
+      }
 
       if (!store.indexNames.contains(SAVED_AT_INDEX)) {
         store.createIndex(SAVED_AT_INDEX, 'savedAtMs');

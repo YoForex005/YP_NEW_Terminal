@@ -257,6 +257,12 @@ export const getTerminalApiBaseUrl = (): string => {
   const terminalApiBase = normalizeTerminalApiBase(process.env.NEXT_PUBLIC_TERMINAL_API_BASE);
   if (terminalApiBase !== undefined) return terminalApiBase;
 
+  // Browser must use same-origin Next proxy (`/api/terminal/...`) to avoid CORS.
+  // Absolute NEXT_PUBLIC_API_BASE_URL is for server-side only.
+  if (typeof window !== 'undefined') {
+    return '';
+  }
+
   return process.env.NEXT_PUBLIC_API_BASE_URL || '';
 };
 

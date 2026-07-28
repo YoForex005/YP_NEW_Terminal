@@ -32,6 +32,11 @@ const hostname = process.env.HOSTNAME || process.env.HOST || "0.0.0.0";
 const port = parsePort(process.env.PORT, 3000);
 const authTimeoutMs = parsePort(process.env.NODE_WS_AUTH_TIMEOUT_MS, 10_000);
 const maxPendingFrames = parsePort(process.env.NODE_WS_MAX_PENDING_FRAMES, 200);
+/** Client WS send buffer high-water mark; above this, PRICE_UPDATE ticks coalesce (latest-wins). */
+const clientBackpressureBytes = parsePort(
+  process.env.NODE_WS_CLIENT_BACKPRESSURE_BYTES,
+  512 * 1024,
+);
 const requiredUpstreamEvents = [
   "SYMBOL_LIST",
   "PRICE_UPDATE",
@@ -275,6 +280,7 @@ const bridgeStats = {
   clientBinaryFramesForwarded: 0,
   upstreamFramesForwarded: 0,
   upstreamBinaryFramesForwarded: 0,
+  droppedTicks: 0,
   upstreamEventCounts: Object.fromEntries(
     requiredUpstreamEvents.map((eventName) => [eventName, 0]),
   ),
@@ -315,6 +321,62 @@ const extractEventName = (data, isBinary) => {
   }
 
   return undefined;
+};
+
+/** True for PRICE_UPDATE / tick / quote style events (case-insensitive). */
+const isPriceUpdateEventName = (eventName) => {
+  if (typeof eventName !== "string" || !eventName.trim()) {
+    return false;
+  }
+
+  switch (eventName.trim().toLowerCase()) {
+    case "price_update":
+    case "tick":
+    case "quote":
+    case "quotes":
+      return true;
+    default:
+      return false;
+  }
+};
+
+/**
+ * Lightweight coalesce key for price ticks under client backpressure.
+ * Prefers symbol when cheap to read; falls back to "*" (latest overall).
+ */
+const extractPriceCoalesceKey = (data, isBinary) => {
+  if (isBinary) {
+    return "*";
+  }
+
+  try {
+    const text = frameToUtf8Text(data);
+    const frame = JSON.parse(text);
+    if (!frame || typeof frame !== "object" || Array.isArray(frame)) {
+      return "*";
+    }
+
+    if (typeof frame.symbol === "string" && frame.symbol.trim()) {
+      return frame.symbol.trim();
+    }
+
+    for (const nestKey of ["tick", "quote", "price", "data", "payload"]) {
+      const nested = frame[nestKey];
+      if (
+        nested &&
+        typeof nested === "object" &&
+        !Array.isArray(nested) &&
+        typeof nested.symbol === "string" &&
+        nested.symbol.trim()
+      ) {
+        return nested.symbol.trim();
+      }
+    }
+
+    return "*";
+  } catch {
+    return "*";
+  }
 };
 
 const recordUpstreamFrame = (data, isBinary) => {
@@ -520,6 +582,9 @@ const createBridgeConnection = (client, request) => {
   let authenticatedCounted = false;
   let closed = false;
   const pendingFrames = [];
+  /** @type {Map<string, { frame: any, isBinary: boolean }>} latest-wins price ticks while client is backpressured */
+  const pendingPriceByKey = new Map();
+  let priceFlushTimer = null;
 
   bridgeStats.acceptedConnections += 1;
   bridgeStats.activeClients += 1;
@@ -564,6 +629,13 @@ const createBridgeConnection = (client, request) => {
     );
   };
 
+  const clearPriceFlushTimer = () => {
+    if (priceFlushTimer != null) {
+      clearTimeout(priceFlushTimer);
+      priceFlushTimer = null;
+    }
+  };
+
   const cleanup = () => {
     if (closed) {
       return;
@@ -571,6 +643,8 @@ const createBridgeConnection = (client, request) => {
 
     closed = true;
     clearTimeout(authTimer);
+    clearPriceFlushTimer();
+    pendingPriceByKey.clear();
     bridgeStats.activeClients = Math.max(0, bridgeStats.activeClients - 1);
     if (authenticatedCounted) {
       authenticatedCounted = false;
@@ -647,6 +721,63 @@ const createBridgeConnection = (client, request) => {
     }
   };
 
+  const sendFrameToClient = (frame, isBinary) => {
+    client.send(frame, { binary: isBinary });
+    recordUpstreamFrame(frame, isBinary);
+  };
+
+  const schedulePriceFlush = () => {
+    if (priceFlushTimer != null || closed) {
+      return;
+    }
+
+    priceFlushTimer = setTimeout(() => {
+      priceFlushTimer = null;
+      flushCoalescedPriceTicks();
+    }, 8);
+  };
+
+  const flushCoalescedPriceTicks = () => {
+    if (
+      closed ||
+      pendingPriceByKey.size === 0 ||
+      client.readyState !== WebSocket.OPEN
+    ) {
+      return;
+    }
+
+    for (const [key, pending] of pendingPriceByKey) {
+      if (client.bufferedAmount > clientBackpressureBytes) {
+        schedulePriceFlush();
+        return;
+      }
+
+      try {
+        sendFrameToClient(pending.frame, pending.isBinary);
+        pendingPriceByKey.delete(key);
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : "Failed to write client.";
+        console.error("[node-ws-bridge] client send error", {
+          remote,
+          message,
+        });
+        closeSocket(client, 1011, "Realtime bridge write failed");
+        cleanup();
+        return;
+      }
+    }
+  };
+
+  const coalescePriceTick = (frame, isBinary) => {
+    const key = extractPriceCoalesceKey(frame, isBinary);
+    if (pendingPriceByKey.has(key)) {
+      bridgeStats.droppedTicks += 1;
+    }
+    pendingPriceByKey.set(key, { frame, isBinary });
+    schedulePriceFlush();
+  };
+
   const connectUpstream = (authPayload) => {
     upstream = new WebSocket(upstreamRealtimeUrl, {
       perMessageDeflate: false,
@@ -669,21 +800,40 @@ const createBridgeConnection = (client, request) => {
     });
 
     upstream.on("message", (data, isBinary) => {
-      if (client.readyState === WebSocket.OPEN) {
-        try {
-          const frame = normalizeForwardFrame(data, isBinary);
-          client.send(frame, { binary: isBinary });
-          recordUpstreamFrame(frame, isBinary);
-        } catch (error) {
-          const message =
-            error instanceof Error ? error.message : "Failed to write client.";
-          console.error("[node-ws-bridge] client send error", {
-            remote,
-            message,
-          });
-          closeSocket(client, 1011, "Realtime bridge write failed");
-          cleanup();
+      if (client.readyState !== WebSocket.OPEN) {
+        return;
+      }
+
+      try {
+        const frame = normalizeForwardFrame(data, isBinary);
+        const underBackpressure =
+          client.bufferedAmount > clientBackpressureBytes;
+
+        if (underBackpressure) {
+          // Classify only under pressure: coalesce PRICE_UPDATE ticks (latest-wins).
+          // Auth, trade, POSITION, BALANCE, errors, requestId responses always forward.
+          const eventName = extractEventName(frame, isBinary);
+          if (isPriceUpdateEventName(eventName)) {
+            coalescePriceTick(frame, isBinary);
+            return;
+          }
+
+          sendFrameToClient(frame, isBinary);
+          return;
         }
+
+        // Low buffer: raw pass-through (plus any held latest ticks).
+        flushCoalescedPriceTicks();
+        sendFrameToClient(frame, isBinary);
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : "Failed to write client.";
+        console.error("[node-ws-bridge] client send error", {
+          remote,
+          message,
+        });
+        closeSocket(client, 1011, "Realtime bridge write failed");
+        cleanup();
       }
     });
 
@@ -840,6 +990,8 @@ const bridgeHealthPayload = () => {
     proxy: {
       mode: "raw-frame-pass-through",
       mutatesTradingPayloads: false,
+      clientBackpressureBytes,
+      priceTickCoalesceUnderBackpressure: true,
       proxiedEvents: requiredUpstreamEvents,
     },
     bridge: {
@@ -853,6 +1005,8 @@ const bridgeHealthPayload = () => {
       clientBinaryFramesForwarded: bridgeStats.clientBinaryFramesForwarded,
       upstreamFramesForwarded: bridgeStats.upstreamFramesForwarded,
       upstreamBinaryFramesForwarded: bridgeStats.upstreamBinaryFramesForwarded,
+      droppedTicks: bridgeStats.droppedTicks,
+      clientBackpressureBytes,
       requiredUpstreamEvents: Object.fromEntries(
         requiredUpstreamEvents.map((eventName) => [
           eventName,

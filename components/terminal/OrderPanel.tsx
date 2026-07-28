@@ -1,7 +1,7 @@
-import React, { memo, useRef, useState, useMemo, useEffect, useSyncExternalStore } from 'react';
+import React, { memo, useRef, useState, useMemo, useEffect } from 'react';
 import type { Instrument } from '@/lib/terminal/types';
 import { ChevronDown, Minus, Plus, HelpCircle } from 'lucide-react';
-import { formatTerminalDisplaySymbol, getSafeLiveQuoteSnapshotBySymbol } from '@/lib/trading/terminal-symbols';
+import { getSafeLiveQuoteSnapshotBySymbol } from '@/lib/trading/terminal-symbols';
 import { useWebtraderStore, subscribeToLivePriceBySymbol, getLivePriceSnapshotBySymbol } from '@/store/webtrader-store';
 
 type TradeSide = 'buy' | 'sell';
@@ -41,14 +41,15 @@ const getQuoteFlashClass = (
     return 'quote-flash-tick';
 };
 
-const getQuoteFlashKey = (symbol: string, side: 'bid' | 'ask', value: number, time: unknown) => {
-    const tickTime = time instanceof Date
-        ? time.getTime()
-        : typeof time === 'string' || typeof time === 'number'
-            ? time
-            : '';
-    return `${symbol}:${side}:${value}:${tickTime}`;
-};
+const ORDER_PANEL_FLASH_CLASSES = [
+    'quote-flash-up',
+    'quote-flash-down',
+    'quote-flash-buy',
+    'quote-flash-sell',
+    'quote-flash-tick',
+] as const;
+
+const DISPLAY_QUOTE_THROTTLE_MS = 200;
 
 const getDisplayBid = (bid: number, ask: number, last: number) =>
     bid > 0 ? bid : bid <= 0 && ask <= 0 && last > 0 ? last : 0;
@@ -62,6 +63,25 @@ const getSafeOrderPanelLivePriceSnapshot = (symbol: string) =>
         getLivePriceSnapshotBySymbol,
         useWebtraderStore.getState().prices,
     );
+
+type LivePriceSnap = ReturnType<typeof getSafeOrderPanelLivePriceSnapshot>;
+
+const restartFlashOnOverlay = (
+    el: HTMLElement | null,
+    direction?: 'up' | 'down' | 'same',
+    side?: 'bid' | 'ask',
+) => {
+    if (!el) return;
+    // Only restart directional flashes (match InstrumentsPanel). Neutral ticks skip.
+    if (direction !== 'up' && direction !== 'down') return;
+    const cls = getQuoteFlashClass(direction, side);
+    if (!cls) return;
+    el.classList.remove(...ORDER_PANEL_FLASH_CLASSES);
+    requestAnimationFrame(() => {
+        if (!el.isConnected) return;
+        el.classList.add(cls);
+    });
+};
 
 // ─── Stepper Input Component ────────────────────────────────────────────────
 const toPositiveFinite = (value: unknown, fallback: number) => {
@@ -244,11 +264,6 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
     const symbolSpec = useWebtraderStore((state) =>
         state.symbols.find((symbol) => symbol.name === instrument.symbol),
     );
-    const rawLivePrice = useSyncExternalStore(
-        (listener) => subscribeToLivePriceBySymbol(instrument.symbol, listener),
-        () => getSafeOrderPanelLivePriceSnapshot(instrument.symbol),
-        () => getSafeOrderPanelLivePriceSnapshot(instrument.symbol),
-    );
     const activeAction = useWebtraderStore((state) => state.activeAction);
     const setActiveAction = useWebtraderStore((state) => state.setActiveAction);
     const updateOrderForm = useWebtraderStore((state) => state.updateOrderForm);
@@ -291,13 +306,48 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
     const [pendingPrice, setPendingPrice] = useState('');
     const [lastInitializedSide, setLastInitializedSide] = useState<TradeSide | null>(null);
 
+    // Live quote readiness is boolean-only (not per-tick bid/ask) so React does not
+    // re-render the full panel on every price tick. Price text + flash are DOM-driven.
+    const [liveQuoteReady, setLiveQuoteReady] = useState(() => {
+        const snap = getSafeOrderPanelLivePriceSnapshot(instrument.symbol);
+        return (snap?.bid ?? 0) > 0 && (snap?.ask ?? 0) > 0;
+    });
+    // Throttled bid/ask for fee/margin/notional JSX (≤5 updates/sec).
+    const [displayQuote, setDisplayQuote] = useState<{ bid: number; ask: number } | null>(() => {
+        const snap = getSafeOrderPanelLivePriceSnapshot(instrument.symbol);
+        const ready = (snap?.bid ?? 0) > 0 && (snap?.ask ?? 0) > 0;
+        return ready && snap ? { bid: snap.bid ?? 0, ask: snap.ask ?? 0 } : null;
+    });
+
+    const sellPriceRef = useRef<HTMLSpanElement>(null);
+    const buyPriceRef = useRef<HTMLSpanElement>(null);
+    const bidFlashOverlayRef = useRef<HTMLSpanElement>(null);
+    const askFlashOverlayRef = useRef<HTMLSpanElement>(null);
+    const latestSnapRef = useRef<LivePriceSnap>(undefined);
+    const liveQuoteReadyRef = useRef(false);
+    const lastDisplayQuoteAtRef = useRef(0);
+    const instrumentRef = useRef(instrument);
+    instrumentRef.current = instrument;
+
+    // Keep readiness ref in sync for the subscription callback.
+    liveQuoteReadyRef.current = liveQuoteReady;
+
     const liveInstrumentBid = instrument.quoteSource === 'live' && instrument.hasExecutableQuote === true && instrument.bid > 0 ? instrument.bid : 0;
     const liveInstrumentAsk = instrument.quoteSource === 'live' && instrument.hasExecutableQuote === true && instrument.ask > 0 ? instrument.ask : 0;
-    const liveBid = (rawLivePrice?.bid ?? 0) > 0 ? rawLivePrice?.bid ?? 0 : liveInstrumentBid;
-    const liveAsk = (rawLivePrice?.ask ?? 0) > 0 ? rawLivePrice?.ask ?? 0 : liveInstrumentAsk;
-    const hasLiveQuote = liveBid > 0 && liveAsk > 0;
-    const bid = hasLiveQuote ? liveBid : instrument.bid;
-    const ask = hasLiveQuote ? liveAsk : instrument.ask;
+    const hasInstrumentExecutableQuote = liveInstrumentBid > 0 && liveInstrumentAsk > 0;
+    const hasLiveQuote = liveQuoteReady || hasInstrumentExecutableQuote;
+    const liveBid = displayQuote && displayQuote.bid > 0
+        ? displayQuote.bid
+        : liveInstrumentBid;
+    const liveAsk = displayQuote && displayQuote.ask > 0
+        ? displayQuote.ask
+        : liveInstrumentAsk;
+    const bid = hasLiveQuote
+        ? (liveBid > 0 ? liveBid : liveInstrumentBid)
+        : instrument.bid;
+    const ask = hasLiveQuote
+        ? (liveAsk > 0 ? liveAsk : liveInstrumentAsk)
+        : instrument.ask;
     const volumeSpec = useMemo(() => {
         const min = toPositiveFinite(symbolSpec?.volumeMin, 0.01);
         const step = toPositiveFinite(symbolSpec?.volumeStep, min);
@@ -310,10 +360,71 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
         setVolume((current) => formatVolume(parseFloat(current), volumeSpec));
     }, [instrument.symbol, volumeSpec]);
 
-    // Auto-fill default SL and TP so the chart instantly shows all three lines
+    // Single subscription: DOM price text + flash restart; React only for readiness / throttled display.
     useEffect(() => {
-        if (!hasLiveQuote || activeAction === null) {
-            if (activeAction === null && lastInitializedSide !== null) {
+        // Force first displayQuote write after symbol switch (avoid stale throttled prices).
+        lastDisplayQuoteAtRef.current = 0;
+
+        const writeDisplayQuote = (snapBid: number, snapAsk: number) => {
+            setDisplayQuote((prev) => {
+                if (prev && prev.bid === snapBid && prev.ask === snapAsk) return prev;
+                return { bid: snapBid, ask: snapAsk };
+            });
+        };
+
+        const updateFromSnap = () => {
+            const snap = getSafeOrderPanelLivePriceSnapshot(instrument.symbol);
+            latestSnapRef.current = snap;
+
+            const inst = instrumentRef.current;
+            const fmt = (v: number) => (v > 0 ? v.toFixed(inst.digits) : '--');
+            const snapBid = snap?.bid ?? 0;
+            const snapAsk = snap?.ask ?? 0;
+            const snapLast = snap?.last ?? 0;
+            const ready = snapBid > 0 && snapAsk > 0;
+
+            if (sellPriceRef.current) {
+                sellPriceRef.current.textContent = fmt(getDisplayBid(snapBid, snapAsk, snapLast));
+            }
+            if (buyPriceRef.current) {
+                buyPriceRef.current.textContent = fmt(getDisplayAsk(snapBid, snapAsk, snapLast));
+            }
+
+            if (ready && snap) {
+                restartFlashOnOverlay(bidFlashOverlayRef.current, snap.bidDirection, 'bid');
+                restartFlashOnOverlay(askFlashOverlayRef.current, snap.askDirection, 'ask');
+            }
+
+            if (ready !== liveQuoteReadyRef.current) {
+                liveQuoteReadyRef.current = ready;
+                setLiveQuoteReady(ready);
+                if (ready) {
+                    lastDisplayQuoteAtRef.current = Date.now();
+                    writeDisplayQuote(snapBid, snapAsk);
+                } else {
+                    setDisplayQuote(null);
+                }
+                return;
+            }
+
+            if (ready) {
+                const now = Date.now();
+                if (now - lastDisplayQuoteAtRef.current >= DISPLAY_QUOTE_THROTTLE_MS) {
+                    lastDisplayQuoteAtRef.current = now;
+                    writeDisplayQuote(snapBid, snapAsk);
+                }
+            }
+        };
+
+        updateFromSnap();
+        return subscribeToLivePriceBySymbol(instrument.symbol, updateFromSnap);
+    }, [instrument.symbol]);
+
+    // Auto-fill default SL and TP so the chart instantly shows all three lines.
+    // Reads bid/ask from the latest snapshot ref — does NOT depend on per-tick prices.
+    useEffect(() => {
+        if (activeAction === null) {
+            if (lastInitializedSide !== null) {
                 setLastInitializedSide(null);
                 setTp('');
                 setSl('');
@@ -321,19 +432,36 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
             return;
         }
 
+        if (!liveQuoteReady && !hasInstrumentExecutableQuote) {
+            return;
+        }
+
         if (selectedSide !== lastInitializedSide) {
-            const entry = selectedSide === 'buy' ? ask : bid;
+            const snap = getSafeOrderPanelLivePriceSnapshot(instrument.symbol) ?? latestSnapRef.current;
+            const snapBid = (snap?.bid ?? 0) > 0 ? (snap?.bid ?? 0) : liveInstrumentBid;
+            const snapAsk = (snap?.ask ?? 0) > 0 ? (snap?.ask ?? 0) : liveInstrumentAsk;
+            const entry = selectedSide === 'buy' ? snapAsk : snapBid;
             if (entry > 0) {
                 const offset = entry * 0.003; // Default 0.3% offset
                 const defaultTp = selectedSide === 'buy' ? entry + offset : entry - offset;
                 const defaultSl = selectedSide === 'buy' ? entry - offset : entry + offset;
-                
+
                 setTp(defaultTp.toFixed(instrument.digits));
                 setSl(defaultSl.toFixed(instrument.digits));
                 setLastInitializedSide(selectedSide);
             }
         }
-    }, [selectedSide, lastInitializedSide, hasLiveQuote, ask, bid, instrument.digits, activeAction]);
+    }, [
+        selectedSide,
+        lastInitializedSide,
+        liveQuoteReady,
+        hasInstrumentExecutableQuote,
+        liveInstrumentBid,
+        liveInstrumentAsk,
+        instrument.symbol,
+        instrument.digits,
+        activeAction,
+    ]);
 
     // Sync local state to store so the chart draft order instantly mirrors these values
     useEffect(() => {
@@ -344,41 +472,11 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
         });
     }, [volume, sl, tp, updateOrderForm, volumeSpec]);
 
-    // Refs for zero-overhead bid/ask text updates — written directly in the
-    // subscription callback, bypassing React's render cycle entirely.
-    const sellPriceRef = useRef<HTMLSpanElement>(null);
-    const buyPriceRef = useRef<HTMLSpanElement>(null);
-    const instrumentRef = useRef(instrument);
-    instrumentRef.current = instrument;
-
-    useEffect(() => {
-        const updateFromSnap = () => {
-            const snap = getSafeOrderPanelLivePriceSnapshot(instrument.symbol);
-            if (!snap) return;
-            const inst = instrumentRef.current;
-            const fmt = (v: number) => v > 0 ? v.toFixed(inst.digits) : '--';
-            const snapBid = snap.bid ?? 0;
-            const snapAsk = snap.ask ?? 0;
-            const snapLast = snap.last ?? 0;
-            if (sellPriceRef.current) sellPriceRef.current.textContent = fmt(getDisplayBid(snapBid, snapAsk, snapLast));
-            if (buyPriceRef.current) buyPriceRef.current.textContent = fmt(getDisplayAsk(snapBid, snapAsk, snapLast));
-        };
-        updateFromSnap();
-        return subscribeToLivePriceBySymbol(instrument.symbol, updateFromSnap);
-    }, [instrument.symbol]);
-
     const isIndicativeQuote = !hasLiveQuote && instrument.quoteSource === 'ohlc';
     const isOneClickForm = formType === 'one-click';
     const canSubmitSideOrder = (_side: TradeSide) => hasLiveQuote;
     const canSubmitOrder = canSubmitSideOrder(selectedSide);
     const formatQuote = (value: number) => (value > 0 ? `${isIndicativeQuote ? '~' : ''}${value.toFixed(instrument.digits)}` : '--');
-    const bidDir = hasLiveQuote ? rawLivePrice?.bidDirection ?? instrument.bidDirection : undefined;
-    const askDir = hasLiveQuote ? rawLivePrice?.askDirection ?? instrument.askDirection : undefined;
-    const rawBidIsLive = (rawLivePrice?.bid ?? 0) > 0;
-    const rawAskIsLive = (rawLivePrice?.ask ?? 0) > 0;
-    const bidFlashClass = rawBidIsLive && bid > 0 ? getQuoteFlashClass(rawLivePrice?.bidDirection, 'bid') : '';
-    const askFlashClass = rawAskIsLive && ask > 0 ? getQuoteFlashClass(rawLivePrice?.askDirection, 'ask') : '';
-    const quoteFlashTickKey = rawLivePrice?.receivedSequence ?? rawLivePrice?.receivedAtMs ?? rawLivePrice?.time;
     const midpointPrice = bid > 0 && ask > 0
         ? (bid + ask) / 2
         : ask > 0
@@ -416,15 +514,9 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
     const estimatedFees = spread > 0
         ? spread * tradeVolume * contractSize
         : 0;
-    const quoteStatusLabel = hasLiveQuote
-        ? 'Live server quote'
-        : isIndicativeQuote
-            ? 'Indicative chart price'
-            : 'Awaiting live quote';
 
-    // dynamic sentiment combining 24h change and real-time tick jitter
+    // dynamic sentiment combining 24h change and throttled live-bid jitter
     const basePct = 50 + (instrument.changePercent * 10);
-    // Use the live bid price to create a fluctuating +/- 12% jitter
     const jitter = liveBid > 0 ? ((liveBid * 100000) % 24) - 12 : 0;
     const bullPct = Math.min(92, Math.max(8, basePct + jitter));
     const bearPct = 100 - bullPct;
@@ -519,10 +611,24 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
         return () => window.removeEventListener('terminal:drag-set-sl-tp', handler as EventListener);
     }, [instrument.symbol, instrument.digits]);
 
+    const readLatestExecutableQuote = () => {
+        const snap = getSafeOrderPanelLivePriceSnapshot(instrument.symbol) ?? latestSnapRef.current;
+        const snapBid = snap?.bid ?? 0;
+        const snapAsk = snap?.ask ?? 0;
+        if (snapBid > 0 && snapAsk > 0) {
+            return { bid: snapBid, ask: snapAsk, hasLive: true as const };
+        }
+        if (liveInstrumentBid > 0 && liveInstrumentAsk > 0) {
+            return { bid: liveInstrumentBid, ask: liveInstrumentAsk, hasLive: true as const };
+        }
+        return { bid: instrument.bid, ask: instrument.ask, hasLive: false as const };
+    };
+
     const adjustPrice = (type: 'tp' | 'sl' | 'pending', delta: number) => {
         const setters = { tp: setTp, sl: setSl, pending: setPendingPrice };
         const getters = { tp: tp, sl: sl, pending: pendingPrice };
-        const base = type === 'tp' ? ask : bid;
+        const quote = readLatestExecutableQuote();
+        const base = type === 'tp' ? quote.ask : quote.bid;
         const current = getters[type] ? parseFloat(getters[type]) : base;
         const next = current + delta * pipStep;
         setters[type](next.toFixed(instrument.digits));
@@ -541,6 +647,11 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
         side: TradeSide,
         options: { orderType?: 'market' | 'limit' | 'stop'; price?: number; tp?: number | null; sl?: number | null } = {},
     ) => {
+        // Hard gate: re-check live snapshot at submit time (do not trust stale React state).
+        const quote = readLatestExecutableQuote();
+        if (!quote.hasLive) {
+            return;
+        }
         if (!canSubmitSideOrder(side)) {
             return;
         }
@@ -747,9 +858,7 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
                         onClick={sellAction}
                         className={`min-w-0 flex-1 flex flex-col items-start justify-between px-2 py-2 pb-[13px] rounded-[4px] transition-all group relative border text-left ${sellClass}`}
                     >
-                        {bidFlashClass && (
-                            <span key={getQuoteFlashKey(instrument.symbol, 'bid', bid, quoteFlashTickKey)} className={`quote-flash-overlay ${bidFlashClass}`} />
-                        )}
+                        <span ref={bidFlashOverlayRef} className="quote-flash-overlay" />
                         <span className={`quote-flash-content text-[10px] font-semibold leading-none tracking-[0.04em] ${isFilled ? 'text-destructive' : selectedSide === 'sell' ? 'text-destructive' : 'text-destructive/70'}`}>
                             {isLimit ? 'Sell Limit' : 'SELL'}
                         </span>
@@ -769,9 +878,7 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
                         onClick={buyAction}
                         className={`min-w-0 flex-1 flex flex-col items-end justify-between px-2 py-2 pb-[13px] rounded-[4px] transition-all group relative border text-right ${buyClass}`}
                     >
-                        {askFlashClass && (
-                            <span key={getQuoteFlashKey(instrument.symbol, 'ask', ask, quoteFlashTickKey)} className={`quote-flash-overlay ${askFlashClass}`} />
-                        )}
+                        <span ref={askFlashOverlayRef} className="quote-flash-overlay" />
                         <span className={`quote-flash-content text-[10px] font-semibold leading-none tracking-[0.04em] ${isFilled ? 'text-success' : selectedSide === 'buy' ? 'text-success' : 'text-success/70'}`}>
                             {isLimit ? 'Buy Limit' : 'BUY'}
                         </span>
@@ -859,9 +966,7 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
                                     ? 'border-destructive/80 bg-destructive/5'
                                     : 'border-destructive/40 bg-transparent hover:border-destructive/60'}`}
                              onClick={() => setSelectedSide('sell')}>
-                            {bidFlashClass && (
-                                <span key={getQuoteFlashKey(instrument.symbol, 'bid', bid, quoteFlashTickKey)} className={`quote-flash-overlay ${bidFlashClass}`} />
-                            )}
+                            <span ref={bidFlashOverlayRef} className="quote-flash-overlay" />
                             <span className={`quote-flash-content text-[11px] font-medium leading-none tracking-wide uppercase ${selectedSide === 'sell' ? 'text-destructive' : 'text-destructive/70'}`}>Sell</span>
                             <span ref={sellPriceRef} className={`quote-flash-content w-full text-[15px] tabular-nums leading-none font-bold tracking-tight ${selectedSide === 'sell' ? 'text-destructive' : 'text-destructive/90'}`}>
                                 {formatQuote(bid)}
@@ -874,9 +979,7 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
                                     ? 'border-success/80 bg-success/5'
                                     : 'border-success/40 bg-transparent hover:border-success/60'}`}
                              onClick={() => setSelectedSide('buy')}>
-                            {askFlashClass && (
-                                <span key={getQuoteFlashKey(instrument.symbol, 'ask', ask, quoteFlashTickKey)} className={`quote-flash-overlay ${askFlashClass}`} />
-                            )}
+                            <span ref={askFlashOverlayRef} className="quote-flash-overlay" />
                             <span className={`quote-flash-content text-[11px] font-medium leading-none tracking-wide uppercase ${selectedSide === 'buy' ? 'text-success' : 'text-success/70'}`}>Buy</span>
                             <span ref={buyPriceRef} className={`quote-flash-content w-full text-right text-[15px] tabular-nums leading-none font-bold tracking-tight ${selectedSide === 'buy' ? 'text-success' : 'text-success/90'}`}>
                                 {formatQuote(ask)}

@@ -1111,8 +1111,8 @@ export const normalizeWebSocketUrl = (request: NextRequest): string => {
   const configured =
     process.env.RUST_GATEWAY_WS_URL?.trim() ||
     process.env.WS_BACKEND_URL?.trim() ||
-    process.env.CPP_REALTIME_WS_URL?.trim() ||
     process.env.NEXT_PUBLIC_WS_URL?.trim() ||
+    process.env.CPP_REALTIME_WS_URL?.trim() ||
     "ws://127.0.0.1:3003";
 
   if (configured.startsWith("ws://") || configured.startsWith("wss://")) {
@@ -1186,26 +1186,615 @@ const messageDataToString = async (data: unknown): Promise<string> => {
 const extractResponsePayload = (frame: JsonRecord): unknown =>
   frame.data ?? frame.payload ?? frame;
 
-const requestTerminalActionWithSessionToken = async <T = unknown>(
-  request: NextRequest,
+// ---------------------------------------------------------------------------
+// REST WebSocket keep-alive pool
+//
+// Replaces open→auth→action→close with reusable authenticated sockets.
+// Pool key is sha256(token)+'\0'+wsUrl so sockets are NEVER shared across tokens.
+// Concurrent actions multiplex on the same socket via requestId waiters.
+// ---------------------------------------------------------------------------
+
+const REST_WS_POOL_ENABLED =
+  parseOptionalBoolean(process.env.TERMINAL_REST_WS_POOL_ENABLED) ?? true;
+const REST_WS_POOL_IDLE_MS = (() => {
+  const parsed = parseOptionalInteger(process.env.TERMINAL_REST_WS_POOL_IDLE_MS);
+  return parsed !== undefined && parsed > 0 ? parsed : 45_000;
+})();
+const REST_WS_POOL_MAX_TOTAL = (() => {
+  const parsed = parseOptionalInteger(process.env.TERMINAL_REST_WS_POOL_MAX_TOTAL);
+  return parsed !== undefined && parsed > 0 ? parsed : 64;
+})();
+/** Soft cap of sockets per token+url key (multiplex handles concurrency). */
+const REST_WS_POOL_MAX_PER_KEY = 2;
+
+type RestWsPoolWaiter = {
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+  action: string;
+};
+
+type RestWsPoolEntry = {
+  key: string;
+  wsUrl: string;
+  socket: WebSocket;
+  authenticated: boolean;
+  /** Settles when auth succeeds or the socket dies during connect/auth. */
+  ready: Promise<void>;
+  waiters: Map<string, RestWsPoolWaiter>;
+  lastUsedAt: number;
+  idleTimer: ReturnType<typeof setTimeout> | null;
+  dead: boolean;
+};
+
+const restWsPoolByKey = new Map<string, RestWsPoolEntry[]>();
+
+const makeRestWsPoolKey = (token: string, wsUrl: string): string =>
+  `${sha256Hex(token)}\0${wsUrl}`;
+
+const countRestWsPoolSockets = (): number => {
+  let total = 0;
+  for (const entries of restWsPoolByKey.values()) {
+    total += entries.length;
+  }
+  return total;
+};
+
+const rejectRestWsPoolWaiters = (entry: RestWsPoolEntry, error: Error): void => {
+  for (const waiter of entry.waiters.values()) {
+    clearTimeout(waiter.timer);
+    waiter.reject(error);
+  }
+  entry.waiters.clear();
+};
+
+const removeRestWsPoolEntryFromMap = (entry: RestWsPoolEntry): void => {
+  const list = restWsPoolByKey.get(entry.key);
+  if (!list) {
+    return;
+  }
+
+  const next = list.filter((candidate) => candidate !== entry);
+  if (next.length === 0) {
+    restWsPoolByKey.delete(entry.key);
+  } else {
+    restWsPoolByKey.set(entry.key, next);
+  }
+};
+
+/** Tear down a pooled socket: reject waiters, remove from map, close. */
+const destroyRestWsPoolEntry = (entry: RestWsPoolEntry, error?: Error): void => {
+  if (entry.dead) {
+    return;
+  }
+
+  entry.dead = true;
+  if (entry.idleTimer) {
+    clearTimeout(entry.idleTimer);
+    entry.idleTimer = null;
+  }
+
+  removeRestWsPoolEntryFromMap(entry);
+
+  rejectRestWsPoolWaiters(
+    entry,
+    error ??
+      new TerminalBridgeError(
+        "Terminal WebSocket pool socket closed.",
+        502,
+        "TERMINAL_WS_CLOSED",
+      ),
+  );
+
+  try {
+    // Only close if the runtime still considers it open/connecting.
+    if (
+      entry.socket.readyState === WebSocket.CONNECTING ||
+      entry.socket.readyState === WebSocket.OPEN
+    ) {
+      entry.socket.close();
+    }
+  } catch {
+    // Best effort cleanup only.
+  }
+};
+
+/** Auth failure must evict every socket for that token+url key. */
+const evictRestWsPoolKey = (key: string, error: Error): void => {
+  const list = [...(restWsPoolByKey.get(key) ?? [])];
+  for (const entry of list) {
+    destroyRestWsPoolEntry(entry, error);
+  }
+};
+
+/** After the last in-flight waiter settles, close the socket if it stays idle. */
+const scheduleRestWsPoolIdleClose = (entry: RestWsPoolEntry): void => {
+  if (entry.dead || entry.waiters.size > 0) {
+    return;
+  }
+
+  if (entry.idleTimer) {
+    clearTimeout(entry.idleTimer);
+  }
+
+  entry.idleTimer = setTimeout(() => {
+    entry.idleTimer = null;
+    if (!entry.dead && entry.waiters.size === 0) {
+      destroyRestWsPoolEntry(entry);
+    }
+  }, REST_WS_POOL_IDLE_MS);
+};
+
+const touchRestWsPoolEntry = (entry: RestWsPoolEntry): void => {
+  entry.lastUsedAt = Date.now();
+  if (entry.idleTimer) {
+    clearTimeout(entry.idleTimer);
+    entry.idleTimer = null;
+  }
+};
+
+/** Evict oldest idle sockets until under the global cap (soft ~64). */
+const evictRestWsPoolLruIdle = (): void => {
+  while (countRestWsPoolSockets() >= REST_WS_POOL_MAX_TOTAL) {
+    let victim: RestWsPoolEntry | null = null;
+    for (const entries of restWsPoolByKey.values()) {
+      for (const entry of entries) {
+        if (entry.dead || entry.waiters.size > 0) {
+          continue;
+        }
+        if (!victim || entry.lastUsedAt < victim.lastUsedAt) {
+          victim = entry;
+        }
+      }
+    }
+
+    if (!victim) {
+      break;
+    }
+
+    destroyRestWsPoolEntry(victim);
+  }
+};
+
+const isRestWsPoolSocketUsable = (entry: RestWsPoolEntry): boolean =>
+  !entry.dead &&
+  (entry.socket.readyState === WebSocket.CONNECTING ||
+    entry.socket.readyState === WebSocket.OPEN);
+
+/**
+ * Connect + auth once. Message routing multiplexes later actions by requestId.
+ * Token is sent only inside the auth frame — never logged.
+ */
+const createRestWsPoolEntry = (
+  key: string,
   token: string,
-  action: string,
-  data?: JsonRecord,
-  timeoutMs = DEFAULT_WS_TIMEOUT_MS,
-  wsUrlOverride?: string,
-): Promise<T> => {
-  const wsUrl = wsUrlOverride ?? normalizeWebSocketUrl(request);
-
+  wsUrl: string,
+): RestWsPoolEntry => {
+  const socket = new WebSocket(wsUrl);
   const authRequestId = nextRequestId("auth");
-  const actionRequestId = nextRequestId(action);
 
-  if (typeof WebSocket !== "function") {
+  let resolveReady!: () => void;
+  let rejectReady!: (error: Error) => void;
+  let readySettled = false;
+
+  const ready = new Promise<void>((resolve, reject) => {
+    resolveReady = () => {
+      if (readySettled) {
+        return;
+      }
+      readySettled = true;
+      resolve();
+    };
+    rejectReady = (error: Error) => {
+      if (readySettled) {
+        return;
+      }
+      readySettled = true;
+      reject(error);
+    };
+  });
+  // Avoid unhandled rejection if acquire races with a fast failure.
+  ready.catch(() => {});
+
+  const entry: RestWsPoolEntry = {
+    key,
+    wsUrl,
+    socket,
+    authenticated: false,
+    ready,
+    waiters: new Map(),
+    lastUsedAt: Date.now(),
+    idleTimer: null,
+    dead: false,
+  };
+
+  const list = restWsPoolByKey.get(key) ?? [];
+  list.push(entry);
+  restWsPoolByKey.set(key, list);
+
+  socket.addEventListener("open", () => {
+    try {
+      socket.send(
+        JSON.stringify({
+          action: "auth_with_token",
+          requestId: authRequestId,
+          data: { token },
+        }),
+      );
+    } catch {
+      const error = new TerminalBridgeError(
+        `Failed to send auth on terminal WebSocket ${wsUrl}.`,
+        502,
+        "TERMINAL_WS_SEND_FAILED",
+      );
+      rejectReady(error);
+      destroyRestWsPoolEntry(entry, error);
+    }
+  });
+
+  socket.addEventListener("error", () => {
+    console.error("[terminal-ws-bridge] pooled WS error event:", wsUrl);
+    const error = new TerminalBridgeError(
+      `Failed to connect to terminal WebSocket ${wsUrl}.`,
+      502,
+      "TERMINAL_WS_CONNECT_FAILED",
+    );
+    rejectReady(error);
+    destroyRestWsPoolEntry(entry, error);
+  });
+
+  socket.addEventListener("close", (event) => {
+    const closeInfo = `code=${(event as CloseEvent).code ?? "?"} reason=${(event as CloseEvent).reason ?? ""}`;
+    // Skip noisy log when we closed the socket ourselves (idle eviction / destroy).
+    if (!entry.dead) {
+      console.error("[terminal-ws-bridge] pooled WS close event:", wsUrl, closeInfo);
+    }
+    const error = new TerminalBridgeError(
+      `Terminal WebSocket closed unexpectedly (${closeInfo}).`,
+      502,
+      "TERMINAL_WS_CLOSED",
+    );
+    rejectReady(error);
+    destroyRestWsPoolEntry(entry, error);
+  });
+
+  socket.addEventListener("message", (event) => {
+    void (async () => {
+      let frame: unknown;
+      try {
+        frame = JSON.parse(await messageDataToString(event.data)) as unknown;
+      } catch (parseError) {
+        const error = new TerminalBridgeError(
+          parseError instanceof Error ? parseError.message : "Invalid WebSocket JSON frame.",
+          502,
+          "TERMINAL_WS_INVALID_FRAME",
+        );
+        rejectReady(error);
+        destroyRestWsPoolEntry(entry, error);
+        return;
+      }
+
+      if (!isRecord(frame)) {
+        return;
+      }
+
+      const requestId = typeof frame.requestId === "string" ? frame.requestId : "";
+      const errorRecord = isRecord(frame.error) ? frame.error : null;
+
+      // Auth handshake (one-shot per pooled socket).
+      if (!entry.authenticated && (!requestId || requestId === authRequestId)) {
+        if (errorRecord) {
+          console.error(
+            "[terminal-ws-bridge] 502 auth error frame from gateway:",
+            JSON.stringify({
+              wsUrl,
+              requestId,
+              errorCode: errorRecord.code,
+              errorMessage: errorRecord.message,
+              frameKeys: Object.keys(frame),
+            }),
+          );
+          const error = new TerminalBridgeError(
+            typeof errorRecord.message === "string"
+              ? errorRecord.message
+              : "Terminal WebSocket authentication failed.",
+            502,
+            typeof errorRecord.code === "string" ? errorRecord.code : "TERMINAL_WS_AUTH_FAILED",
+            frame,
+          );
+          rejectReady(error);
+          // Never reuse a key that failed auth (token may be invalid/expired).
+          evictRestWsPoolKey(key, error);
+          return;
+        }
+
+        if (requestId === authRequestId) {
+          entry.authenticated = true;
+          resolveReady();
+          // No waiters yet is common; arm idle close until the first action lands.
+          scheduleRestWsPoolIdleClose(entry);
+        }
+        return;
+      }
+
+      // Ignore unsolicited frames that do not match an in-flight waiter.
+      if (!requestId) {
+        return;
+      }
+
+      const waiter = entry.waiters.get(requestId);
+      if (!waiter) {
+        return;
+      }
+
+      entry.waiters.delete(requestId);
+      clearTimeout(waiter.timer);
+      touchRestWsPoolEntry(entry);
+
+      if (errorRecord) {
+        console.error(
+          "[terminal-ws-bridge] 502 error frame from gateway:",
+          JSON.stringify({
+            wsUrl,
+            action: waiter.action,
+            requestId,
+            errorCode: errorRecord.code,
+            errorMessage: errorRecord.message,
+            frameKeys: Object.keys(frame),
+          }),
+        );
+        waiter.reject(
+          new TerminalBridgeError(
+            typeof errorRecord.message === "string"
+              ? errorRecord.message
+              : "Terminal WebSocket returned an error.",
+            502,
+            typeof errorRecord.code === "string" ? errorRecord.code : "TERMINAL_WS_ERROR",
+            frame,
+          ),
+        );
+      } else {
+        waiter.resolve(extractResponsePayload(frame));
+      }
+
+      scheduleRestWsPoolIdleClose(entry);
+    })();
+  });
+
+  return entry;
+};
+
+const isRestWsPoolTimeoutError = (error: unknown): error is TerminalBridgeError =>
+  error instanceof TerminalBridgeError && error.code === "TERMINAL_WS_TIMEOUT";
+
+const buildRestWsPoolTimeoutError = (action?: string): TerminalBridgeError =>
+  new TerminalBridgeError(
+    action
+      ? `${action} timed out while waiting for the terminal WebSocket response.`
+      : "Terminal WebSocket connect/auth timed out while waiting for the terminal WebSocket response.",
+    504,
+    "TERMINAL_WS_TIMEOUT",
+  );
+
+/**
+ * Await connect+auth (`entry.ready`) with a hard timeout.
+ * On timeout: mark entry dead, close socket, remove from pool, reject waiters.
+ */
+const awaitRestWsPoolReady = async (
+  entry: RestWsPoolEntry,
+  timeoutMs: number,
+  action?: string,
+): Promise<void> => {
+  if (timeoutMs <= 0) {
+    const error = buildRestWsPoolTimeoutError(action);
+    destroyRestWsPoolEntry(entry, error);
+    throw error;
+  }
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      entry.ready,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          const error = buildRestWsPoolTimeoutError(action);
+          // Stuck connect/auth must not leave a zombie socket in the pool.
+          destroyRestWsPoolEntry(entry, error);
+          reject(error);
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+};
+
+/**
+ * Acquire an open+authenticated pooled socket for this token+url.
+ * Reuses when possible; otherwise connects and auths once.
+ * `timeoutMs` bounds connect+auth so acquire cannot hang forever.
+ */
+const acquireRestWsPoolEntry = async (
+  token: string,
+  wsUrl: string,
+  timeoutMs: number = DEFAULT_WS_TIMEOUT_MS,
+  action?: string,
+): Promise<RestWsPoolEntry> => {
+  const key = makeRestWsPoolKey(token, wsUrl);
+  const startedAt = Date.now();
+  const remainingMs = (): number => Math.max(0, timeoutMs - (Date.now() - startedAt));
+
+  const tryExisting = async (): Promise<RestWsPoolEntry | null> => {
+    const entries = restWsPoolByKey.get(key) ?? [];
+
+    // Prefer already-authenticated open sockets (multiplex concurrent requestIds).
+    for (const entry of entries) {
+      if (
+        !entry.dead &&
+        entry.authenticated &&
+        entry.socket.readyState === WebSocket.OPEN
+      ) {
+        touchRestWsPoolEntry(entry);
+        return entry;
+      }
+    }
+
+    // Wait on a socket still connecting/authenticating rather than opening extras.
+    const pending = entries.filter(isRestWsPoolSocketUsable);
+    if (pending.length > 0) {
+      // Prefer the least-loaded socket when multiple are in flight.
+      pending.sort((a, b) => a.waiters.size - b.waiters.size);
+      const entry = pending[0]!;
+      touchRestWsPoolEntry(entry);
+      try {
+        await awaitRestWsPoolReady(entry, remainingMs(), action);
+      } catch (error) {
+        // Hard budget exceeded — do not fall through to open another socket.
+        if (isRestWsPoolTimeoutError(error)) {
+          throw error;
+        }
+        // Auth/connect failure: allow caller to create a replacement.
+        return null;
+      }
+      if (!entry.dead && entry.authenticated && entry.socket.readyState === WebSocket.OPEN) {
+        touchRestWsPoolEntry(entry);
+        return entry;
+      }
+    }
+
+    return null;
+  };
+
+  const existing = await tryExisting();
+  if (existing) {
+    return existing;
+  }
+
+  const liveForKey = (restWsPoolByKey.get(key) ?? []).filter(isRestWsPoolSocketUsable);
+  if (liveForKey.length >= REST_WS_POOL_MAX_PER_KEY) {
+    // At per-key cap: wait on the least-loaded live socket instead of opening another.
+    liveForKey.sort((a, b) => a.waiters.size - b.waiters.size);
+    const entry = liveForKey[0]!;
+    touchRestWsPoolEntry(entry);
+    try {
+      await awaitRestWsPoolReady(entry, remainingMs(), action);
+      if (!entry.dead && entry.authenticated && entry.socket.readyState === WebSocket.OPEN) {
+        touchRestWsPoolEntry(entry);
+        return entry;
+      }
+    } catch (error) {
+      // Hard budget exceeded — surface timeout (do not open another socket).
+      if (isRestWsPoolTimeoutError(error)) {
+        throw error;
+      }
+      // Auth/connect failure — fall through and create a replacement (mirrors tryExisting).
+    }
+    // Socket died while waiting — fall through and create a replacement.
+  }
+
+  evictRestWsPoolLruIdle();
+
+  const entry = createRestWsPoolEntry(key, token, wsUrl);
+  try {
+    await awaitRestWsPoolReady(entry, remainingMs(), action);
+  } catch (error) {
+    if (error instanceof TerminalBridgeError) {
+      throw error;
+    }
     throw new TerminalBridgeError(
-      "Server WebSocket runtime is unavailable. Use Node 22+ or test this action in Postman WebSocket.",
-      500,
-      "SERVER_WEBSOCKET_UNAVAILABLE",
+      `Failed to authenticate terminal WebSocket ${wsUrl}.`,
+      502,
+      "TERMINAL_WS_AUTH_FAILED",
+      error,
     );
   }
+
+  if (entry.dead || !entry.authenticated || entry.socket.readyState !== WebSocket.OPEN) {
+    throw new TerminalBridgeError(
+      `Failed to authenticate terminal WebSocket ${wsUrl}.`,
+      502,
+      "TERMINAL_WS_AUTH_FAILED",
+    );
+  }
+
+  touchRestWsPoolEntry(entry);
+  return entry;
+};
+
+/** Send an action on a pooled socket and wait for the matching requestId. */
+const requestTerminalActionViaPool = async <T = unknown>(
+  token: string,
+  action: string,
+  data: JsonRecord | undefined,
+  timeoutMs: number,
+  wsUrl: string,
+): Promise<T> => {
+  // Bound total connect+auth+action time like the one-shot path.
+  const startedAt = Date.now();
+  const entry = await acquireRestWsPoolEntry(token, wsUrl, timeoutMs, action);
+  const actionTimeoutMs = Math.max(0, timeoutMs - (Date.now() - startedAt));
+  if (actionTimeoutMs <= 0) {
+    throw buildRestWsPoolTimeoutError(action);
+  }
+
+  const actionRequestId = nextRequestId(action);
+
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      // Timed-out waiter is dropped; socket stays up for other requestIds.
+      entry.waiters.delete(actionRequestId);
+      scheduleRestWsPoolIdleClose(entry);
+      reject(buildRestWsPoolTimeoutError(action));
+    }, actionTimeoutMs);
+
+    entry.waiters.set(actionRequestId, {
+      resolve: (value) => resolve(value as T),
+      reject,
+      timer,
+      action,
+    });
+
+    touchRestWsPoolEntry(entry);
+
+    try {
+      entry.socket.send(
+        JSON.stringify({
+          action,
+          requestId: actionRequestId,
+          data: data ?? {},
+        }),
+      );
+    } catch (sendError) {
+      entry.waiters.delete(actionRequestId);
+      clearTimeout(timer);
+      const error = new TerminalBridgeError(
+        sendError instanceof Error
+          ? sendError.message
+          : `Failed to send ${action} on terminal WebSocket.`,
+        502,
+        "TERMINAL_WS_SEND_FAILED",
+      );
+      destroyRestWsPoolEntry(entry, error);
+      reject(error);
+    }
+  });
+};
+
+/**
+ * Legacy one-shot path: open → auth → action → close.
+ * Used when TERMINAL_REST_WS_POOL_ENABLED=false.
+ */
+const requestTerminalActionOneShot = async <T = unknown>(
+  wsUrl: string,
+  token: string,
+  action: string,
+  data: JsonRecord | undefined,
+  timeoutMs: number,
+): Promise<T> => {
+  const authRequestId = nextRequestId("auth");
+  const actionRequestId = nextRequestId(action);
 
   return new Promise<T>((resolve, reject) => {
     const socket = new WebSocket(wsUrl);
@@ -1280,7 +1869,6 @@ const requestTerminalActionWithSessionToken = async <T = unknown>(
       );
     });
 
-
     socket.addEventListener("message", (event) => {
       void (async () => {
         let frame: unknown;
@@ -1339,6 +1927,32 @@ const requestTerminalActionWithSessionToken = async <T = unknown>(
       })();
     });
   });
+};
+
+const requestTerminalActionWithSessionToken = async <T = unknown>(
+  request: NextRequest,
+  token: string,
+  action: string,
+  data?: JsonRecord,
+  timeoutMs = DEFAULT_WS_TIMEOUT_MS,
+  wsUrlOverride?: string,
+): Promise<T> => {
+  const wsUrl = wsUrlOverride ?? normalizeWebSocketUrl(request);
+
+  if (typeof WebSocket !== "function") {
+    throw new TerminalBridgeError(
+      "Server WebSocket runtime is unavailable. Use Node 22+ or test this action in Postman WebSocket.",
+      500,
+      "SERVER_WEBSOCKET_UNAVAILABLE",
+    );
+  }
+
+  // Pool off → preserve historical one-shot open/auth/action/close behavior.
+  if (!REST_WS_POOL_ENABLED) {
+    return requestTerminalActionOneShot<T>(wsUrl, token, action, data, timeoutMs);
+  }
+
+  return requestTerminalActionViaPool<T>(token, action, data, timeoutMs, wsUrl);
 };
 
 export const requestTerminalAction = async <T = unknown>(
@@ -1784,11 +2398,21 @@ export const requestTerminalOhlcGapRepair = async (
     }
 
     if (!shouldRepairTerminalOhlcHistory(probe)) {
+      const bars = extractOhlcResponseBars(probePayload);
+      if (bars && bars.length > 0 && normalized.requestType !== "get_before") {
+        try {
+          const redisKey = `market:history:${normalized.symbol}:${normalized.timeframeMinutes}`;
+          await redisCache.set(redisKey, JSON.stringify(bars), "EX", 86400);
+        } catch (e) {
+          console.error(`[terminal-ws-bridge] Redis cache write failed for ${normalized.symbol}:`, e);
+        }
+      }
       return {
         ...probe,
         accountId,
         checkedAt: new Date().toISOString(),
         probe,
+        ...(bars && bars.length > 0 ? { bars } : {}),
       };
     }
 

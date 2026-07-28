@@ -35,7 +35,6 @@ import {
     getLivePriceSnapshotBySymbol,
     seedOhlcClosePrice,
     subscribeToLivePriceBySymbol,
-    usePriceBySymbol,
     useWebtraderStore,
 } from '@/store/webtrader-store';
 import { useChartSettingsStore } from '@/store/chart-settings-store';
@@ -56,6 +55,10 @@ import {
     buildCompactSeriesEntries,
     getCompactSeriesTime,
 } from '@/lib/terminal/compact-series-time';
+import {
+    getTerminalChartSwitchSeed,
+    precomputeTerminalChartSwitchSeed,
+} from '@/lib/terminal/chart-switch-seed-cache';
 import {
     applyPriceToCandleSeries,
     getLiveQuoteEventTime,
@@ -119,6 +122,8 @@ interface KlineChartContainerProps {
     chartBarSpacing?: number | null;
     onChartBarSpacingChange?: (barSpacing: number) => void;
     showTitle?: boolean;
+    /** Primary pane runs the full history pipeline; secondary panes stay cache/live-light. */
+    isPrimaryPane?: boolean;
 }
 
 type ResolutionOption = ChartResolutionOption;
@@ -126,16 +131,101 @@ type ResolutionOption = ChartResolutionOption;
 interface AtomicChartSwitchSeed {
     streamKey: string;
     bars: OHLCBar[];
+    preparedAtMs: number;
+    source: 'layout-seed';
+    hasLivePriceSeed: boolean;
 }
 
 const RESOLUTIONS: ResolutionOption[] = DEFAULT_CHART_RESOLUTIONS;
 
+function isChartPerfDebugEnabled(): boolean {
+    if (process.env.NODE_ENV === 'production' || typeof window === 'undefined') {
+        return false;
+    }
+
+    try {
+        return new URLSearchParams(window.location.search).get('chartPerfDebug') === '1';
+    } catch {
+        return false;
+    }
+}
+
+function markChartSwitchPerf(label: string, detail?: Record<string, unknown>) {
+    if (!isChartPerfDebugEnabled() || typeof window === 'undefined' || !window.performance?.mark) {
+        return;
+    }
+
+    const markName = `yopips:chart-switch:${label}`;
+    try {
+        window.performance.mark(markName, detail ? { detail } : undefined);
+    } catch {
+        window.performance.mark(markName);
+    }
+    console.debug('[ChartPerf]', label, detail ?? {});
+}
+
+function scheduleChartBackgroundTask(callback: () => void, timeout = 250): () => void {
+    if (typeof window === 'undefined') {
+        callback();
+        return () => {};
+    }
+
+    const idleWindow = window as Window & {
+        requestIdleCallback?: (callback: () => void, options?: { timeout?: number }) => number;
+        cancelIdleCallback?: (handle: number) => void;
+    };
+    let cancelled = false;
+    let frameId: number | null = null;
+    let idleId: number | null = null;
+
+    frameId = window.requestAnimationFrame(() => {
+        frameId = null;
+        const run = () => {
+            if (!cancelled) {
+                callback();
+            }
+        };
+
+        if (idleWindow.requestIdleCallback) {
+            idleId = idleWindow.requestIdleCallback(run, { timeout });
+            return;
+        }
+
+        frameId = window.requestAnimationFrame(run);
+    });
+
+    return () => {
+        cancelled = true;
+        if (frameId !== null) {
+            window.cancelAnimationFrame(frameId);
+        }
+        if (idleId !== null) {
+            idleWindow.cancelIdleCallback?.(idleId);
+        }
+    };
+}
+
 const CHART_HISTORY_TARGET_BARS = 1000;
 const MAX_RENDERED_OHLC_BARS = 1000;
-const MAX_SCROLLBACK_RENDERED_OHLC_BARS = 1000;
+const MAX_SCROLLBACK_RENDERED_OHLC_BARS = 5000;
 const LIVE_CANDLE_ROLLOVER_POLL_MS = 1000;
 const LIVE_CANDLE_ROLLOVER_MAX_SNAPSHOT_AGE_MS = 5 * 60 * 1000;
-const LIVE_CANDLE_ROLLOVER_MAX_CATCHUP_BARS = 600;
+const CLOSED_MARKET_LIVE_QUOTE_STALE_MS = 5 * 60 * 1000;
+const CRYPTO_SYMBOL_PREFIXES = [
+    'BTC',
+    'XBT',
+    'ETH',
+    'LTC',
+    'XRP',
+    'ADA',
+    'BNB',
+    'SOL',
+    'DOGE',
+    'DOT',
+    'AVAX',
+    'LINK',
+    'MATIC',
+] as const;
 const LIVE_QUOTE_FALLBACK_MAX_SINGLE_MOVE_RATIO = 0.012;
 const LIVE_QUOTE_FALLBACK_MAX_STORED_EXTREME_RATIO = 0.015;
 const MAX_INITIAL_VISIBLE_BARS = GLOBAL_CHART_VIEWPORT.initialVisibleBars;
@@ -304,6 +394,39 @@ function normalizeTimestampMs(timeValue: unknown): number | null {
 
     const dateValue = new Date(String(timeValue)).getTime();
     return Number.isNaN(dateValue) || dateValue <= 0 ? null : dateValue;
+}
+
+function getFreshnessTimestampMsFromLiveSnapshot(snapshot: unknown): number | null {
+    if (!snapshot || typeof snapshot !== 'object') {
+        return null;
+    }
+
+    const source = snapshot as Record<string, unknown>;
+    return normalizeTimestampMs(
+        source.receivedAtMs ??
+        source.received_at_ms ??
+        source.server_received_msc ??
+        source.serverReceivedMsc ??
+        source.server_time_msc ??
+        source.serverTimeMsc ??
+        source.mt5_time_msc ??
+        source.mt5TimeMsc ??
+        source.time,
+    );
+}
+
+function normalizeSymbolForMarketClass(value: string): string {
+    return value.trim().replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+}
+
+function isCryptoMarketSymbol(symbol: string, category?: string | null): boolean {
+    const normalizedCategory = category?.trim().toLowerCase() ?? '';
+    if (normalizedCategory.includes('crypto')) {
+        return true;
+    }
+
+    const normalizedSymbol = normalizeSymbolForMarketClass(symbol);
+    return CRYPTO_SYMBOL_PREFIXES.some((prefix) => normalizedSymbol.startsWith(prefix));
 }
 
 function normalizeOptionalHistoryUnixMs(value: unknown): number | undefined {
@@ -608,10 +731,13 @@ function repairImplausibleSameBucketLiveRange(
 function alignLiveBarOpenToPreviousClose(
     bar: OHLCBar,
     previousBar: OHLCBar | null | undefined,
+    bucketMs?: number,
 ): OHLCBar {
     if (
         !previousBar ||
+        (!isOpenLiveTickBar(bar) && bar.closed !== false) ||
         bar.time <= previousBar.time ||
+        (bucketMs !== undefined && bucketMs > 0 && bar.time - previousBar.time > bucketMs) ||
         !Number.isFinite(previousBar.close) ||
         previousBar.close <= 0
     ) {
@@ -631,9 +757,13 @@ function alignLiveBarOpenToPreviousClose(
     };
 }
 
-function alignOpenGapsToPreviousClose(bars: OHLCBar[]): OHLCBar[] {
+function alignOpenGapsToPreviousClose(bars: OHLCBar[], bucketMs?: number): OHLCBar[] {
     return bars.map((bar, index) =>
-        alignLiveBarOpenToPreviousClose(bar, index > 0 ? bars[index - 1] : null),
+        alignLiveBarOpenToPreviousClose(
+            bar,
+            index > 0 ? bars[index - 1] : null,
+            bucketMs,
+        ),
     );
 }
 
@@ -760,11 +890,32 @@ function preferRealBar(
         if (existingIsLive !== incomingIsLive && existingIsHistorical !== incomingIsHistorical) {
             const historicalBar = existingIsHistorical ? existing : incoming;
             const liveBar = existingIsLive ? existing : incoming;
+            // Same-bucket tip: always blend live close into the forming candle.
+            // Do not freeze on historical close when wall-clock/closed flags lag.
+            const sameBucket =
+                historicalBar.time === liveBar.time
+                || historicalBar.time === existing.time
+                || liveBar.time === existing.time;
+            const liveIsOpenTip = liveBar.closed !== true;
+            if (sameBucket && liveIsOpenTip) {
+                return {
+                    ...liveBar,
+                    time: existing.time,
+                    open: historicalBar.open,
+                    high: Math.max(historicalBar.high, liveBar.high, liveBar.close),
+                    low: Math.min(historicalBar.low, liveBar.low, liveBar.close),
+                    close: liveBar.close,
+                    volume: Math.max(historicalBar.volume, liveBar.volume),
+                    closed: false,
+                    derived: undefined,
+                    continuity: undefined,
+                    isContinuity: undefined,
+                    basis: undefined,
+                    cached: undefined,
+                };
+            }
+
             if (!isClosedBucket(historicalBar, bucketMs)) {
-                // Open bucket: history has the correct bucket open and all ticks since
-                // the minute started; live has the latest close price.
-                // Blend them: use history's open/range/volume as the base and
-                // live's close as the most recent price.
                 return {
                     ...liveBar,
                     time: existing.time,
@@ -1003,6 +1154,11 @@ function isLikelyMarketClosed(latestBarTimeMs: number): boolean {
     // Generic holiday: >20h gap on any weekday = market holiday, not a data bug
     return hoursSinceLastBar > 20;
 }
+
+const isWeekendUtc = (): boolean => {
+    const day = new Date().getUTCDay();
+    return day === 0 || day === 6;
+};
 
 function shouldRetryHistoryBackfill(stats: HistoryBarStats, bucketMs: number): boolean {
     if (stats.totalBars === 0) {
@@ -1255,7 +1411,9 @@ function KlineChartContainer({
     chartBarSpacing,
     onChartBarSpacingChange,
     showTitle: showTitleProp,
+    isPrimaryPane = true,
 }: KlineChartContainerProps) {
+    const isSecondaryPane = isPrimaryPane === false;
     const showTitleStore = useChartSettingsStore((state) => state.showTitle);
     const showTitle = showTitleProp !== undefined ? showTitleProp : showTitleStore;
     const showChartValues = useChartSettingsStore((state) => state.showChartValues);
@@ -1274,6 +1432,7 @@ function KlineChartContainer({
     const showTickVolumes = useChartSettingsStore((state) => state.showTickVolumes);
     const showRealVolumes = useChartSettingsStore((state) => state.showRealVolumes);
     const tradingSessionId = useWebtraderStore((state) => state.session?.id?.trim() || null);
+    const storeSymbols = useWebtraderStore((state) => state.symbols);
     const normalizedAccountSessionScopeId = accountSessionScopeId?.trim() || null;
     const syntheticMarketDataEnabled = shouldAllowSyntheticMarketData();
     const getResolutionFromMinutes = useCallback((minutes: number | null | undefined) => (
@@ -1340,6 +1499,8 @@ function KlineChartContainer({
     const fallbackLiveAxisPriceRef = useRef<number | null>(null);
     const livePriceRef = useRef<number | null>(null);
     const preferredLiveAxisPriceRef = useRef<number | null>(null);
+    /** Timestamp of last accepted real OHLC live bar apply; used to gate quote→body. */
+    const lastOhlcLiveBarAtMsRef = useRef(0);
     const updateLivePriceOverlayRef = useRef<(() => void) | null>(null);
     const manualPriceRangeRef = useRef<{ minValue: number; maxValue: number } | null>(null);
     const positionsRef = useRef(positions);
@@ -1426,22 +1587,17 @@ function KlineChartContainer({
     const effectiveBasePrice = useMemo(() => {
         return basePrice && basePrice > 0 ? basePrice : inferSeedPrice(symbol);
     }, [basePrice, symbol]);
-    // Subscribe internally so the live price axis updates without re-rendering the parent chain.
-    const internalLivePrice = usePriceBySymbol(symbol);
-    const normalizedPreferredLiveAxisPrice = useMemo(() => {
-        // Prop takes precedence (allows parent override); fall back to internal subscription.
-        const candidate = typeof preferredLiveAxisPrice === 'number' && preferredLiveAxisPrice > 0
-            ? preferredLiveAxisPrice
-            : (internalLivePrice?.bid ?? 0) > 0
-                ? internalLivePrice!.bid
-                : (internalLivePrice?.ask ?? 0) > 0
-                    ? internalLivePrice!.ask
-                    : null;
-
-        return typeof candidate === 'number' && Number.isFinite(candidate) && candidate > 0
-            ? candidate
-            : null;
-    }, [preferredLiveAxisPrice, internalLivePrice]);
+    const selectedStoreSymbol = useMemo(
+        () => storeSymbols.find((entry) => symbolsMatch(entry.name, symbol)),
+        [storeSymbols, symbol],
+    );
+    const selectedSymbolIsCrypto = useMemo(
+        () => isCryptoMarketSymbol(
+            selectedStoreSymbol?.name ?? symbol,
+            selectedStoreSymbol?.category,
+        ),
+        [selectedStoreSymbol?.category, selectedStoreSymbol?.name, symbol],
+    );
 
     const resolveLiveAxisPrice = useCallback((fallbackPrice?: number | null) => {
         const preferredPrice = preferredLiveAxisPriceRef.current;
@@ -1460,11 +1616,31 @@ function KlineChartContainer({
         return null;
     }, []);
 
+    // Imperative live-price axis sync — avoids React re-renders on every tick.
+    // MUST use the same price basis as the forming candle tip (getLiveQuotePrice = mid/last),
+    // not bid-only. Bid-only made the dashed line sit away from candle close (e.g. 63899 vs 63904).
     useEffect(() => {
-        preferredLiveAxisPriceRef.current = normalizedPreferredLiveAxisPrice;
-        livePriceRef.current = resolveLiveAxisPrice(fallbackLiveAxisPriceRef.current);
-        updateLivePriceOverlayRef.current?.();
-    }, [normalizedPreferredLiveAxisPrice, resolveLiveAxisPrice]);
+        const syncAxisFromSnapshot = () => {
+            let candidate: number | null = null;
+            if (typeof preferredLiveAxisPrice === 'number' && preferredLiveAxisPrice > 0) {
+                candidate = preferredLiveAxisPrice;
+            } else {
+                const snap = getLivePriceSnapshotBySymbol(symbol);
+                candidate = snap ? getLiveQuotePrice(snap) : null;
+            }
+            preferredLiveAxisPriceRef.current =
+                typeof candidate === 'number' && Number.isFinite(candidate) && candidate > 0
+                    ? candidate
+                    : null;
+            // Prefer live quote for the overlay; fall back to last candle close.
+            livePriceRef.current =
+                preferredLiveAxisPriceRef.current
+                ?? resolveLiveAxisPrice(fallbackLiveAxisPriceRef.current);
+            updateLivePriceOverlayRef.current?.();
+        };
+        syncAxisFromSnapshot();
+        return subscribeToLivePriceBySymbol(symbol, syncAxisFromSnapshot);
+    }, [symbol, preferredLiveAxisPrice, resolveLiveAxisPrice]);
 
     const markChartHasCandles = useCallback(() => {
         if (isLoadingRef.current) {
@@ -1527,28 +1703,57 @@ function KlineChartContainer({
             return;
         }
 
+        let deferredSwitchVolumeFrame: number | null = null;
         const bucketMs = selectedResolution.minutes * 60 * 1000;
+        const chartDataStreamKey = [
+            normalizedAccountSessionScopeId ?? 'terminal',
+            symbol.trim().toUpperCase(),
+            selectedResolution.minutes,
+        ].join(':');
+        markChartSwitchPerf('layout-seed:start', {
+            streamKey: chartDataStreamKey,
+            symbol,
+            timeframeMinutes: selectedResolution.minutes,
+        });
+        const prewarmedSwitchSeed = getTerminalChartSwitchSeed(
+            normalizedAccountSessionScopeId,
+            symbol,
+            selectedResolution.minutes,
+        );
+        const cachedSeedBars = prewarmedSwitchSeed?.bars ?? ohlcService.getSyncBars(
+            symbol,
+            selectedResolution.minutes,
+            normalizedAccountSessionScopeId,
+        );
         const cachedBars = normalizeChartBars(
-            ohlcService
-                .getSyncBars(symbol, selectedResolution.minutes, normalizedAccountSessionScopeId)
-                .filter((bar) =>
-                    isRenderableCachedOrHistoricalBar(bar) &&
-                    isRealMarketBar(bar) &&
-                    isBarInsideChartSymbolPriceDomain(symbol, bar),
-                ),
+            cachedSeedBars.filter((bar) =>
+                isRenderableCachedOrHistoricalBar(bar) &&
+                isRealMarketBar(bar) &&
+                isBarInsideChartSymbolPriceDomain(symbol, bar),
+            ),
             bucketMs,
             LIVE_FIRST_SYMBOL_SWITCH_HISTORY_BARS,
         );
         const barsByTime = new Map(cachedBars.map((bar) => [bar.time, { ...bar }]));
         const snapshot = getLivePriceSnapshotBySymbol(symbol);
         const livePrice = snapshot ? getLiveQuotePrice(snapshot) : null;
+        const hasLivePriceSeed = livePrice !== null && Number.isFinite(livePrice) && livePrice > 0;
 
-        if (livePrice !== null && Number.isFinite(livePrice) && livePrice > 0) {
+        const hasHistoricalSwitchSeed = cachedBars.length > 0;
+
+        if (hasHistoricalSwitchSeed && hasLivePriceSeed) {
             const eventTime = getLiveQuoteEventTime(snapshot!, Date.now());
             const liveBucketTime = bucketTimeMs(eventTime, bucketMs);
             const sameBucketBar = barsByTime.get(liveBucketTime);
             const previousBar = cachedBars[cachedBars.length - 1];
-            const liveOpen = sameBucketBar?.open ?? previousBar?.close ?? livePrice;
+            const previousBarIsAdjacent = Boolean(
+                previousBar &&
+                liveBucketTime > previousBar.time &&
+                liveBucketTime - previousBar.time <= bucketMs,
+            );
+            const liveOpen = sameBucketBar?.open
+                ?? (previousBarIsAdjacent ? previousBar?.close : livePrice)
+                ?? livePrice;
             const liveBar: OHLCBar = {
                 ...(sameBucketBar ?? {}),
                 symbol,
@@ -1579,6 +1784,7 @@ function KlineChartContainer({
                 ),
                 LIVE_FIRST_SYMBOL_SWITCH_HISTORY_BARS,
             ),
+            bucketMs,
         );
         const compactEntries = buildCompactSeriesEntries(
             switchBars,
@@ -1592,6 +1798,11 @@ function KlineChartContainer({
         };
 
         mainSeries.applyOptions({ priceFormat });
+        markChartSwitchPerf('first-setData:start', {
+            streamKey: chartDataStreamKey,
+            bars: compactEntries.length,
+            chartType,
+        });
         if (chartType === 'Line') {
             mainSeries.setData(compactEntries.map(({ bar, seriesTime }) =>
                 toLineData(bar, seriesTime),
@@ -1604,38 +1815,97 @@ function KlineChartContainer({
                 return candle;
             }));
         }
+        markChartSwitchPerf('first-setData:end', {
+            streamKey: chartDataStreamKey,
+            bars: compactEntries.length,
+        });
 
         const visualVolumeMax = getVisualVolumeScaleMax(switchBars.map((bar) => bar.volume));
-        volumeSeries.setData(compactEntries.map(({ bar, seriesTime }) =>
+        const switchVolumeData = compactEntries.map(({ bar, seriesTime }) =>
             toVolumeData(bar, palette, seriesTime, visualVolumeMax),
-        ));
+        );
+        deferredSwitchVolumeFrame = window.requestAnimationFrame(() => {
+            deferredSwitchVolumeFrame = null;
+            if (atomicChartSwitchSeedRef.current?.streamKey !== chartDataStreamKey) {
+                return;
+            }
+
+            try {
+                volumeSeries.setData(switchVolumeData);
+                markChartSwitchPerf('volume-setData:deferred', {
+                    streamKey: chartDataStreamKey,
+                    bars: switchVolumeData.length,
+                });
+            } catch {
+                // The passive chart controller may have rebound the series.
+            }
+        });
 
         const latestBar = switchBars[switchBars.length - 1] ?? null;
         currentBarRef.current = latestBar;
         lastBarTimeRef.current = latestBar?.time ?? 0;
         fallbackLiveAxisPriceRef.current = latestBar?.close ?? null;
         livePriceRef.current = resolveLiveAxisPrice(latestBar?.close ?? null);
-        const chartDataStreamKey = [
-            normalizedAccountSessionScopeId ?? 'terminal',
-            symbol.trim().toUpperCase(),
-            selectedResolution.minutes,
-        ].join(':');
+        updateLivePriceOverlayRef.current?.();
         lastAppliedChartDataStreamKeyRef.current = chartDataStreamKey;
-        atomicChartSwitchSeedRef.current = {
-            streamKey: chartDataStreamKey,
-            bars: switchBars.map((bar) => ({ ...bar })),
-        };
-
         if (latestBar) {
+            atomicChartSwitchSeedRef.current = {
+                streamKey: chartDataStreamKey,
+                bars: switchBars.map((bar) => ({ ...bar })),
+                preparedAtMs: performance.now(),
+                source: 'layout-seed',
+                hasLivePriceSeed,
+            };
+            precomputeTerminalChartSwitchSeed({
+                accountSessionScopeId: normalizedAccountSessionScopeId,
+                symbol,
+                timeframeMinutes: selectedResolution.minutes,
+                bars: switchBars,
+                limit: LIVE_FIRST_SYMBOL_SWITCH_HISTORY_BARS,
+            });
             setNoDataMessage(null);
             setActiveBarIfChanged(latestBar);
             markChartHasCandles();
+            markChartSwitchPerf('first-visible-candle', {
+                streamKey: chartDataStreamKey,
+                time: latestBar.time,
+                close: latestBar.close,
+                bars: switchBars.length,
+            });
             try {
                 chart.timeScale().scrollToPosition(getPreferredRightOffset(), false);
             } catch {
                 // The chart can be disposed during an account/session replacement.
             }
+        } else {
+            try {
+                volumeSeries.setData([]);
+            } catch {
+                // The passive chart controller may have rebound the series.
+            }
+            atomicChartSwitchSeedRef.current = null;
+            currentBarRef.current = null;
+            lastBarTimeRef.current = 0;
+            fallbackLiveAxisPriceRef.current = null;
+            livePriceRef.current = resolveLiveAxisPrice(null);
+            updateLivePriceOverlayRef.current?.();
+            setNoDataMessage(null);
+            setActiveBarIfChanged(null);
+            setIsLoading(true);
         }
+
+        markChartSwitchPerf('layout-seed:end', {
+            streamKey: chartDataStreamKey,
+            bars: switchBars.length,
+            hasLivePriceSeed,
+            seedSource: prewarmedSwitchSeed ? 'prewarmed' : 'sync-cache',
+        });
+
+        return () => {
+            if (deferredSwitchVolumeFrame !== null) {
+                window.cancelAnimationFrame(deferredSwitchVolumeFrame);
+            }
+        };
     }, [
         chartType,
         getPreferredRightOffset,
@@ -1835,29 +2105,35 @@ function KlineChartContainer({
         }
     }, []);
 
+    const syncPositionLinesTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
     const clearPositionLines = useCallback(() => {
+        if (syncPositionLinesTimeoutRef.current) {
+            clearTimeout(syncPositionLinesTimeoutRef.current);
+            syncPositionLinesTimeoutRef.current = null;
+        }
         positionDragCleanupRef.current?.();
         positionDragCleanupRef.current = null;
         clearPositionLineOverlays();
 
         const mainSeries = mainSeriesRef.current;
-        if (!mainSeries) {
-            priceLinesRef.current = [];
-            return;
-        }
         for (const line of priceLinesRef.current) {
-            try { mainSeries.removePriceLine(line); } catch { /* series already disposed */ }
+            if (mainSeries) {
+                try { mainSeries.removePriceLine(line); } catch { /* series already disposed */ }
+            }
         }
         priceLinesRef.current = [];
 
-        // Also clear persistent lines
-        for (const [id, state] of persistentPositionLinesRef.current.entries()) {
-            try { mainSeries.removePriceLine(state.mainLine); } catch { }
-            if (state.slLine) try { mainSeries.removePriceLine(state.slLine); } catch { }
-            if (state.tpLine) try { mainSeries.removePriceLine(state.tpLine); } catch { }
-            state.mainOverlay.remove();
-            state.slOverlay?.remove();
-            state.tpOverlay?.remove();
+        // Also clear persistent lines (and DOM overlays even if the series is gone).
+        for (const [, state] of persistentPositionLinesRef.current.entries()) {
+            if (mainSeries) {
+                try { mainSeries.removePriceLine(state.mainLine); } catch { }
+                if (state.slLine) try { mainSeries.removePriceLine(state.slLine); } catch { }
+                if (state.tpLine) try { mainSeries.removePriceLine(state.tpLine); } catch { }
+            }
+            try { state.mainOverlay.remove(); } catch { }
+            try { state.slOverlay?.remove(); } catch { }
+            try { state.tpOverlay?.remove(); } catch { }
         }
         persistentPositionLinesRef.current.clear();
     }, [clearPositionLineOverlays]);
@@ -1990,11 +2266,10 @@ function KlineChartContainer({
         window.addEventListener('pointerup', onPointerUp);
     }, [palette.down, palette.up, pricePrecision, updatePositionLineOverlays]);
 
-    const syncPositionLinesTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-
     const syncPositionLines = useCallback(() => {
+        // Always reschedule so the latest call wins (e.g. symbol switch after a prior tick).
         if (syncPositionLinesTimeoutRef.current) {
-            return; // Already scheduled, throttle it
+            clearTimeout(syncPositionLinesTimeoutRef.current);
         }
 
         syncPositionLinesTimeoutRef.current = setTimeout(() => {
@@ -2652,6 +2927,8 @@ function KlineChartContainer({
             symbol,
             timeframeMinutes: selectedResolution.minutes,
         };
+        // Reset OHLC freshness so quote→body is not gated by a previous symbol/timeframe.
+        lastOhlcLiveBarAtMsRef.current = 0;
         const isActiveRenderedChartSwitch = () => (
             !disposed &&
             activeChartSwitchRef.current.id === chartSwitchId &&
@@ -2682,20 +2959,31 @@ function KlineChartContainer({
         const atomicSwitchSeedBars = atomicSwitchSeed?.bars ?? [];
         const hasAtomicSwitchSeed = atomicSwitchSeedBars.length > 0;
         const prepaintBucketMs = selectedResolution.minutes * 60 * 1000;
-        const syncSeedBars = ohlcService.getSyncBars(
-            symbol,
-            selectedResolution.minutes,
-            normalizedAccountSessionScopeId,
-        );
-        const renderableSyncSeedBars = syncSeedBars.filter((bar) =>
-            isRenderableCachedOrHistoricalBar(bar) &&
-            isBarInsideChartSymbolPriceDomain(symbol, bar),
-        );
-        const syncSeedMetadata = ohlcService.getHistoryMetadata(
-            symbol,
-            selectedResolution.minutes,
-            normalizedAccountSessionScopeId,
-        );
+        markChartSwitchPerf('hydrate:start', {
+            streamKey: chartDataStreamKey,
+            hasAtomicSwitchSeed,
+            atomicBars: atomicSwitchSeedBars.length,
+        });
+        const syncSeedBars = hasAtomicSwitchSeed
+            ? atomicSwitchSeedBars
+            : ohlcService.getSyncBars(
+                symbol,
+                selectedResolution.minutes,
+                normalizedAccountSessionScopeId,
+            );
+        const renderableSyncSeedBars = hasAtomicSwitchSeed
+            ? atomicSwitchSeedBars
+            : syncSeedBars.filter((bar) =>
+                isRenderableCachedOrHistoricalBar(bar) &&
+                isBarInsideChartSymbolPriceDomain(symbol, bar),
+            );
+        const syncSeedMetadata = hasAtomicSwitchSeed
+            ? undefined
+            : ohlcService.getHistoryMetadata(
+                symbol,
+                selectedResolution.minutes,
+                normalizedAccountSessionScopeId,
+            );
         const syncSeedBaselineDecision = getLatestCleanHistoryBaselineDecision(
             renderableSyncSeedBars,
             [],
@@ -3113,13 +3401,45 @@ function KlineChartContainer({
         wrapper.appendChild(livePriceHit);
         livePriceHitRef.current = livePriceHit;
 
+        // Non-crypto weekend = always closed (even if a stale last quote looks "fresh").
+        // Weekday: closed if bar is stale/holiday AND no fresh live quote.
+        const hasFreshLiveQuoteForRollover = (): boolean => {
+            const snapshot = getLivePriceSnapshotBySymbol(symbol);
+            const snapshotPrice = snapshot ? getLiveQuotePrice(snapshot) : null;
+            if (snapshotPrice === null || !Number.isFinite(snapshotPrice) || snapshotPrice <= 0) {
+                return false;
+            }
+
+            const freshnessTimeMs = getFreshnessTimestampMsFromLiveSnapshot(snapshot);
+            return freshnessTimeMs !== null
+                && Date.now() - freshnessTimeMs <= CLOSED_MARKET_LIVE_QUOTE_STALE_MS;
+        };
+        const shouldFreezeLiveTipForClosedMarket = (latestRealMarketTimeMs?: number): boolean => {
+            if (selectedSymbolIsCrypto) return false;
+            if (isWeekendUtc()) return true;
+            const t = latestRealMarketTimeMs
+                ?? (currentBarRef.current ? getBarSourceTimeMs(currentBarRef.current) : 0)
+                ?? lastBarTimeRef.current
+                ?? 0;
+            return t > 0 && isLikelyMarketClosed(t) && !hasFreshLiveQuoteForRollover();
+        };
+        const shouldPauseFrontendRolloverForClosedMarket = (
+            latestRealMarketTimeMs: number,
+        ): boolean => shouldFreezeLiveTipForClosedMarket(latestRealMarketTimeMs);
+
         const updateLivePriceOverlay = () => {
             const line = livePriceLineRef.current;
             const badge = livePriceBadgeRef.current;
             const hit = livePriceHitRef.current;
             const series = mainSeriesRef.current;
-            const price = livePriceRef.current;
             if (!line || !badge || !hit || !series) return;
+            if (shouldFreezeLiveTipForClosedMarket()) {
+                line.style.display = 'none';
+                badge.style.display = 'none';
+                hit.style.display = 'none';
+                return;
+            }
+            const price = livePriceRef.current;
             if (price == null) {
                 line.style.display = 'none';
                 badge.style.display = 'none';
@@ -4012,6 +4332,7 @@ function KlineChartContainer({
         let liveRenderFrame: number | null = null;
         let progressiveHistorySeedFrame: number | null = null;
         let historicalCacheRenderFrame: number | null = null;
+        let cancelInitialHistoryHydrate: (() => void) | null = null;
         let cachedHostHeight = 0;         // refreshed on resize, avoids clientHeight layout-thrash per frame
         let noDataShown = false;          // gate: only dispatch setNoDataMessage when state actually changes
         let lastPositionOverlayMs = 0;    // throttle position overlay updates to â‰¤ 30fps in live path
@@ -4129,27 +4450,30 @@ function KlineChartContainer({
 
             return symbolCandidates.some((candidate) => symbolsMatch(candidate, currentSymbol));
         };
-        const unsubscribeHistoryMetadata = ohlcService.addOhlcHistoryMetadataListener((
-            metadataSymbol,
-            timeframe,
-            metadata,
-        ) => {
-            if (!isCurrentChartSwitch() || !isMatchingHistoryMetadata(metadataSymbol, timeframe, metadata)) {
-                return;
-            }
-
-            latestHistoryMetadata = metadata;
-            if (metadata.event === 'ohlc_history_refreshed') {
-                recentHistoryMetadataWindows.push({ metadata, observedAt: Date.now() });
-                pruneRecentHistoryMetadataWindows();
-                if (!latestHistoryGapCatchUpInFlightGate.inFlight) {
-                    latestHistoryGapCatchUpInFlightGate.begin();
-                    void loadHistory(true, isHistoryLoaded ? 'preserve-visible' : undefined).finally(() => {
-                        latestHistoryGapCatchUpInFlightGate.finish(!isCurrentChartSwitch(), scheduleLatestHistoryGapCatchUp);
-                    });
+        // Secondary panes skip metadata-driven history reloads — primary owns the cascade.
+        const unsubscribeHistoryMetadata = isSecondaryPane
+            ? () => {}
+            : ohlcService.addOhlcHistoryMetadataListener((
+                metadataSymbol,
+                timeframe,
+                metadata,
+            ) => {
+                if (!isCurrentChartSwitch() || !isMatchingHistoryMetadata(metadataSymbol, timeframe, metadata)) {
+                    return;
                 }
-            }
-        });
+
+                latestHistoryMetadata = metadata;
+                if (metadata.event === 'ohlc_history_refreshed') {
+                    recentHistoryMetadataWindows.push({ metadata, observedAt: Date.now() });
+                    pruneRecentHistoryMetadataWindows();
+                    if (!latestHistoryGapCatchUpInFlightGate.inFlight) {
+                        latestHistoryGapCatchUpInFlightGate.begin();
+                        void loadHistory(true, isHistoryLoaded ? 'preserve-visible' : undefined).finally(() => {
+                            latestHistoryGapCatchUpInFlightGate.finish(!isCurrentChartSwitch(), scheduleLatestHistoryGapCatchUp);
+                        });
+                    }
+                }
+            });
         const shouldMergeOlderHistoryUpdate = (bar: OHLCBar, renderedLatestTime = 0) => {
             if (!isRealMarketBar(bar) || isOpenLiveTickBar(bar)) {
                 return false;
@@ -4560,7 +4884,8 @@ function KlineChartContainer({
         };
 
         const scheduleHistoryLoadWhenRealtimeReady = () => {
-            if (!isCurrentChartSwitch() || isHistoryLoaded || historyReadinessRetryRequested) {
+            // Secondary panes never re-enter the staged loadHistory cascade.
+            if (isSecondaryPane || !isCurrentChartSwitch() || isHistoryLoaded || historyReadinessRetryRequested) {
                 return;
             }
 
@@ -4588,6 +4913,13 @@ function KlineChartContainer({
             stats: HistoryBarStats,
             historySeedApplied = hasRenderedHistorySeed,
         ) => {
+            if (isSecondaryPane) {
+                if (historySeedApplied) {
+                    setHistoryBackfillMessage(null);
+                }
+                return false;
+            }
+
             const shouldRetry = !historySeedApplied || shouldRetryHistoryBackfill(stats, bucketMs);
             if (
                 !isCurrentChartSwitch() ||
@@ -4622,6 +4954,10 @@ function KlineChartContainer({
             return true;
         };
         const ensureHistoryCatchUpRetry = (stats: HistoryBarStats) => {
+            if (isSecondaryPane) {
+                return false;
+            }
+
             const retryScheduled = scheduleHistoryBackfillRetry(stats);
             if (retryScheduled) {
                 return true;
@@ -4632,6 +4968,7 @@ function KlineChartContainer({
 
         const scheduleDeferredHistoryBackfill = (hasMoreHistoryPotential: boolean) => {
             if (
+                isSecondaryPane ||
                 !isCurrentChartSwitch() ||
                 !hasMoreHistoryPotential ||
                 deferredBackfillScheduled ||
@@ -4665,7 +5002,7 @@ function KlineChartContainer({
         };
 
         function requestLatestHistoryGapFill(layoutMode: DataLayoutMode = 'preserve-or-follow-latest') {
-            if (!isCurrentChartSwitch()) {
+            if (isSecondaryPane || !isCurrentChartSwitch()) {
                 return false;
             }
 
@@ -4721,6 +5058,7 @@ function KlineChartContainer({
 
         function scheduleLatestHistoryGapCatchUp() {
             if (
+                isSecondaryPane ||
                 !isCurrentChartSwitch() ||
                 latestHistoryGapCatchUpAttempts >= MAX_BACKGROUND_HISTORY_BACKFILL_ATTEMPTS
             ) {
@@ -4815,14 +5153,51 @@ function KlineChartContainer({
             const wasPinnedBeforeLiveAppend = isPinnedToLatest();
             const seriesTime = getNextSeriesTimeForLiveBar(liveBar);
             const previousDisplayBar = displayBarsBySeriesTime.get(seriesTime) ?? null;
-            let displayLiveBar = options.replaceSameBucketRange && previousDisplayBar?.time === liveBar.time
-                ? liveBar
-                : preferRealBar(previousDisplayBar ?? undefined, liveBar, bucketMs);
-            displayLiveBar = blendDisplayedBarWithOpenLiveTick(
-                previousDisplayBar,
-                liveBar,
-                displayLiveBar,
-            );
+            // Forming tip: always take live close/high/low. preferRealBar/history merge
+            // was freezing the last candle body when a closed/historical tip bar won.
+            const isOpenLiveTip =
+                liveBar.closed !== true
+                && (
+                    options.replaceSameBucketRange
+                    || isOpenLiveTickBar(liveBar)
+                    || isLiveTickBar(liveBar)
+                    || (typeof liveBar.source === 'string' && /tick|quote|rust_realtime/i.test(liveBar.source))
+                );
+            let displayLiveBar: OHLCBar;
+            if (
+                isOpenLiveTip
+                && previousDisplayBar
+                && previousDisplayBar.time === liveBar.time
+            ) {
+                const liveClose = liveBar.close;
+                displayLiveBar = {
+                    ...previousDisplayBar,
+                    ...liveBar,
+                    time: previousDisplayBar.time,
+                    open: previousDisplayBar.open > 0 ? previousDisplayBar.open : liveBar.open,
+                    high: Math.max(previousDisplayBar.high, liveBar.high, liveClose),
+                    low: Math.min(previousDisplayBar.low, liveBar.low, liveClose),
+                    close: liveClose,
+                    volume: Math.max(previousDisplayBar.volume || 0, liveBar.volume || 0),
+                    closed: false,
+                    source: liveBar.source ?? previousDisplayBar.source ?? 'mt5_tick',
+                    sourceTimeMs: liveBar.sourceTimeMs ?? previousDisplayBar.sourceTimeMs,
+                    derived: undefined,
+                    continuity: undefined,
+                    isContinuity: undefined,
+                    basis: undefined,
+                    cached: undefined,
+                };
+            } else if (options.replaceSameBucketRange && previousDisplayBar?.time === liveBar.time) {
+                displayLiveBar = liveBar;
+            } else {
+                displayLiveBar = preferRealBar(previousDisplayBar ?? undefined, liveBar, bucketMs);
+                displayLiveBar = blendDisplayedBarWithOpenLiveTick(
+                    previousDisplayBar,
+                    liveBar,
+                    displayLiveBar,
+                );
+            }
             const previousLatestSeriesTime = previousLastBarTime > 0
                 ? realTimeToSeriesTime.get(previousLastBarTime)
                 : undefined;
@@ -4831,7 +5206,23 @@ function KlineChartContainer({
                 previousRenderedBar = displayBarsBySeriesTime.get(previousLatestSeriesTime) ?? null;
             }
             previousRenderedBar = previousRenderedBar ?? currentBarRef.current;
-            displayLiveBar = alignLiveBarOpenToPreviousClose(displayLiveBar, previousRenderedBar);
+            // Keep historical open for continuity, but never let this erase a fresher live close.
+            const openAligned = alignLiveBarOpenToPreviousClose(
+                displayLiveBar,
+                previousRenderedBar,
+                bucketMs,
+            );
+            if (isOpenLiveTip && previousDisplayBar?.time === liveBar.time) {
+                displayLiveBar = {
+                    ...openAligned,
+                    close: liveBar.close,
+                    high: Math.max(openAligned.high, liveBar.high, liveBar.close),
+                    low: Math.min(openAligned.low, liveBar.low, liveBar.close),
+                    closed: false,
+                };
+            } else {
+                displayLiveBar = openAligned;
+            }
             const repairedDisplayLiveBar = repairImplausibleSameBucketLiveRange(
                 displayLiveBar,
                 liveBar,
@@ -4839,11 +5230,19 @@ function KlineChartContainer({
             );
             if (repairedDisplayLiveBar.repaired) {
                 displayLiveBar = repairedDisplayLiveBar.bar;
+                // Preserve live close after repair clamps (repair only targets polluted extremes).
+                if (isOpenLiveTip) {
+                    displayLiveBar = {
+                        ...displayLiveBar,
+                        close: liveBar.close,
+                        high: Math.max(displayLiveBar.high, liveBar.close),
+                        low: Math.min(displayLiveBar.low, liveBar.close),
+                    };
+                }
                 liveBarsByTime.set(displayLiveBar.time, displayLiveBar);
             }
-            const isCommittedSeriesTime = latestCommittedSeriesTime !== null &&
-                seriesTime <= latestCommittedSeriesTime;
-            if (hasSameOhlcvValues(previousDisplayBar, displayLiveBar) && isCommittedSeriesTime) {
+            // Always paint when tip close/high/low moved — even if series time is "committed".
+            if (hasSameOhlcvValues(previousDisplayBar, displayLiveBar)) {
                 return false;
             }
 
@@ -4875,7 +5274,9 @@ function KlineChartContainer({
             }
             currentBarRef.current = displayLiveBar;
             fallbackLiveAxisPriceRef.current = displayLiveBar.close;
-            livePriceRef.current = resolveLiveAxisPrice(displayLiveBar.close);
+            // Keep overlay price = tip close so the dashed line tracks the last candle.
+            preferredLiveAxisPriceRef.current = displayLiveBar.close;
+            livePriceRef.current = displayLiveBar.close;
             hasRenderedAnyCandles = true;
             if (gracefulLoadingTimerRef.current !== null) {
                 clearTimeout(gracefulLoadingTimerRef.current);
@@ -4914,6 +5315,11 @@ function KlineChartContainer({
             if (!isActiveRenderedChartSwitch()) {
                 return;
             }
+            if (shouldFreezeLiveTipForClosedMarket()) {
+                // Keep last history tip; hide dashed live line/badge while closed.
+                updateLivePriceOverlay();
+                return;
+            }
 
             const snapshot = getLivePriceSnapshotBySymbol(symbol);
             const snapshotLivePrice = snapshot ? getLiveQuotePrice(snapshot) : null;
@@ -4932,6 +5338,22 @@ function KlineChartContainer({
             const livePrice = snapshotLivePrice ?? (
                 options.allowWallClockRollover ? fallbackRolloverPrice : null
             );
+
+            // Skip only when the tip candle already reflects this live price (OHLC or a
+            // prior quote already applied it). Never block quotes solely because an OHLC
+            // bar arrived recently — that froze the forming candle when OHLC lag/stale
+            // timestamps skipped intermediate price moves.
+            if (
+                !options.allowWallClockRollover
+                && latestRenderedBar
+                && typeof livePrice === 'number'
+                && Number.isFinite(livePrice)
+                && livePrice > 0
+                && Number.isFinite(latestRenderedBar.close)
+                && Math.abs(latestRenderedBar.close - livePrice) < Math.max(1e-12, Math.abs(livePrice) * 1e-12)
+            ) {
+                return;
+            }
 
             if (livePrice === null || !Number.isFinite(livePrice) || livePrice <= 0) {
                 return;
@@ -4959,20 +5381,83 @@ function KlineChartContainer({
                 ? currentBucketTime
                 : snapshotTime;
             const eventBucketTime = bucketTimeMs(eventTime, bucketMs);
-            if (eventBucketTime <= 0) {
+            if (eventBucketTime <= 0 && !(previousLastBarTime > 0)) {
                 return;
             }
 
-            const targetTime = previousLastBarTime > 0 && eventBucketTime < previousLastBarTime
-                ? previousLastBarTime
-                : eventBucketTime;
-            const targetSeriesTime = realTimeToSeriesTime.get(targetTime);
-            const previousSameBucketBar =
-                liveBarsByTime.get(targetTime) ??
-                (targetSeriesTime !== undefined ? displayBarsBySeriesTime.get(targetSeriesTime) : undefined) ??
-                (latestRenderedBar?.time === targetTime ? latestRenderedBar : null);
-            const candleBase = previousSameBucketBar ?? latestRenderedBar;
+            // Always mutate the *rendered tip bar* (by map identity), not a possibly
+            // stale previousLastBarTime that can diverge from the series tip.
+            const tipBar =
+                currentBarRef.current
+                ?? (latestSeriesTime !== null ? displayBarsBySeriesTime.get(latestSeriesTime) : null)
+                ?? latestRenderedBar
+                ?? null;
+
+            const targetTime = shouldRollToCurrentBucket
+                ? currentBucketTime
+                : (tipBar && tipBar.time > 0)
+                    ? tipBar.time
+                    : previousLastBarTime > 0
+                        ? previousLastBarTime
+                        : eventBucketTime > 0
+                            ? eventBucketTime
+                            : currentBucketTime;
+            if (targetTime <= 0) {
+                return;
+            }
+
             const volumeIncrement = snapshot ? getLiveQuoteVolumeIncrement(snapshot) : 1;
+
+            // Fast path: force tip OHLC from the SAME live price as the dashed line.
+            if (tipBar && tipBar.time === targetTime && !shouldRollToCurrentBucket) {
+                const open = tipBar.open > 0 ? tipBar.open : livePrice;
+                const forcedTipBar: OHLCBar = {
+                    ...tipBar,
+                    symbol,
+                    timeframeMinutes: selectedResolution.minutes,
+                    time: tipBar.time,
+                    open,
+                    high: Math.max(tipBar.high || open, open, livePrice),
+                    low: Math.min(
+                        tipBar.low > 0 ? tipBar.low : open,
+                        open,
+                        livePrice,
+                    ),
+                    close: livePrice,
+                    // Tick volume accumulates (MT5-style); do not freeze at 1.
+                    volume: Math.max(0, (tipBar.volume || 0)) + Math.max(1, volumeIncrement),
+                    source: 'mt5_tick',
+                    sourceTimeMs: Number.isFinite(snapshotTime) && snapshotTime > 0 ? snapshotTime : nowMs,
+                    closed: false,
+                    derived: undefined,
+                    continuity: undefined,
+                    isContinuity: undefined,
+                    basis: undefined,
+                    cached: undefined,
+                };
+                if (!isBarInsideChartSymbolPriceDomain(symbol, forcedTipBar)) {
+                    return;
+                }
+                const liveBar = cacheLiveBar(forcedTipBar, {
+                    replaceExisting: true,
+                });
+                if (!liveBar) {
+                    return;
+                }
+                const applied = applyLiveBarToRenderedSeries(liveBar, previousLastBarTime, {
+                    replaceSameBucketRange: true,
+                });
+                if (applied) {
+                    // Keep dashed price line glued to candle close.
+                    fallbackLiveAxisPriceRef.current = livePrice;
+                    preferredLiveAxisPriceRef.current = livePrice;
+                    livePriceRef.current = livePrice;
+                    updateLivePriceOverlayRef.current?.();
+                }
+                return;
+            }
+
+            const candleBase = tipBar ?? latestRenderedBar;
             if (!candleBase) {
                 const provisionalLiveBar: OHLCBar = {
                     symbol,
@@ -4993,83 +5478,46 @@ function KlineChartContainer({
                 }
 
                 const liveBar = cacheLiveBar(provisionalLiveBar, {
-                    skipSanity: true,
+                    replaceExisting: true,
                 });
                 if (!liveBar) {
                     return;
                 }
 
-                applyLiveBarToRenderedSeries(liveBar, previousLastBarTime);
+                applyLiveBarToRenderedSeries(liveBar, previousLastBarTime, {
+                    replaceSameBucketRange: true,
+                });
                 return;
             }
-            const updatedSeries = applyPriceToCandleSeries(
-                [candleBase],
-                livePrice,
-                pricePrecision,
-                selectedResolution.minutes,
-                eventTime,
-                volumeIncrement,
-                2,
-            );
-            const updatedCandle = updatedSeries[updatedSeries.length - 1];
-            if (!updatedCandle) {
-                return;
-            }
-            const liveQuoteReferencePrice =
-                previousSameBucketBar?.close ??
-                latestRenderedBar?.close ??
-                updatedCandle.open;
-            if (
-                isImplausibleLiveQuoteFallbackMove(
-                    liveQuoteReferencePrice,
-                    livePrice,
-                    LIVE_QUOTE_FALLBACK_MAX_SINGLE_MOVE_RATIO,
-                )
-            ) {
-                return;
-            }
-            const previousHighLooksPolluted = Boolean(
-                previousSameBucketBar &&
-                previousSameBucketBar.high > Math.max(previousSameBucketBar.open, previousSameBucketBar.close, livePrice) &&
-                isImplausibleLiveQuoteFallbackMove(
-                    liveQuoteReferencePrice,
-                    previousSameBucketBar.high,
-                    LIVE_QUOTE_FALLBACK_MAX_STORED_EXTREME_RATIO,
-                ),
-            );
-            const previousLowLooksPolluted = Boolean(
-                previousSameBucketBar &&
-                previousSameBucketBar.low < Math.min(previousSameBucketBar.open, previousSameBucketBar.close, livePrice) &&
-                isImplausibleLiveQuoteFallbackMove(
-                    liveQuoteReferencePrice,
-                    previousSameBucketBar.low,
-                    LIVE_QUOTE_FALLBACK_MAX_STORED_EXTREME_RATIO,
-                ),
-            );
-            const preservedHigh = previousHighLooksPolluted
-                ? Math.max(updatedCandle.open, previousSameBucketBar?.close ?? updatedCandle.open)
-                : updatedCandle.high;
-            const preservedLow = previousLowLooksPolluted
-                ? Math.min(updatedCandle.open, previousSameBucketBar?.close ?? updatedCandle.open)
-                : updatedCandle.low;
-            const shouldReplaceSameBucketRange = previousHighLooksPolluted || previousLowLooksPolluted;
+
+            // Rollover / new bucket: build from tip close → new open candle.
+            const openPrice = candleBase.close > 0 ? candleBase.close : livePrice;
             const liveSnapshotBar: OHLCBar = {
-                ...updatedCandle,
+                ...candleBase,
                 symbol,
                 timeframeMinutes: selectedResolution.minutes,
-                high: Math.max(preservedHigh, livePrice),
-                low: Math.min(preservedLow, livePrice),
+                time: targetTime,
+                open: openPrice,
+                high: Math.max(openPrice, livePrice),
+                low: Math.min(openPrice, livePrice),
+                close: livePrice,
+                volume: volumeIncrement,
                 source: 'mt5_tick',
                 sourceTimeMs: eventTime,
                 closed: false,
+                derived: undefined,
+                continuity: undefined,
+                isContinuity: undefined,
+                // Keep basis empty so isRealMarketBar accepts the bar for series.update.
+                basis: undefined,
+                cached: undefined,
             };
             if (!isBarInsideChartSymbolPriceDomain(symbol, liveSnapshotBar)) {
                 return;
             }
 
             const liveBar = cacheLiveBar(liveSnapshotBar, {
-                replaceExisting: shouldReplaceSameBucketRange,
-                skipSanity: true,
+                replaceExisting: true,
             });
             if (!liveBar) {
                 return;
@@ -5078,7 +5526,7 @@ function KlineChartContainer({
             applyLiveBarToRenderedSeries(
                 liveBar,
                 previousLastBarTime,
-                { replaceSameBucketRange: shouldReplaceSameBucketRange },
+                { replaceSameBucketRange: true },
             );
         };
 
@@ -5158,6 +5606,9 @@ function KlineChartContainer({
             if (!latestRenderedBar || previousLastBarTime <= 0 || currentBucketTime < previousLastBarTime + bucketMs) {
                 return false;
             }
+            if (shouldPauseFrontendRolloverForClosedMarket(getBarSourceTimeMs(latestRenderedBar))) {
+                return false;
+            }
 
             const firstRolloverTime = previousLastBarTime + bucketMs;
             const missingBucketCount = Math.floor((currentBucketTime - firstRolloverTime) / bucketMs) + 1;
@@ -5165,8 +5616,10 @@ function KlineChartContainer({
                 return false;
             }
 
-            const limitedFirstRolloverTime = missingBucketCount > LIVE_CANDLE_ROLLOVER_MAX_CATCHUP_BARS
-                ? currentBucketTime - ((LIVE_CANDLE_ROLLOVER_MAX_CATCHUP_BARS - 1) * bucketMs)
+            // Do not manufacture completed candles across a multi-bucket data gap.
+            // History backfill owns those buckets; the UI only creates the current tip.
+            const limitedFirstRolloverTime = missingBucketCount > 1
+                ? currentBucketTime
                 : firstRolloverTime;
             let renderedAny = false;
             let previousBar = latestRenderedBar;
@@ -5184,11 +5637,15 @@ function KlineChartContainer({
                     continue;
                 }
 
+                const previousBarIsAdjacent =
+                    rolloverTime > previousBar.time &&
+                    rolloverTime - previousBar.time <= bucketMs;
+                const rolloverOpen = previousBarIsAdjacent ? previousBar.close : livePrice;
                 const rolloverBar: OHLCBar = {
                     time: rolloverTime,
-                    open: previousBar.close,
-                    high: Math.max(previousBar.close, livePrice),
-                    low: Math.min(previousBar.close, livePrice),
+                    open: rolloverOpen,
+                    high: Math.max(rolloverOpen, livePrice),
+                    low: Math.min(rolloverOpen, livePrice),
                     close: livePrice,
                     volume: 1,
                     symbol,
@@ -5203,7 +5660,7 @@ function KlineChartContainer({
                     continue;
                 }
 
-                const liveBar = cacheLiveBar(rolloverBar, { replaceExisting: true, skipSanity: true });
+                const liveBar = cacheLiveBar(rolloverBar, { replaceExisting: true });
                 if (!liveBar) {
                     continue;
                 }
@@ -5223,6 +5680,14 @@ function KlineChartContainer({
         const runLiveCandleRollover = (): boolean => {
             if (forceVisibleCandleRolloverToCurrentBucket()) {
                 return true;
+            }
+
+            const latestRenderedBar = getLatestRenderedBarForLiveRollover();
+            if (
+                latestRenderedBar &&
+                shouldPauseFrontendRolloverForClosedMarket(getBarSourceTimeMs(latestRenderedBar))
+            ) {
+                return false;
             }
 
             applyLivePriceSnapshotToRenderedCandle({ allowWallClockRollover: true });
@@ -5399,7 +5864,7 @@ function KlineChartContainer({
             const realBars = getRenderableMarketBars(renderBars, maxBars);
             // Do not render continuity/gap-fill bars. They consume compact logical slots
             // and reintroduce visible gaps between real backend history and live candles.
-            const displayBars = alignOpenGapsToPreviousClose(realBars);
+            const displayBars = alignOpenGapsToPreviousClose(realBars, bucketMs);
             const hasCandles = realBars.length > 0;
             const renderHasHistorySeed = hasRenderedHistorySeed
                 || (markHistoryLoaded && acceptedInputBars.some(isLatestHistoryCatchUpReferenceBar))
@@ -5513,6 +5978,8 @@ function KlineChartContainer({
                 currentBarRef.current = latestRealBar;
                 fallbackLiveAxisPriceRef.current = latestDisplayBar.close;
                 livePriceRef.current = resolveLiveAxisPrice(latestDisplayBar.close);
+                // Closed non-crypto: never leave a live dashed tip from a prior symbol/session.
+                updateLivePriceOverlay();
                 setNoDataMessage(null);
                 // Keep spinner while still in provisional-preview mode (deferHistoryStatus=true).
                 // History hasn't loaded yet â€” clearing isLoading here causes the blank-chart flash.
@@ -5559,7 +6026,12 @@ function KlineChartContainer({
                 clearLoadingTimer(); setIsLoading(false);
                 // Seed a provisional live candle at the current bucket when history ends
                 // in the past — eliminates the right-edge gap before the first real tick arrives.
-                if (latestRealBar !== null && bucketMs > 0) {
+                // Skip on closed non-crypto markets so we never invent a fake live tip.
+                if (
+                    latestRealBar !== null &&
+                    bucketMs > 0 &&
+                    !shouldFreezeLiveTipForClosedMarket(getBarSourceTimeMs(latestRealBar))
+                ) {
                     const nowMs = getCurrentFrontendTime();
                     const nowBucketTime = getCurrentFrontendBucketTime();
                     if (
@@ -5579,7 +6051,7 @@ function KlineChartContainer({
                             sourceTimeMs: nowMs,
                             closed: false,
                         };
-                        const acceptedSeedBar = cacheLiveBar(seedBar, { replaceExisting: true, skipSanity: true });
+                        const acceptedSeedBar = cacheLiveBar(seedBar, { replaceExisting: true });
                         if (acceptedSeedBar) {
                             applyLiveBarToRenderedSeries(acceptedSeedBar, latestRealBar.time);
                         }
@@ -5731,7 +6203,9 @@ function KlineChartContainer({
         };
 
         maybeRequestOlderHistory = (range: LogicalRangeSnapshot | null) => {
+            // Secondary panes stay cache/live-light — no left-edge scrollback cascade.
             if (
+                isSecondaryPane ||
                 !isCurrentChartSwitch() ||
                 !isHistoryLoaded ||
                 !range ||
@@ -5957,7 +6431,8 @@ function KlineChartContainer({
                 if (applyHistoryResult(history)) {
                     // After the first history paint, scan for internal gaps in the background.
                     // A 2s delay lets the chart finish rendering before gap fetches start.
-                    if (!isBackfillRetry) {
+                    // Secondary panes skip aggressive gap repair — primary owns that work.
+                    if (!isBackfillRetry && !isSecondaryPane) {
                         setTimeout(() => {
                             if (isCurrentChartSwitch()) {
                                 ohlcService.detectAndFillInternalGaps(symbol, selectedResolution.minutes);
@@ -6095,6 +6570,11 @@ function KlineChartContainer({
                 return;
             }
 
+            // Closed non-crypto: allow completed history bars only — no open live tip mutation.
+            if (shouldFreezeLiveTipForClosedMarket(getBarSourceTimeMs(bar)) && bar.closed !== true) {
+                return;
+            }
+
             let incomingBar = alignOpenLiveBarCloseToCurrentPriceLine(
                 toBucketedBar(bar, bucketMs),
             );
@@ -6212,9 +6692,17 @@ function KlineChartContainer({
             }
 
             if (!isHistoryLoaded) {
-                // The live candle owns the chart tip. History loading and gap repair are
-                // background work and must not hold an accepted MT5 tick off-screen.
-                applyLiveBarToRenderedSeries(liveBar, previousLastBarTime);
+                const hasHistorySeedForLiveRender =
+                    hasRenderedHistorySeed ||
+                    hasCachedOrHistoricalSeedBars(loadedHistoryBarsByTime.values());
+
+                // Live ticks are cached immediately, but a cold first-open symbol should
+                // keep the loading state until MT5 history/cache supplies the baseline.
+                if (hasHistorySeedForLiveRender && applyLiveBarToRenderedSeries(liveBar, previousLastBarTime)) {
+                    lastOhlcLiveBarAtMsRef.current = Date.now();
+                } else if (!hasHistorySeedForLiveRender) {
+                    setHistoryBackfillMessage('Loading MT5 candle history before drawing the chart...');
+                }
                 scheduleHistoryLoadWhenRealtimeReady();
                 return;
             }
@@ -6227,7 +6715,9 @@ function KlineChartContainer({
                 return;
             }
 
-            applyLiveBarToRenderedSeries(liveBar, previousLastBarTime);
+            if (applyLiveBarToRenderedSeries(liveBar, previousLastBarTime)) {
+                lastOhlcLiveBarAtMsRef.current = Date.now();
+            }
         }, { replay: 'latest' });
 
         // Live-first progressive switch: the current quote above owns the first render.
@@ -6263,14 +6753,98 @@ function KlineChartContainer({
             });
         }
 
-        void loadHistory();
+        cancelInitialHistoryHydrate = scheduleChartBackgroundTask(() => {
+            if (!isCurrentChartSwitch()) {
+                return;
+            }
+
+            // Secondary panes: seed from getSyncBars/switch seed + optional one-shot
+            // cache-first getHistory. Skip staged warmup/backfill/gap-fill cascade.
+            if (isSecondaryPane) {
+                markChartSwitchPerf('loadHistory:start', {
+                    streamKey: chartDataStreamKey,
+                    bars: INITIAL_CHART_HISTORY_LIMIT,
+                    secondary: true,
+                });
+                // Prefer in-memory/switch seed — progressive rAF may already be scheduled.
+                if (hasAtomicSwitchSeed || cleanRenderableSyncSeedBars.length > 0) {
+                    if (
+                        !isHistoryLoaded &&
+                        !hasAtomicSwitchSeed &&
+                        cleanRenderableSyncSeedBars.length > 0
+                    ) {
+                        const secondarySeedBars = normalizeChartBars(
+                            cleanRenderableSyncSeedBars,
+                            bucketMs,
+                            LIVE_FIRST_SYMBOL_SWITCH_HISTORY_BARS,
+                        );
+                        applyBars(
+                            secondarySeedBars,
+                            undefined,
+                            false,
+                            LIVE_FIRST_SYMBOL_SWITCH_HISTORY_BARS,
+                            false,
+                            false,
+                            true,
+                            'focus-latest',
+                        );
+                    }
+                    isHistoryLoaded = true;
+                    clearLoadingTimer();
+                    setIsLoading(false);
+                    setHistoryBackfillMessage(null);
+                    notifyHistoryStatusChange({
+                        isLoading: false,
+                        hasCandles: hasRenderedHistorySeed || renderedBarCount > 0 || hasAtomicSwitchSeed,
+                    });
+                    markChartSwitchPerf('loadHistory:end', {
+                        streamKey: chartDataStreamKey,
+                        secondary: true,
+                        seedOnly: true,
+                    });
+                    return;
+                }
+                // Cold secondary: one cache-first getHistory only (no retry cascade).
+                void loadHistory(false).finally(() => {
+                    if (isCurrentChartSwitch()) {
+                        isHistoryLoaded = true;
+                        clearLoadingTimer();
+                        setIsLoading(false);
+                        setHistoryBackfillMessage(null);
+                        notifyHistoryStatusChange({
+                            isLoading: false,
+                            hasCandles: hasRenderedHistorySeed || renderedBarCount > 0,
+                        });
+                    }
+                    markChartSwitchPerf('loadHistory:end', {
+                        streamKey: chartDataStreamKey,
+                        secondary: true,
+                    });
+                });
+                return;
+            }
+
+            markChartSwitchPerf('loadHistory:start', {
+                streamKey: chartDataStreamKey,
+                bars: INITIAL_CHART_HISTORY_LIMIT,
+            });
+            void loadHistory().finally(() => {
+                markChartSwitchPerf('loadHistory:end', {
+                    streamKey: chartDataStreamKey,
+                });
+            });
+        });
 
         // If history is slow (network delay, cold MT5), only reveal cached candles
         // after a history/cache seed exists; live-only bars stay cached while priming.
             pendingProvisionalPreviewTimer = setTimeout(() => {
                 pendingProvisionalPreviewTimer = null;
-                if (isCurrentChartSwitch() && !isHistoryLoaded) {
-                    renderProvisionalLivePreview(undefined, true);
+                if (
+                    isCurrentChartSwitch() &&
+                    !isHistoryLoaded &&
+                    !shouldFreezeLiveTipForClosedMarket()
+                ) {
+                    renderProvisionalLivePreview();
                 }
             }, PROVISIONAL_PREVIEW_DELAY_MS);
 
@@ -6295,6 +6869,8 @@ function KlineChartContainer({
                 window.cancelAnimationFrame(progressiveHistorySeedFrame);
                 progressiveHistorySeedFrame = null;
             }
+            cancelInitialHistoryHydrate?.();
+            cancelInitialHistoryHydrate = null;
             if (historicalCacheRenderFrame !== null) {
                 window.cancelAnimationFrame(historicalCacheRenderFrame);
                 historicalCacheRenderFrame = null;
@@ -6317,27 +6893,11 @@ function KlineChartContainer({
             if (priceAxisCleanup) { try { priceAxisCleanup(); } catch { /* noop */ } priceAxisCleanup = null; }
             try { chart.timeScale().unsubscribeVisibleLogicalRangeChange(rangeHandler); } catch { /* noop */ }
             try { chart.unsubscribeCrosshairMove(crosshairHandler); } catch { /* noop */ }
-            try {
-                for (const line of priceLinesRef.current) {
-                    try { mainSeries.removePriceLine(line); } catch { /* noop */ }
-                }
-            } finally {
-                priceLinesRef.current = [];
-            }
             try { positionDragCleanupRef.current?.(); } catch { /* noop */ }
             positionDragCleanupRef.current = null;
-            clearPositionLineOverlays();
             try { window.removeEventListener('pointermove', onDragPointerMove); } catch { /* noop */ }
             try { window.removeEventListener('pointerup', onDragPointerUp); } catch { /* noop */ }
             try { endDrag(); } catch { /* noop */ }
-            try { livePriceLineRef.current?.remove(); } catch { /* noop */ }
-            try { livePriceBadgeRef.current?.remove(); } catch { /* noop */ }
-            try { livePriceHitRef.current?.remove(); } catch { /* noop */ }
-            livePriceLineRef.current = null;
-            livePriceBadgeRef.current = null;
-            livePriceHitRef.current = null;
-            livePriceRef.current = null;
-            updateLivePriceOverlayRef.current = null;
             volumeSeriesRefreshRef.current = null;
             try { seriesMarkersPluginRef.current?.detach(); } catch { /* noop */ }
             seriesMarkersPluginRef.current = null;
@@ -6346,12 +6906,33 @@ function KlineChartContainer({
                 latestChartInstanceLifecycleKeyRef.current === chartInstanceLifecycleKey &&
                 chartRef.current === chart;
             if (!shouldPreserveChartInstanceForSymbolSwitch) {
+                try {
+                    for (const line of priceLinesRef.current) {
+                        try { mainSeries.removePriceLine(line); } catch { /* noop */ }
+                    }
+                } finally {
+                    priceLinesRef.current = [];
+                }
+                clearPositionLineOverlays();
+                try { livePriceLineRef.current?.remove(); } catch { /* noop */ }
+                try { livePriceBadgeRef.current?.remove(); } catch { /* noop */ }
+                try { livePriceHitRef.current?.remove(); } catch { /* noop */ }
+                livePriceLineRef.current = null;
+                livePriceBadgeRef.current = null;
+                livePriceHitRef.current = null;
+                livePriceRef.current = null;
+                updateLivePriceOverlayRef.current = null;
                 mainSeriesRef.current = null;
                 volumeSeriesRef.current = null;
                 if (chartRef.current === chart) {
                     chartRef.current = null;
                     try { chart.remove(); } catch { host.innerHTML = ''; }
                 }
+            } else {
+                // Symbol switch with preserved chart: drop previous symbol's position lines
+                // (e.g. BTC ~63999 lines stuck on GBPJPY) before the next sync.
+                clearPositionLines();
+                updateLivePriceOverlayRef.current?.();
             }
         };
     }, [
@@ -6359,8 +6940,10 @@ function KlineChartContainer({
         chartInstanceLifecycleKey,
         chartType,
         clearPositionLineOverlays,
+        clearPositionLines,
         getPreferredBarSpacing,
         getPreferredRightOffset,
+        isSecondaryPane,
         markChartHasCandles,
         notifyHistoryStatusChange,
         normalizedAccountSessionScopeId,
@@ -6368,6 +6951,7 @@ function KlineChartContainer({
         pricePrecision,
         resolveLiveAxisPrice,
         selectedResolution,
+        selectedSymbolIsCrypto,
         setActiveBarIfChanged,
         symbol,
         tradingSessionId,
@@ -6383,6 +6967,12 @@ function KlineChartContainer({
         return () => { clearPositionLines(); };
     }, [clearPositionLines, syncPositionLines]);
 
+    // Explicit symbol switch: clear previous symbol's price lines before re-syncing.
+    useEffect(() => {
+        clearPositionLines();
+        syncPositionLines();
+    }, [symbol, clearPositionLines, syncPositionLines]);
+
     const change = activeBar
         ? {
             absolute: activeBar.close - activeBar.open,
@@ -6390,7 +6980,34 @@ function KlineChartContainer({
             color: activeBar.close > activeBar.open ? palette.up : activeBar.close < activeBar.open ? palette.down : palette.muted,
         }
         : null;
-    const statusNotice = !activeBar ? historyBackfillMessage : null;
+    // Snapshot read only (no React subscription) so closed-market notice doesn't re-render per tick.
+    const displayQuoteSnapshot = getLivePriceSnapshotBySymbol(symbol);
+    const displayQuotePrice = (() => {
+        if (typeof preferredLiveAxisPrice === 'number' && preferredLiveAxisPrice > 0) {
+            return preferredLiveAxisPrice;
+        }
+        const bid = displayQuoteSnapshot?.bid ?? 0;
+        const ask = displayQuoteSnapshot?.ask ?? 0;
+        const candidate = bid > 0 ? bid : ask > 0 ? ask : null;
+        return typeof candidate === 'number' && Number.isFinite(candidate) && candidate > 0
+            ? candidate
+            : null;
+    })();
+    const livePriceFreshnessMs = getFreshnessTimestampMsFromLiveSnapshot(displayQuoteSnapshot);
+    const hasFreshDisplayQuote = displayQuotePrice !== null
+        && livePriceFreshnessMs !== null
+        && Date.now() - livePriceFreshnessMs <= CLOSED_MARKET_LIVE_QUOTE_STALE_MS;
+    // Non-crypto weekend always shows closed (even if a stale quote looks "fresh").
+    // Weekday: closed when the bar is stale/holiday and there is no fresh live quote.
+    const closedMarketNotice = activeBar &&
+        !selectedSymbolIsCrypto &&
+        (
+            isWeekendUtc()
+            || (isLikelyMarketClosed(getBarSourceTimeMs(activeBar)) && !hasFreshDisplayQuote)
+        )
+        ? 'Market closed — showing last available candle history.'
+        : null;
+    const statusNotice = closedMarketNotice ?? (!activeBar ? historyBackfillMessage : null);
 
     return (
         <div
@@ -6412,9 +7029,11 @@ function KlineChartContainer({
                                     <span>{symbol}</span>
                                     {symbolName ? <span className="opacity-60" style={{ color: palette.muted }}>{symbolName}</span> : null}
                                     <span className="opacity-60" style={{ color: palette.muted }}>- {selectedResolution.label}</span>
-                                    <div className="ml-2 flex items-center gap-1.5 rounded-none bg-primary/10 px-2 py-0.5">
-                                        <div className="h-1.5 w-1.5 animate-pulse rounded-none bg-primary" />
-                                        <span className="text-[10px] font-bold uppercase tracking-wider text-primary">Live</span>
+                                    <div className={`ml-2 flex items-center gap-1.5 rounded-none px-2 py-0.5 ${closedMarketNotice ? 'bg-amber-500/10' : 'bg-primary/10'}`}>
+                                        <div className={`h-1.5 w-1.5 rounded-none ${closedMarketNotice ? 'bg-amber-400' : 'animate-pulse bg-primary'}`} />
+                                        <span className={`text-[10px] font-bold uppercase tracking-wider ${closedMarketNotice ? 'text-amber-300' : 'text-primary'}`}>
+                                            {closedMarketNotice ? 'Closed' : 'Live'}
+                                        </span>
                                     </div>
                                 </>
                             ) : null}

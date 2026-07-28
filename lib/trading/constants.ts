@@ -21,10 +21,10 @@ export const WS_CONFIG = {
 // Falls back to the base /ws (full mode) if env var is not set.
 export const WS_ROUTES = {
   FULL:    process.env.NEXT_PUBLIC_WS_URL || '/ws',
-  MARKET:  process.env.NEXT_PUBLIC_WS_MARKET_URL || '/ws/market',
-  OHLC:    process.env.NEXT_PUBLIC_WS_OHLC_URL || '/ws/ohlc',
-  ACCOUNT: process.env.NEXT_PUBLIC_WS_ACCOUNT_URL || '/ws/account',
-  TRADE:   process.env.NEXT_PUBLIC_WS_TRADE_URL || '/ws/trade',
+  MARKET:  process.env.NEXT_PUBLIC_WS_MARKET_URL || process.env.NEXT_PUBLIC_WS_URL || '/ws',
+  OHLC:    process.env.NEXT_PUBLIC_WS_OHLC_URL || process.env.NEXT_PUBLIC_WS_URL || '/ws',
+  ACCOUNT: process.env.NEXT_PUBLIC_WS_ACCOUNT_URL || process.env.NEXT_PUBLIC_WS_URL || '/ws',
+  TRADE:   process.env.NEXT_PUBLIC_WS_TRADE_URL || process.env.NEXT_PUBLIC_WS_URL || '/ws',
 } as const;
 
 // API Endpoints

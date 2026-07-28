@@ -38,7 +38,16 @@ interface PriceDirection {
 
 type PriceSnapshot = PriceTick & PriceDirection;
 type ActiveBottomTab = 'positions' | 'orders' | 'history';
-const MAX_ACCEPTED_FUTURE_TICK_SKEW_MS = 60_000;
+// Keep MT5 broker-time ticks on the same clock as ChartRequest candle history.
+// Broker servers commonly use UTC+2/UTC+3; fourteen hours spans the valid
+// civil-timezone range while still rejecting clearly corrupt future values.
+const MAX_ACCEPTED_BROKER_CLOCK_OFFSET_MS = 14 * 60 * 60_000;
+const LIVE_PRICE_SYMBOL_KEY_SEPARATOR = '\u0001';
+
+interface LivePriceUniverseSnapshot {
+  count: number;
+  symbolKey: string;
+}
 
 const isMarketStatusPayload = (
   status: QuoteStatus | MarketStatusPayload,
@@ -251,14 +260,14 @@ const normalizePriceTickTimestampMs = (tick: PriceTick | undefined): number => {
     if (!Number.isFinite(timestamp) || timestamp <= 0) {
       return now;
     }
-    return timestamp <= now + MAX_ACCEPTED_FUTURE_TICK_SKEW_MS ? timestamp : now;
+    return timestamp <= now + MAX_ACCEPTED_BROKER_CLOCK_OFFSET_MS ? timestamp : now;
   }
 
   const parsed = new Date(rawTime as unknown as string | number).getTime();
   if (!Number.isFinite(parsed) || parsed <= 0) {
     return now;
   }
-  return parsed <= now + MAX_ACCEPTED_FUTURE_TICK_SKEW_MS ? parsed : now;
+  return parsed <= now + MAX_ACCEPTED_BROKER_CLOCK_OFFSET_MS ? parsed : now;
 };
 
 const getPriceTickFreshnessTimestampMs = (tick: PriceTick | undefined): number => {
@@ -378,6 +387,14 @@ const applyTicksToPrices = (
 
 const livePriceSnapshotCache: Record<string, PriceSnapshot> = {};
 const livePriceListenersBySymbol = new Map<string, Set<() => void>>();
+const livePriceUniverseSymbols = new Set<string>();
+const livePriceUniverseListeners = new Set<() => void>();
+const EMPTY_LIVE_PRICE_UNIVERSE_SNAPSHOT: LivePriceUniverseSnapshot = {
+  count: 0,
+  symbolKey: '',
+};
+let livePriceUniverseSnapshot: LivePriceUniverseSnapshot =
+  EMPTY_LIVE_PRICE_UNIVERSE_SNAPSHOT;
 
 const getPriceForSymbolFromRecord = (
   prices: Record<string, PriceSnapshot>,
@@ -407,6 +424,63 @@ const notifyLivePriceListeners = (symbols: string[]) => {
     });
   }
   listeners.forEach((listener) => listener());
+};
+
+const notifyLivePriceUniverseListeners = () => {
+  livePriceUniverseListeners.forEach((listener) => listener());
+};
+
+const hasUsableLiveQuote = (price: PriceSnapshot | undefined): boolean =>
+  Boolean(
+    price &&
+      (
+        (price.bid ?? 0) > 0 ||
+        (price.ask ?? 0) > 0 ||
+        (price.last ?? 0) > 0
+      ),
+  );
+
+const refreshLivePriceUniverseSnapshot = () => {
+  livePriceUniverseSnapshot =
+    livePriceUniverseSymbols.size > 0
+      ? {
+          count: livePriceUniverseSymbols.size,
+          symbolKey: [...livePriceUniverseSymbols]
+            .sort()
+            .join(LIVE_PRICE_SYMBOL_KEY_SEPARATOR),
+        }
+      : EMPTY_LIVE_PRICE_UNIVERSE_SNAPSHOT;
+  notifyLivePriceUniverseListeners();
+};
+
+const trackLivePriceUniverseAliases = (aliases: string[]) => {
+  let changed = false;
+
+  for (const alias of aliases) {
+    if (
+      livePriceUniverseSymbols.has(alias) ||
+      !hasUsableLiveQuote(livePriceSnapshotCache[alias])
+    ) {
+      continue;
+    }
+
+    livePriceUniverseSymbols.add(alias);
+    changed = true;
+  }
+
+  if (changed) {
+    refreshLivePriceUniverseSnapshot();
+  }
+};
+
+const resetLivePriceUniverseSnapshot = () => {
+  if (livePriceUniverseSymbols.size === 0) {
+    return;
+  }
+
+  livePriceUniverseSymbols.clear();
+  livePriceUniverseSnapshot = EMPTY_LIVE_PRICE_UNIVERSE_SNAPSHOT;
+  notifyLivePriceUniverseListeners();
 };
 
 const subscribeLivePriceBySymbol = (symbol: string, listener: () => void) => {
@@ -458,6 +532,7 @@ const publishLivePriceTick = (tick: PriceTick): boolean => {
     );
   }
 
+  trackLivePriceUniverseAliases(aliases);
   notifyLivePriceListeners(aliases);
   return true;
 };
@@ -471,7 +546,26 @@ const resetLivePriceSnapshotCache = () => {
   if (symbols.length > 0) {
     notifyLivePriceListeners(symbols);
   }
+
+  resetLivePriceUniverseSnapshot();
 };
+
+export const getLivePriceUniverseSnapshot = (): LivePriceUniverseSnapshot =>
+  livePriceUniverseSnapshot;
+
+export const subscribeToLivePriceUniverse = (listener: () => void) => {
+  livePriceUniverseListeners.add(listener);
+  return () => {
+    livePriceUniverseListeners.delete(listener);
+  };
+};
+
+export const useLivePriceUniverse = () =>
+  useSyncExternalStore(
+    subscribeToLivePriceUniverse,
+    getLivePriceUniverseSnapshot,
+    getLivePriceUniverseSnapshot,
+  );
 
 const getMarginLevel = (account: TradingAccountInfo | null): number => {
   if (!account) return 0;

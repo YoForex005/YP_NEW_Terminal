@@ -27,6 +27,27 @@ import type {
   TradingSession,
 } from '@/types/webtrader';
 
+/** Throttle Zustand mt5ServerTimeMs writes on the hot tick path (~2Hz max). */
+const MT5_SERVER_TIME_WRITE_MIN_INTERVAL_MS = 500;
+let lastMt5ServerTimeWrittenMs = 0;
+let lastMt5ServerTimeWriteWallClockMs = 0;
+
+function maybeSetMt5ServerTimeMs(ms: number): void {
+  if (!(ms > 0)) {
+    return;
+  }
+  const now = Date.now();
+  const isFirstWrite = lastMt5ServerTimeWriteWallClockMs === 0;
+  if (
+    ms > lastMt5ServerTimeWrittenMs &&
+    (isFirstWrite || now - lastMt5ServerTimeWriteWallClockMs >= MT5_SERVER_TIME_WRITE_MIN_INTERVAL_MS)
+  ) {
+    lastMt5ServerTimeWrittenMs = ms;
+    lastMt5ServerTimeWriteWallClockMs = now;
+    useWebtraderStore.getState().setMt5ServerTimeMs(ms);
+  }
+}
+
 const TERMINAL_SESSION_REQUEST_TIMEOUT_MS = 15_000;
 // Reuse a cached token if it expires more than 60s from now (was 75s).
 const TERMINAL_SESSION_TOKEN_REUSE_MARGIN_MS = 60_000;
@@ -1737,7 +1758,7 @@ export function useAutoConnectTrading(
 
       client = new WebSocketTradingClient({
         onMt5TimeUpdate: (mt5ServerTimeMs) => {
-          useWebtraderStore.getState().setMt5ServerTimeMs(mt5ServerTimeMs);
+          maybeSetMt5ServerTimeMs(mt5ServerTimeMs);
         },
         onAuthenticated: (session) => {
           if (!isCurrentMainClientAccountEvent()) {
@@ -1893,10 +1914,9 @@ export function useAutoConnectTrading(
           }
 
           // Track latest MT5 server time from tick timestamps (most reliable source).
+          // Throttled to ≥500ms so Zustand does not fan out on every tick.
           const tickMs = tick.time instanceof Date ? tick.time.getTime() : 0;
-          if (tickMs > 0) {
-            useWebtraderStore.getState().setMt5ServerTimeMs(tickMs);
-          }
+          maybeSetMt5ServerTimeMs(tickMs);
 
           callbacksRef.current.updatePrice(tick);
           if (isValidLiveTick(tick)) {
