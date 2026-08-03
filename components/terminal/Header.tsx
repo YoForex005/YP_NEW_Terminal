@@ -1,6 +1,6 @@
 'use client';
 
-import type { Instrument } from '@/lib/terminal/types';
+import type { Instrument, Position } from '@/lib/terminal/types';
 import {
     Menu,
     ChevronDown,
@@ -34,7 +34,11 @@ import { memo, startTransition, useDeferredValue, useEffect, useMemo, useRef, us
 import { PriceAlertModal } from './PriceAlertModal';
 import { LoginModal } from './LoginModal';
 import { useAuth } from '@/components/auth/auth-provider';
-import { getLivePriceSnapshotBySymbol, usePriceBySymbol } from '@/store/webtrader-store';
+import {
+    getLivePriceSnapshotBySymbol,
+    subscribeToLivePriceBySymbol,
+    usePriceBySymbol,
+} from '@/store/webtrader-store';
 
 export interface UserProfile {
     name: string;
@@ -74,6 +78,7 @@ interface AccountInfo {
 
 interface HeaderProps {
     account: AccountInfo;
+    positions?: Position[];
     selectedSymbol: string;
     openTabs: string[];
     userProfile?: UserProfile;
@@ -91,6 +96,76 @@ interface HeaderProps {
     onSwitchAccount?: (id: string) => void;
     onShowToast?: (type: 'success' | 'info' | 'topup' | 'warning' | 'error', title: string, message?: string) => void;
     onOpenOrderPanel?: () => void;
+}
+
+function canCalculatePositionProfitInAccountCurrency(position: Position, accountCurrency: string) {
+    const compactSymbol = position.symbol.toUpperCase().replace(/[^A-Z]/g, '');
+    const normalizedCurrency = accountCurrency.trim().toUpperCase();
+    return (
+        normalizedCurrency.length === 3 &&
+        compactSymbol.length >= 6 &&
+        compactSymbol.slice(3, 6) === normalizedCurrency
+    );
+}
+
+function calculateTickDrivenAccountMetrics(
+    account: AccountInfo,
+    positions: readonly Position[],
+): AccountInfo {
+    if (positions.length === 0) return account;
+
+    let authoritativePositionProfit = 0;
+    let livePositionProfit = 0;
+    let hasLiveCalculation = false;
+
+    for (const position of positions) {
+        const serverProfit = Number.isFinite(position.profit) ? position.profit : 0;
+        authoritativePositionProfit += serverProfit;
+
+        const snapshot = getLivePriceSnapshotBySymbol(position.symbol);
+        const contractSize = position.contractSize ?? 0;
+        const canCalculate =
+            snapshot &&
+            contractSize > 0 &&
+            position.volume > 0 &&
+            position.openPrice > 0 &&
+            canCalculatePositionProfitInAccountCurrency(
+                position,
+                account.currency || 'USD',
+            );
+        if (!canCalculate || !snapshot) {
+            livePositionProfit += serverProfit;
+            continue;
+        }
+
+        const closePrice = position.type === 'buy' ? snapshot.bid : snapshot.ask;
+        if (!Number.isFinite(closePrice) || closePrice <= 0) {
+            livePositionProfit += serverProfit;
+            continue;
+        }
+
+        livePositionProfit += position.type === 'buy'
+            ? (closePrice - position.openPrice) * position.volume * contractSize
+            : (position.openPrice - closePrice) * position.volume * contractSize;
+        hasLiveCalculation = true;
+    }
+
+    if (!hasLiveCalculation) return account;
+
+    // Adjust the latest authoritative account snapshot only by the price-driven
+    // P/L movement since its position snapshot. Balance, swaps, credit, and
+    // commissions remain server-authoritative.
+    const floatingDelta = livePositionProfit - authoritativePositionProfit;
+    const equity = account.equity + floatingDelta;
+    const freeMargin = account.freeMargin + floatingDelta;
+
+    return {
+        ...account,
+        profit: account.profit + floatingDelta,
+        equity,
+        freeMargin,
+        marginLevel: account.margin > 0 ? (equity / account.margin) * 100 : 0,
+    };
 }
 
 type InstrumentMenuItem = Pick<Instrument, 'symbol' | 'name' | 'category' | 'digits'>;
@@ -168,7 +243,7 @@ function PriceAlertModalLive({
     );
 }
 
-function Header({ account, selectedSymbol, openTabs, userProfile, notifications, availableInstruments = [], accounts, activeAccountId, onSwitchAccount, onSelectTab, onCloseTab, onToggleSidebar, onReorderTabs, onTopUp, onMarkNotificationsRead, onAddPriceAlert, onShowToast, onOpenOrderPanel }: HeaderProps) {
+function Header({ account, positions = [], selectedSymbol, openTabs, userProfile, notifications, availableInstruments = [], accounts, activeAccountId, onSwitchAccount, onSelectTab, onCloseTab, onToggleSidebar, onReorderTabs, onTopUp, onMarkNotificationsRead, onAddPriceAlert, onShowToast, onOpenOrderPanel }: HeaderProps) {
     const { theme } = useTheme();
     const { logout } = useAuth();
     const [isAccountMenuOpen, setIsAccountMenuOpen] = useState(false);
@@ -197,6 +272,27 @@ function Header({ account, selectedSymbol, openTabs, userProfile, notifications,
 
     const [accountDropdownView, setAccountDropdownView] = useState<'main' | 'switch'>('main');
     const [isLoginModalOpen, setIsLoginModalOpen] = useState(false);
+    const [liveAccountMetrics, setLiveAccountMetrics] = useState(account);
+    const isAccountMetricsVisible = isAccountMenuOpen || isMobileAccountMenuOpen;
+
+    useEffect(() => {
+        const updateMetrics = () => {
+            setLiveAccountMetrics(calculateTickDrivenAccountMetrics(account, positions));
+        };
+
+        updateMetrics();
+        if (!isAccountMetricsVisible || positions.length === 0) {
+            return;
+        }
+
+        const symbols = [...new Set(positions.map((position) => position.symbol).filter(Boolean))];
+        const unsubscribe = symbols.map((symbol) =>
+            subscribeToLivePriceBySymbol(symbol, updateMetrics),
+        );
+        return () => {
+            unsubscribe.forEach((stop) => stop());
+        };
+    }, [account, isAccountMetricsVisible, positions]);
 
     const activeAcc: TradingAccount =
         (accounts || []).find(a => a.id === activeAccountId) ||
@@ -346,9 +442,17 @@ function Header({ account, selectedSymbol, openTabs, userProfile, notifications,
         value: number | string | undefined,
         unit: string = activeAcc.currency || account.currency || 'USD',
     ) => {
-        const strValue = typeof value === 'number'
-            ? `${value.toLocaleString('en-US', { minimumFractionDigits: 2 })} ${unit}`
-            : (value || '-');
+        const formattedNumber = typeof value === 'number' && Number.isFinite(value)
+            ? value.toLocaleString('en-US', {
+                minimumFractionDigits: 2,
+                maximumFractionDigits: 2,
+            })
+            : null;
+        const strValue = formattedNumber
+            ? `${formattedNumber}${unit ? ` ${unit}` : ''}`
+            : typeof value === 'string'
+                ? value || '-'
+                : '-';
 
         return hideBalance && strValue !== '-' ? (
             <span className="blur-[4px] select-none opacity-80 pointer-events-none transition-all">{strValue}</span>
@@ -452,18 +556,32 @@ function Header({ account, selectedSymbol, openTabs, userProfile, notifications,
 
     const renderAccountDropdown = (isMobile: boolean = false) => {
         if (accountDropdownView === 'switch') return renderSwitchAccountView(isMobile);
+        const displayedAccount = isAccountMetricsVisible ? liveAccountMetrics : account;
         
         return (
         <div className="absolute right-0 top-[calc(100%+8px)] w-[min(92vw,300px)] max-h-[min(70dvh,440px)] overflow-y-auto overscroll-contain bg-popover border border-border rounded-[8px] shadow-none-[0_8px_32px_rgba(0,0,0,0.8)] z-[100] py-4 animate-in fade-in slide-in-from-top-2 duration-150">
             <div className="flex flex-col gap-3 px-5 mb-4">
                 <div className="flex flex-col gap-1.5">
                     {[
-                        { id: 'balance', label: 'Balance', value: renderAccountValue(account.balance), tooltip: 'Your funds ignoring the results of currently open positions.' },
-                        { id: 'equity', label: 'Equity', value: renderAccountValue(account.equity), tooltip: 'Your account balance plus the floating profit/loss of your open positions.' },
-                        { id: 'margin', label: 'Margin', value: renderAccountValue(account.margin), tooltip: 'The amount of funds required to open and maintain your current positions.' },
-                        { id: 'freeMargin', label: 'Free margin', value: renderAccountValue(account.freeMargin), tooltip: 'The amount of funds available to open new positions.' },
-                        { id: 'marginLevel', label: 'Margin level', value: renderAccountValue(account.marginLevel === 0 ? '-' : `${account.marginLevel}%`, ''), tooltip: 'The percentage ratio of Equity to Margin.' },
-                        { id: 'accountLeverage', label: 'Account leverage', value: renderAccountValue(account.leverage && account.leverage > 0 ? `1:${account.leverage}` : '-', ''), tooltip: 'Your set account leverage ratio.' }
+                        { id: 'balance', label: 'Balance', value: renderAccountValue(displayedAccount.balance), tooltip: 'Your funds ignoring the results of currently open positions.' },
+                        { id: 'equity', label: 'Equity', value: renderAccountValue(displayedAccount.equity), tooltip: 'Your account balance plus the floating profit/loss of your open positions.' },
+                        { id: 'margin', label: 'Margin', value: renderAccountValue(displayedAccount.margin), tooltip: 'The amount of funds required to open and maintain your current positions.' },
+                        { id: 'freeMargin', label: 'Free margin', value: renderAccountValue(displayedAccount.freeMargin), tooltip: 'The amount of funds available to open new positions.' },
+                        {
+                            id: 'marginLevel',
+                            label: 'Margin level',
+                            value: renderAccountValue(
+                                displayedAccount.marginLevel > 0 && Number.isFinite(displayedAccount.marginLevel)
+                                    ? `${displayedAccount.marginLevel.toLocaleString('en-US', {
+                                        minimumFractionDigits: 2,
+                                        maximumFractionDigits: 2,
+                                    })}%`
+                                    : '-',
+                                '',
+                            ),
+                            tooltip: 'The percentage ratio of Equity to Margin.',
+                        },
+                        { id: 'accountLeverage', label: 'Account leverage', value: renderAccountValue(displayedAccount.leverage && displayedAccount.leverage > 0 ? `1:${displayedAccount.leverage}` : '-', ''), tooltip: 'Your set account leverage ratio.' }
                     ].map((row) => (
                         <div key={row.id} className="flex items-center justify-between py-1 relative">
                             <span className="text-[13px] text-muted-foreground font-medium">{row.label}</span>
@@ -927,7 +1045,10 @@ function Header({ account, selectedSymbol, openTabs, userProfile, notifications,
                                     </span>
                                     <div className="flex items-baseline gap-1 leading-none mt-0.5">
                                         <span className={`text-[12px] font-bold text-foreground font-mono truncate transition-all ${hideBalance ? 'blur-[4px] select-none opacity-80 pointer-events-none' : ''}`}>
-                                            {account.balance.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                                            {account.balance.toLocaleString('en-US', {
+                                                minimumFractionDigits: 2,
+                                                maximumFractionDigits: 2,
+                                            })}
                                         </span>
                                     </div>
                                 </div>
@@ -970,7 +1091,10 @@ function Header({ account, selectedSymbol, openTabs, userProfile, notifications,
                             </div>
                             <div className="flex items-center gap-1 leading-none mt-0.5">
                                 <span className={`text-[15px] font-bold text-foreground tracking-wide transition-all ${hideBalance ? 'blur-[4px] select-none opacity-80 pointer-events-none' : ''}`}>
-                                    {account.balance.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                                    {account.balance.toLocaleString('en-US', {
+                                        minimumFractionDigits: 2,
+                                        maximumFractionDigits: 2,
+                                    })}
                                 </span>
                                 <span className={`text-[15px] font-normal text-muted-foreground transition-all ${hideBalance ? 'blur-[4px] select-none opacity-80 pointer-events-none' : ''}`}>
                                     {activeAcc.currency || account.currency || 'USD'}

@@ -660,7 +660,10 @@ const liveRuntimeStore = createStore<LiveRuntimeState>()((set, get) => ({
     set({ ohlcSessionScopeId: ohlcSessionScopeId?.trim() || null });
   },
   setAccountInfo: (accountInfo) => {
-    set({ accountInfo });
+    // Realtime adapters may reuse their internal account object. Always publish
+    // a fresh snapshot so selector subscribers render every authoritative MT5
+    // balance/equity/margin update.
+    set({ accountInfo: accountInfo ? { ...accountInfo } : null });
   },
   setSymbols: (symbols) => {
     set({ symbols });

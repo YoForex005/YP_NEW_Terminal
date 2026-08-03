@@ -37,6 +37,9 @@ type PendingRequest<T = unknown> = {
   timeout: ReturnType<typeof setTimeout>;
   expectedTypes?: string[];
   lane: 'feed' | 'trade';
+  operation?: string;
+  request?: JsonRecord;
+  clientSentAtMs: number;
 };
 
 export interface TerminalExchangeResponse {
@@ -372,18 +375,30 @@ const mapAccountInfo = (payload: unknown, accountContext?: JsonRecord): TradingA
     source.marginFree ?? source.freeMargin ?? source.free_margin ?? source.margin_free;
   const availableMargin =
     source.availableMargin ?? source.available_margin ?? source.marginAvailable ?? marginFree;
+  const equity = parseNumber(source.equity);
+  const margin = parseNumber(source.margin);
+  const resolvedMarginFree = parseNumber(
+    marginFree,
+    equity - margin,
+  );
+  const resolvedMarginLevel = parseNumber(
+    source.marginLevel ?? source.margin_level,
+    margin > 0 ? (equity / margin) * 100 : 0,
+  );
 
   return {
     login,
     name: parseString(source.name ?? accountContext?.name),
     server: parseString(source.server ?? accountContext?.server),
     currency: parseString(source.currency ?? accountContext?.currency, 'USD'),
-    leverage: parseInteger(source.leverage ?? accountContext?.leverage, 1),
+    // Unknown leverage must remain unknown (0); displaying 1:1 would fabricate
+    // an account setting that MT5 did not send.
+    leverage: parseInteger(source.leverage ?? accountContext?.leverage, 0),
     balance: parseNumber(source.balance),
-    equity: parseNumber(source.equity),
-    margin: parseNumber(source.margin),
-    marginFree: parseNumber(marginFree),
-    marginLevel: parseNumber(source.marginLevel ?? source.margin_level),
+    equity,
+    margin,
+    marginFree: resolvedMarginFree,
+    marginLevel: resolvedMarginLevel,
     marginInitial: parseNumber(source.marginInitial ?? source.margin_initial),
     marginMaintenance: parseNumber(source.marginMaintenance ?? source.margin_maintenance),
     profit: parseNumber(source.profit),
@@ -391,7 +406,7 @@ const mapAccountInfo = (payload: unknown, accountContext?: JsonRecord): TradingA
     commission: parseNumber(source.commission),
     credit: parseNumber(source.credit),
     limitOrders: parseInteger(source.limitOrders ?? source.limit_orders),
-    availableMargin: parseNumber(availableMargin),
+    availableMargin: parseNumber(availableMargin, resolvedMarginFree),
   };
 };
 
@@ -413,17 +428,24 @@ const mergeAccountInfo = (
       ? payload.accountInfo
       : payload;
   const totals = isRecord(payload.totals) ? payload.totals : {};
-  const next = current ?? mapAccountInfo(payload, accountContext);
+  const mapped = current ? null : mapAccountInfo(payload, accountContext);
+  // Account deltas must produce a new reference. Mutating `current` caused
+  // Zustand selectors to treat live MT5 updates as unchanged.
+  const next = current ? { ...current } : mapped;
   if (!next) return null;
 
+  const findDeltaValue = (...aliases: string[]) =>
+    findProvidedValue(source, ...aliases) ??
+    findProvidedValue(totals, ...aliases) ??
+    findProvidedValue(payload, ...aliases);
   const setNumber = (key: keyof TradingAccountInfo, ...aliases: string[]) => {
-    const value = findProvidedValue(source, ...aliases);
+    const value = findDeltaValue(...aliases);
     if (value !== undefined) {
       next[key] = parseNumber(value, next[key] as number) as never;
     }
   };
   const setInteger = (key: keyof TradingAccountInfo, ...aliases: string[]) => {
-    const value = findProvidedValue(source, ...aliases);
+    const value = findDeltaValue(...aliases);
     if (value !== undefined) {
       next[key] = parseInteger(value, next[key] as number) as never;
     }
@@ -454,15 +476,24 @@ const mergeAccountInfo = (
   setInteger('limitOrders', 'limitOrders', 'limit_orders');
   setNumber('availableMargin', 'availableMargin', 'available_margin', 'marginAvailable');
 
-  const floatingProfit = findProvidedValue(payload, 'floating_profit') ?? findProvidedValue(totals, 'floating_profit');
-  if (floatingProfit !== undefined) {
-    next.profit = parseNumber(floatingProfit, next.profit);
+  const equityProvided = findDeltaValue('equity') !== undefined;
+  const marginProvided = findDeltaValue('margin') !== undefined;
+  const marginFreeProvided =
+    findDeltaValue('marginFree', 'freeMargin', 'free_margin', 'margin_free') !== undefined;
+  const marginLevelProvided = findDeltaValue('marginLevel', 'margin_level') !== undefined;
+  const availableMarginProvided =
+    findDeltaValue('availableMargin', 'available_margin', 'marginAvailable') !== undefined;
+
+  // MT5 free margin and margin level are deterministic from authoritative
+  // equity/margin when a compact delta omits the precomputed fields.
+  if (!marginFreeProvided && (equityProvided || marginProvided)) {
+    next.marginFree = next.equity - next.margin;
   }
-  if (
-    findProvidedValue(source, 'availableMargin', 'available_margin', 'marginAvailable') === undefined &&
-    findProvidedValue(source, 'marginFree', 'freeMargin', 'free_margin', 'margin_free') !== undefined
-  ) {
+  if (!availableMarginProvided && (marginFreeProvided || equityProvided || marginProvided)) {
     next.availableMargin = next.marginFree;
+  }
+  if (!marginLevelProvided && (equityProvided || marginProvided)) {
+    next.marginLevel = next.margin > 0 ? (next.equity / next.margin) * 100 : 0;
   }
 
   return next;
@@ -962,6 +993,7 @@ export class TerminalTicketRealtimeClient {
   private manualDisconnect = false;
   private refreshPromise: Promise<void> | null = null;
   private stateRefreshPromise: Promise<void> | null = null;
+  private stateRefreshReleaseTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingRequests = new Map<string, PendingRequest>();
   private streamRouter = new WebSocketStreamRouter();
@@ -975,6 +1007,10 @@ export class TerminalTicketRealtimeClient {
   private feedSubscribedSymbols = new Set<string>();
   private ohlcListeners = new Set<(payload: OhlcPayload) => void>();
   private ohlcHistoryMetadataListeners = new Set<(metadata: OhlcHistoryResponseMetadata) => void>();
+  // The terminal feed backend keeps only the newest chart request on a socket.
+  // Serialize requests so a background prewarm cannot cancel the selected
+  // symbol's in-flight history response.
+  private chartRequestQueue: Promise<void> = Promise.resolve();
 
   private terminalToken: string;
   private feedTicket: string;
@@ -1110,6 +1146,11 @@ export class TerminalTicketRealtimeClient {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    if (this.stateRefreshReleaseTimer) {
+      clearTimeout(this.stateRefreshReleaseTimer);
+      this.stateRefreshReleaseTimer = null;
+    }
+    this.stateRefreshPromise = null;
     this.feedSubscribedSymbols.clear();
     this.desiredFeedSymbols.clear();
     this.feedSocket?.close();
@@ -1219,11 +1260,18 @@ export class TerminalTicketRealtimeClient {
       ...(options.before !== undefined ? { before: options.before } : {}),
     };
 
-    return this.sendFeedRequest<JsonRecord>(
-      payload,
-      ['chart.history'],
-      options.timeoutMs ?? 45_000,
+    const request = this.chartRequestQueue.then(() =>
+      this.sendFeedRequest<JsonRecord>(
+        payload,
+        ['chart.history'],
+        options.timeoutMs ?? 45_000,
+      ),
     );
+    this.chartRequestQueue = request.then(
+      () => undefined,
+      () => undefined,
+    );
+    return request;
   }
 
   public async placeOrder(request: TradeRequest): Promise<TradeResult> {
@@ -1232,15 +1280,9 @@ export class TerminalTicketRealtimeClient {
       { ...mapTerminalTradeRequestPayload(request), dry_run: this.shouldDryRunMutatingCommands() },
       ['result'],
       30_000,
+      request.clientRequestId,
     );
-    const result = mapTradeResult(payload);
-    this.streamRouter.publish('trade.execution', {
-      action: 'place_order',
-      request,
-      requestId: String(payload.requestId ?? payload.request_id ?? ''),
-      result,
-    });
-    return result;
+    return mapTradeResult(payload);
   }
 
   public async modifyOrder(
@@ -1259,14 +1301,7 @@ export class TerminalTicketRealtimeClient {
       ['result'],
       30_000,
     );
-    const result = mapTradeResult(payload);
-    this.streamRouter.publish('trade.execution', {
-      action: params.isPosition ? 'modify_position' : 'modify_order',
-      request: { ticket, ...params },
-      requestId: String(payload.requestId ?? payload.request_id ?? ''),
-      result,
-    });
-    return result;
+    return mapTradeResult(payload);
   }
 
   public async cancelOrder(ticket: number): Promise<TradeResult> {
@@ -1276,14 +1311,7 @@ export class TerminalTicketRealtimeClient {
       ['result'],
       30_000,
     );
-    const result = mapTradeResult(payload);
-    this.streamRouter.publish('trade.execution', {
-      action: 'cancel_order',
-      request: { ticket },
-      requestId: String(payload.requestId ?? payload.request_id ?? ''),
-      result,
-    });
-    return result;
+    return mapTradeResult(payload);
   }
 
   public async closePosition(ticket: number, volume?: number): Promise<TradeResult> {
@@ -1297,14 +1325,7 @@ export class TerminalTicketRealtimeClient {
       ['result'],
       30_000,
     );
-    const result = mapTradeResult(payload);
-    this.streamRouter.publish('trade.execution', {
-      action: 'close_position',
-      request: { ticket, volume },
-      requestId: String(payload.requestId ?? payload.request_id ?? ''),
-      result,
-    });
-    return result;
+    return mapTradeResult(payload);
   }
 
   private connectFeed(): Promise<void> {
@@ -1398,7 +1419,14 @@ export class TerminalTicketRealtimeClient {
     }
 
     if (type === 'error') {
-      this.options.onError?.(new Error(parseString(frame.message ?? frame.error?.toString(), 'Feed websocket error.')));
+      const error = new Error(
+        parseString(frame.message ?? frame.error?.toString(), 'Feed websocket error.'),
+      );
+      this.options.onError?.(error);
+      const requestId = parseString(frame.requestId ?? frame.request_id ?? frame.id);
+      if (requestId) {
+        this.rejectPendingRequest(requestId, error);
+      }
       return;
     }
 
@@ -1423,28 +1451,60 @@ export class TerminalTicketRealtimeClient {
       return;
     }
 
-    if (type === 'account.summary') {
+    if (normalizedType === 'account.summary' || normalizedType === 'account_summary') {
       this.applyAccountSummary(frame);
-      this.resolveMatchingPending(type, frame);
+      this.resolveMatchingPending('account.summary', frame);
       return;
     }
 
-    if (type === 'account.summary.delta') {
+    if (
+      normalizedType === 'account.summary.delta' ||
+      normalizedType === 'account_summary_delta' ||
+      normalizedType === 'account.update' ||
+      normalizedType === 'account_update' ||
+      normalizedType === 'balance.update' ||
+      normalizedType === 'balance_update' ||
+      normalizedType === 'equity.update' ||
+      normalizedType === 'equity_update' ||
+      normalizedType === 'margin.update' ||
+      normalizedType === 'margin_update'
+    ) {
       this.applyAccountSummaryDelta(frame);
       return;
     }
 
     if (type === 'result') {
       const op = parseString(frame.op ?? frame.operation);
+      const requestId = parseString(frame.requestId ?? frame.request_id ?? frame.id);
+      const pending = requestId ? this.pendingRequests.get(requestId) : undefined;
+      const clientAckReceivedAtMs = Date.now();
+      const clientTiming = pending
+        ? {
+            clientSentAtMs: pending.clientSentAtMs,
+            clientAckReceivedAtMs,
+            roundTripMs: Math.max(0, clientAckReceivedAtMs - pending.clientSentAtMs),
+          }
+        : undefined;
       if (op === 'state.refresh') {
         this.applyAccountSummary(frame);
       }
       this.resolveMatchingPending(type, frame);
-      this.streamRouter.publish('trade.execution', {
-        action: op,
-        requestId: parseString(frame.requestId ?? frame.request_id ?? frame.id),
-        result: mapTradeResult(getFramePayload(frame)),
-      });
+      const action =
+        op === 'order.place' ? 'place_order' :
+        op === 'order.modify' ? 'modify_order' :
+        op === 'order.cancel' ? 'cancel_order' :
+        op === 'position.modify' ? 'modify_position' :
+        op === 'position.close' ? 'close_position' :
+        null;
+      if (action) {
+        this.streamRouter.publish('trade.execution', {
+          action,
+          requestId,
+          request: pending?.request,
+          result: mapTradeResult(getFramePayload(frame)),
+          ...(clientTiming ? { clientTiming } : {}),
+        });
+      }
       return;
     }
 
@@ -1656,7 +1716,7 @@ export class TerminalTicketRealtimeClient {
       name: parseString(context.name),
       company: parseString(context.company),
       currency: parseString(context.currency, 'USD'),
-      leverage: parseInteger(context.leverage, 1),
+      leverage: parseInteger(context.leverage, 0),
       status: 'connected',
       connectedAt: new Date(),
       lastPingAt: new Date(),
@@ -1713,17 +1773,31 @@ export class TerminalTicketRealtimeClient {
   private refreshState(): Promise<void> {
     if (this.stateRefreshPromise) return this.stateRefreshPromise;
 
-    this.stateRefreshPromise = this.sendTradeRequest(
+    if (this.stateRefreshReleaseTimer) {
+      clearTimeout(this.stateRefreshReleaseTimer);
+      this.stateRefreshReleaseTimer = null;
+    }
+
+    const refreshPromise = this.sendTradeRequest(
       'state.refresh',
       { sections: ['account', 'positions', 'orders'] },
       ['result', 'account.summary'],
     )
       .then(() => undefined)
       .finally(() => {
-        this.stateRefreshPromise = null;
+        // Keep the completed snapshot through this event-loop turn. The page
+        // reads positions/orders first and account info immediately afterward;
+        // all three should reuse the same authoritative state.refresh result.
+        this.stateRefreshReleaseTimer = setTimeout(() => {
+          if (this.stateRefreshPromise === refreshPromise) {
+            this.stateRefreshPromise = null;
+          }
+          this.stateRefreshReleaseTimer = null;
+        }, 0);
       });
 
-    return this.stateRefreshPromise;
+    this.stateRefreshPromise = refreshPromise;
+    return refreshPromise;
   }
 
   private detachSocketHandlers(socket: WebSocket): void {
@@ -1750,6 +1824,9 @@ export class TerminalTicketRealtimeClient {
         timeout,
         expectedTypes,
         lane: 'feed',
+        operation: parseString(payload.type, 'feed.request'),
+        request: payload,
+        clientSentAtMs: Date.now(),
       });
     });
 
@@ -1766,8 +1843,9 @@ export class TerminalTicketRealtimeClient {
     payload: JsonRecord = {},
     expectedTypes: string[] = ['result'],
     timeoutMs = REQUEST_TIMEOUT_MS,
+    requestIdOverride?: string,
   ): Promise<TPayload> {
-    const requestId = crypto.randomUUID();
+    const requestId = requestIdOverride?.trim() || crypto.randomUUID();
     const isCommand = type.includes('.');
     const isMutatingCommand = /^(order|position)\./.test(type);
     const explicitIdempotencyKey = parseString(payload.idempotency_key ?? payload.idempotencyKey);
@@ -1793,6 +1871,9 @@ export class TerminalTicketRealtimeClient {
         timeout,
         expectedTypes,
         lane: 'trade',
+        operation: type,
+        request: guardedCommandPayload,
+        clientSentAtMs: Date.now(),
       });
     });
 

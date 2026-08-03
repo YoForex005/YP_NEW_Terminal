@@ -165,9 +165,8 @@ const TERMINAL_BOOTSTRAP_QUOTE_PREWARM_DELAY_MS = 250;
 const TERMINAL_BOOTSTRAP_OHLC_HISTORY_PREWARM_DELAY_MS = 1_500;
 const TERMINAL_REACTIVE_OHLC_HISTORY_PREWARM_DELAY_MS = 2_500;
 const TERMINAL_BACKGROUND_OHLC_PREWARM_LIMIT = 100;
-const TERMINAL_OPEN_TAB_OHLC_PREWARM_LIMIT = 8;
-const TERMINAL_OPEN_TAB_OHLC_PREWARM_DELAY_MS = 120;
 const TERMINAL_SYMBOL_HOVER_OHLC_PREWARM_DELAY_MS = 90;
+const TERMINAL_CHART_KEEP_ALIVE_LIMIT = 5;
 const TERMINAL_DEFAULT_TIMEFRAME_MINUTES = 1;
 const TERMINAL_OHLC_REPAIR_FETCH_TIMEOUT_MS = 17_000;
 const TERMINAL_OHLC_REPAIR_REQUEST_DEDUPE_MS = 15_000;
@@ -886,6 +885,36 @@ function uniqueTerminalSymbols(symbols: readonly string[]) {
     return symbols.reduce<string[]>((accumulator, symbol) => (
         appendUniqueTerminalSymbol(accumulator, symbol)
     ), []);
+}
+
+function reconcileTerminalChartKeepAliveSymbols(
+    currentSymbols: readonly string[],
+    openTabs: readonly string[],
+    selectedSymbol: string | null | undefined,
+    limit = TERMINAL_CHART_KEEP_ALIVE_LIMIT,
+) {
+    const normalizedSelectedSymbol = selectedSymbol?.trim() ?? '';
+    const isStillOpen = (symbol: string) =>
+        openTabs.some((tabSymbol) => symbolsMatch(tabSymbol, symbol)) ||
+        Boolean(normalizedSelectedSymbol && symbolsMatch(normalizedSelectedSymbol, symbol));
+    let nextSymbols = uniqueTerminalSymbols(currentSymbols.filter(isStillOpen));
+
+    // Restore a bounded set of persisted tabs on first mount. Afterwards the
+    // existing order is true LRU order and evicted open tabs stay cold until clicked.
+    if (nextSymbols.length === 0) {
+        nextSymbols = uniqueTerminalSymbols(openTabs).slice(-limit);
+    }
+
+    if (normalizedSelectedSymbol) {
+        nextSymbols = nextSymbols.filter((symbol) => !symbolsMatch(symbol, normalizedSelectedSymbol));
+        nextSymbols.push(normalizedSelectedSymbol);
+    }
+
+    return nextSymbols.slice(-Math.max(1, limit));
+}
+
+function getTerminalChartHistoryStatusKey(symbol: string, timeframeMinutes: number) {
+    return `${getTerminalSymbolKey(symbol)}:${normalizeTerminalTimeframeMinutes(timeframeMinutes)}`;
 }
 
 function appendExactQuoteSubscriptionSymbol(symbols: string[], symbol: string) {
@@ -2168,12 +2197,8 @@ function terminalTradeExecutionMatchesPendingOrder(
     }
 
     const requestId = getTerminalTradeExecutionRequestId(payload);
-    if (
-        correlation.resultRequestId &&
-        requestId &&
-        correlation.resultRequestId === requestId
-    ) {
-        return true;
+    if (correlation.resultRequestId && requestId) {
+        return correlation.resultRequestId === requestId;
     }
 
     const resultOrder = getTerminalTradeResultNumber(payload, 'order');
@@ -2489,24 +2514,29 @@ function NetworkStatusMenu({
     status,
     error,
     activeAccount,
+    wsClient,
 }: {
     status: string;
     error?: string | null;
     activeAccount: DashboardTradingAccount | null;
+    wsClient: WebSocketTradingClient | null;
 }) {
     const [isOpen, setIsOpen] = useState(false);
-    const [latency, setLatency] = useState(6.81);
+    const [lastTradeRoundTripMs, setLastTradeRoundTripMs] = useState<number | null>(null);
 
     useEffect(() => {
-        if (status !== 'ready' && status !== 'connected') return;
-        const interval = setInterval(() => {
-            setLatency(prev => {
-                const variation = (Math.random() - 0.5) * 0.4;
-                return Math.max(4.1, Math.min(prev + variation, 9.5));
-            });
-        }, 2000);
-        return () => clearInterval(interval);
-    }, [status]);
+        setLastTradeRoundTripMs(null);
+        if (!wsClient) return;
+
+        return wsClient.addStreamListener('trade.execution', (message) => {
+            const payload = asTerminalRecord(message.payload);
+            const clientTiming = asTerminalRecord(payload?.clientTiming);
+            const roundTripMs = toFiniteNumber(clientTiming?.roundTripMs, Number.NaN);
+            if (Number.isFinite(roundTripMs) && roundTripMs >= 0) {
+                setLastTradeRoundTripMs(roundTripMs);
+            }
+        });
+    }, [wsClient]);
 
     const isConnected = status === 'ready' || status === 'connected';
     const serverLabel =
@@ -2538,7 +2568,9 @@ function NetworkStatusMenu({
                     <div className={`w-[2px] h-[10px] rounded-none transition-colors ${isConnected ? 'bg-emerald-500' : 'bg-muted-foreground/30'}`} />
                 </div>
                 <span className={`text-[8px] leading-none font-mono font-bold mt-[2px] mb-[1px] transition-colors ${isConnected ? 'text-emerald-500' : 'text-muted-foreground/50'}`}>
-                    {isConnected ? latency.toFixed(2) : '---'}
+                    {isConnected
+                        ? lastTradeRoundTripMs === null ? 'LIVE' : `${Math.round(lastTradeRoundTripMs)}ms`
+                        : '---'}
                 </span>
             </button>
 
@@ -2560,8 +2592,12 @@ function NetworkStatusMenu({
                         <p className="mt-1 break-all text-[12px] font-medium text-foreground">{serverLabel}</p>
                     </div>
                     <div className="px-3 py-2">
-                        <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-muted-foreground">Latency</p>
-                        <p className={`mt-1 break-all text-[12px] font-medium ${isConnected ? 'text-emerald-400' : 'text-muted-foreground'}`}>{isConnected ? `${latency.toFixed(2)} ms` : 'Disconnected'}</p>
+                        <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-muted-foreground">Last trade RTT</p>
+                        <p className={`mt-1 break-all text-[12px] font-medium ${isConnected ? 'text-emerald-400' : 'text-muted-foreground'}`}>
+                            {isConnected
+                                ? lastTradeRoundTripMs === null ? 'Place a trade to measure' : `${Math.round(lastTradeRoundTripMs)} ms`
+                                : 'Disconnected'}
+                        </p>
                     </div>
                     {error ? (
                         <div className="px-3 py-2">
@@ -3292,6 +3328,7 @@ function TradingDashboardInner() {
     const [selectedSymbol, setSelectedSymbol] = useState('');
     const [selectedSymbolAccountId, setSelectedSymbolAccountId] = useState<string | null>(null);
     const [openTabs, setOpenTabs] = useState<string[]>([]);
+    const [chartKeepAliveSymbols, setChartKeepAliveSymbols] = useState<string[]>([]);
 
     const [watchlistSymbols, setWatchlistSymbols] = useState<string[]>([]);
     const [visibleMarketSearchSymbols, setVisibleMarketSearchSymbols] = useState<string[]>([]);
@@ -3427,6 +3464,25 @@ function TradingDashboardInner() {
         ),
         [livePriceSymbolKey, selectedSymbol, storeSymbols],
     );
+    const renderedChartKeepAliveSymbols = useMemo(
+        () => reconcileTerminalChartKeepAliveSymbols(
+            chartKeepAliveSymbols,
+            openTabs,
+            selectedBrokerSymbol,
+        ),
+        [chartKeepAliveSymbols, openTabs, selectedBrokerSymbol],
+    );
+    useEffect(() => {
+        if (!selectedBrokerSymbol && openTabs.length === 0) {
+            setChartKeepAliveSymbols((current) => current.length === 0 ? current : []);
+            return;
+        }
+
+        setChartKeepAliveSymbols((current) => {
+            const next = reconcileTerminalChartKeepAliveSymbols(current, openTabs, selectedBrokerSymbol);
+            return areSymbolListsEqual(current, next) ? current : next;
+        });
+    }, [openTabs, selectedBrokerSymbol]);
     useEffect(() => {
         const unsubscribe = useWebtraderStore.subscribe((state, previousState) => {
             if (state.prices !== previousState.prices) {
@@ -3684,8 +3740,9 @@ function TradingDashboardInner() {
     const positionsRefreshSettleDeadlineRef = useRef<number | null>(null);
     const isTerminalMountedRef = useRef(true);
     const delayedPostTradeRefreshTimeoutsRef = useRef<Set<number>>(new Set());
-    const pendingOrderConfirmationRef = useRef<PendingTerminalOrderConfirmation | null>(null);
-    const pendingOrderConfirmationTimeoutRef = useRef<number | null>(null);
+    const activeOrderMutationCountRef = useRef(0);
+    const pendingOrderConfirmationsRef = useRef<Map<number, PendingTerminalOrderConfirmation>>(new Map());
+    const pendingOrderConfirmationTimeoutsRef = useRef<Map<number, number>>(new Map());
     const pendingOrderConfirmationSeqRef = useRef(0);
     const [closedHistoryState, setClosedHistoryState] = useState<{
         isLoading: boolean;
@@ -4051,20 +4108,24 @@ function TradingDashboardInner() {
     }, []);
     useEffect(() => {
         isTerminalMountedRef.current = true;
+        const delayedPostTradeRefreshTimeouts = delayedPostTradeRefreshTimeoutsRef.current;
+        const pendingOrderConfirmationTimeouts = pendingOrderConfirmationTimeoutsRef.current;
+        const pendingOrderConfirmations = pendingOrderConfirmationsRef.current;
 
         return () => {
             isTerminalMountedRef.current = false;
             positionsRefreshRequestSeqRef.current += 1;
             positionsRefreshInFlightRef.current = null;
-            delayedPostTradeRefreshTimeoutsRef.current.forEach((timeoutId) => {
+            delayedPostTradeRefreshTimeouts.forEach((timeoutId) => {
                 window.clearTimeout(timeoutId);
             });
-            delayedPostTradeRefreshTimeoutsRef.current.clear();
-            if (pendingOrderConfirmationTimeoutRef.current !== null) {
-                window.clearTimeout(pendingOrderConfirmationTimeoutRef.current);
-                pendingOrderConfirmationTimeoutRef.current = null;
-            }
-            pendingOrderConfirmationRef.current = null;
+            delayedPostTradeRefreshTimeouts.clear();
+            pendingOrderConfirmationTimeouts.forEach((timeoutId) => {
+                window.clearTimeout(timeoutId);
+            });
+            pendingOrderConfirmationTimeouts.clear();
+            pendingOrderConfirmations.clear();
+            activeOrderMutationCountRef.current = 0;
             if (positionsRefreshSettleTimeoutRef.current !== null) {
                 window.clearTimeout(positionsRefreshSettleTimeoutRef.current);
                 positionsRefreshSettleTimeoutRef.current = null;
@@ -4075,10 +4136,32 @@ function TradingDashboardInner() {
     }, [clearOhlcWarmupTimers]);
     const [quoteFeedWarning, setQuoteFeedWarning] = useState<string | null>(null);
     const [chartHistoryStatus, setChartHistoryStatus] = useState<ChartHistoryStatus | null>(null);
+    const chartHistoryStatusCacheRef = useRef<Map<string, ChartHistoryStatus>>(new Map());
     const activeChartSymbolRef = useRef(selectedBrokerSymbol);
     activeChartSymbolRef.current = selectedBrokerSymbol;
+    const activeChartTimeframeRef = useRef(normalizeTerminalTimeframeMinutes(chartTimeframeMinutes));
+    activeChartTimeframeRef.current = normalizeTerminalTimeframeMinutes(chartTimeframeMinutes);
     const hasObservedLiveMarketDataRef = useRef(false);
     const selectedChartTimeframeMinutes = normalizeTerminalTimeframeMinutes(chartTimeframeMinutes);
+    useEffect(() => {
+        if (!selectedBrokerSymbol) {
+            setChartHistoryStatus(null);
+            return;
+        }
+
+        const cachedStatus = chartHistoryStatusCacheRef.current.get(
+            getTerminalChartHistoryStatusKey(selectedBrokerSymbol, selectedChartTimeframeMinutes),
+        ) ?? null;
+        setChartHistoryStatus((current) =>
+            isMatchingTerminalChartHistoryStatus(
+                current,
+                selectedBrokerSymbol,
+                selectedChartTimeframeMinutes,
+            )
+                ? current
+                : cachedStatus,
+        );
+    }, [selectedBrokerSymbol, selectedChartTimeframeMinutes]);
     const selectedBrokerChartHasCandles = Boolean(
         selectedBrokerSymbol &&
         chartHistoryStatus?.hasCandles &&
@@ -4218,8 +4301,15 @@ function TradingDashboardInner() {
     }, [clearNonBlockingConnectionWarning]);
 
     const handleChartHistoryStatusChange = useCallback((nextStatus: ChartHistoryStatus) => {
+        chartHistoryStatusCacheRef.current.set(
+            getTerminalChartHistoryStatusKey(nextStatus.symbol, nextStatus.timeframeMinutes),
+            nextStatus,
+        );
         const activeChartSymbol = activeChartSymbolRef.current;
-        if (activeChartSymbol && !symbolsMatch(nextStatus.symbol, activeChartSymbol)) {
+        if (
+            (activeChartSymbol && !symbolsMatch(nextStatus.symbol, activeChartSymbol)) ||
+            nextStatus.timeframeMinutes !== activeChartTimeframeRef.current
+        ) {
             return;
         }
 
@@ -4311,6 +4401,7 @@ function TradingDashboardInner() {
             selectedOhlcHistoryBackfillTimerRef.current = null;
         }
         priceHistoryCache.current = {};
+        chartHistoryStatusCacheRef.current.clear();
         setChartHistoryStatus(null);
         setSelectedHistoryDiagnostics(null);
         ohlcService.disconnect();
@@ -4319,6 +4410,7 @@ function TradingDashboardInner() {
         setSelectedSymbol((current) => current === '' ? current : '');
         setSelectedSymbolAccountId(null);
         setOpenTabs((current) => current.length === 0 ? current : []);
+        setChartKeepAliveSymbols((current) => current.length === 0 ? current : []);
         setWatchlistSymbols((current) => current.length === 0 ? current : []);
         setOptimisticOpenPositions((current) => current.length === 0 ? current : []);
         terminalBootstrapQuotePrewarmKeyRef.current = null;
@@ -4380,20 +4472,26 @@ function TradingDashboardInner() {
     }, []);
 
     useEffect(() => {
-        const hasLaunchCodeInHash = (() => {
+        const hasLaunchCodeInUrl = (() => {
             if (typeof window === 'undefined') {
                 return false;
             }
 
             try {
-                const params = new URLSearchParams(window.location.hash.replace(/^#/, ''));
-                return params.has('launch_code') || params.has('launchCode') || params.has('code');
+                const launchCodeParamNames = ['launch', 'launch_code', 'launchCode', 'code'];
+                const searchParams = new URLSearchParams(window.location.search);
+                if (launchCodeParamNames.some((name) => searchParams.has(name))) {
+                    return true;
+                }
+
+                const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+                return launchCodeParamNames.some((name) => hashParams.has(name));
             } catch {
                 return false;
             }
         })();
 
-        if (terminalLaunchSession.isActive || hasLaunchCodeInHash) {
+        if (terminalLaunchSession.isActive || hasLaunchCodeInUrl) {
             setIsSnapshotLoading(false);
             return;
         }
@@ -5584,46 +5682,6 @@ function TradingDashboardInner() {
         }
     }, [chartTimeframeMinutes, requestOhlcHistoryForSymbols, storeSymbols, subscribeRealtimeSymbols]);
 
-    // Keep already-open charts hot in the service's bounded in-memory LRU. This
-    // runs outside the click path so switching tabs can synchronously paint both
-    // the live candle and the visible history window.
-    useEffect(() => {
-        if (!isOhlcHistoryClientReady || openTabs.length === 0) {
-            return;
-        }
-
-        const backgroundTabs = uniqueTerminalSymbols(openTabs)
-            .filter((tabSymbol) => !selectedSymbol || !symbolsMatch(tabSymbol, selectedSymbol))
-            .slice(-TERMINAL_OPEN_TAB_OHLC_PREWARM_LIMIT);
-        if (backgroundTabs.length === 0) {
-            return;
-        }
-
-        const timer = window.setTimeout(() => {
-            const normalizedTf = normalizeTerminalTimeframeMinutes(chartTimeframeMinutes);
-            for (const tabSymbol of backgroundTabs) {
-                prewarmTerminalChartSwitchSeed({
-                    accountSessionScopeId,
-                    symbol: tabSymbol,
-                    timeframeMinutes: normalizedTf,
-                });
-            }
-            primeTerminalMarketData(backgroundTabs, {
-                requestHistory: true,
-                historyLimit: TERMINAL_BACKGROUND_OHLC_PREWARM_LIMIT,
-            });
-        }, TERMINAL_OPEN_TAB_OHLC_PREWARM_DELAY_MS);
-
-        return () => window.clearTimeout(timer);
-    }, [
-        accountSessionScopeId,
-        chartTimeframeMinutes,
-        isOhlcHistoryClientReady,
-        openTabs,
-        primeTerminalMarketData,
-        selectedSymbol,
-    ]);
-
     const refreshTerminalSymbolCatalog = useCallback(async () => {
         const client = storeWsClient;
         if (
@@ -6399,6 +6457,16 @@ function TradingDashboardInner() {
             };
         }
 
+        // Trade commands use the same authenticated transport as account snapshots.
+        // Do not let read-only refresh traffic get ahead of an order acknowledgement.
+        if (activeOrderMutationCountRef.current > 0) {
+            return {
+                accountInfoUpdated: false,
+                positionsUpdated: false,
+                ordersUpdated: false,
+            };
+        }
+
         if (!storeWsClient?.isConnected || !storeWsClient.isAuthenticated) {
             setPositionsLoadState((current) => ({ ...current, isLoading: false }));
             return {
@@ -6622,6 +6690,11 @@ function TradingDashboardInner() {
             return;
         }
 
+        delayedPostTradeRefreshTimeoutsRef.current.forEach((timeoutId) => {
+            window.clearTimeout(timeoutId);
+        });
+        delayedPostTradeRefreshTimeoutsRef.current.clear();
+
         const timeoutId = window.setTimeout(() => {
             delayedPostTradeRefreshTimeoutsRef.current.delete(timeoutId);
             if (!isTerminalMountedRef.current) {
@@ -6636,22 +6709,23 @@ function TradingDashboardInner() {
         delayedPostTradeRefreshTimeoutsRef.current.add(timeoutId);
     }, [refreshLiveTradingState]);
 
-    const consumePendingOrderConfirmation = useCallback((id?: number): PendingTerminalOrderConfirmation | null => {
-        const pending = pendingOrderConfirmationRef.current;
-        if (id !== undefined && pending?.id !== id) {
+    const consumePendingOrderConfirmation = useCallback((id: number): PendingTerminalOrderConfirmation | null => {
+        const pending = pendingOrderConfirmationsRef.current.get(id) ?? null;
+        if (!pending) {
             return null;
         }
 
-        if (pendingOrderConfirmationTimeoutRef.current !== null) {
-            window.clearTimeout(pendingOrderConfirmationTimeoutRef.current);
-            pendingOrderConfirmationTimeoutRef.current = null;
+        const timeoutId = pendingOrderConfirmationTimeoutsRef.current.get(id);
+        if (timeoutId !== undefined) {
+            window.clearTimeout(timeoutId);
+            pendingOrderConfirmationTimeoutsRef.current.delete(id);
         }
-        pendingOrderConfirmationRef.current = null;
+        pendingOrderConfirmationsRef.current.delete(id);
 
-        return pending ?? null;
+        return pending;
     }, []);
 
-    const clearPendingOrderConfirmation = useCallback((id?: number) => {
+    const clearPendingOrderConfirmation = useCallback((id: number) => {
         void consumePendingOrderConfirmation(id);
     }, [consumePendingOrderConfirmation]);
 
@@ -6659,28 +6733,25 @@ function TradingDashboardInner() {
         message: string,
         correlation: PendingTerminalOrderCorrelation,
     ): number => {
-        clearPendingOrderConfirmation();
-
         const id = pendingOrderConfirmationSeqRef.current + 1;
         pendingOrderConfirmationSeqRef.current = id;
         const expiresAtMs = Date.now() + 60_000;
-        pendingOrderConfirmationRef.current = {
+        pendingOrderConfirmationsRef.current.set(id, {
             id,
             message,
             expiresAtMs,
             confirmed: false,
             correlation,
-        };
+        });
 
-        pendingOrderConfirmationTimeoutRef.current = window.setTimeout(() => {
-            if (pendingOrderConfirmationRef.current?.id === id) {
-                pendingOrderConfirmationRef.current = null;
-            }
-            pendingOrderConfirmationTimeoutRef.current = null;
+        const timeoutId = window.setTimeout(() => {
+            pendingOrderConfirmationsRef.current.delete(id);
+            pendingOrderConfirmationTimeoutsRef.current.delete(id);
         }, Math.max(0, expiresAtMs - Date.now()));
+        pendingOrderConfirmationTimeoutsRef.current.set(id, timeoutId);
 
         return id;
-    }, [clearPendingOrderConfirmation]);
+    }, []);
 
     useEffect(() => {
         if (!storeWsClient) {
@@ -6688,41 +6759,37 @@ function TradingDashboardInner() {
         }
 
         const unsub = storeWsClient.addStreamListener('trade.execution', (message) => {
-            const pendingOrderConfirmation = pendingOrderConfirmationRef.current;
-            if (!pendingOrderConfirmation) {
-                return;
-            }
-
-            if (Date.now() > pendingOrderConfirmation.expiresAtMs) {
-                clearPendingOrderConfirmation(pendingOrderConfirmation.id);
-                return;
-            }
-
-            if (pendingOrderConfirmation.confirmed) {
-                return;
-            }
-
             const retcode = parseTerminalTradeRetcode(getTerminalTradeResultRetcode(message.payload));
             const MT5_SUCCESS_CODES = TERMINAL_TRADE_SUCCESS_RETCODES;
             if (retcode === null || !MT5_SUCCESS_CODES.has(retcode)) {
                 return;
             }
 
-            if (!terminalTradeExecutionMatchesPendingOrder(
-                message.payload,
-                pendingOrderConfirmation.correlation,
-            )) {
-                return;
-            }
+            const now = Date.now();
+            for (const pendingOrderConfirmation of pendingOrderConfirmationsRef.current.values()) {
+                if (now > pendingOrderConfirmation.expiresAtMs) {
+                    clearPendingOrderConfirmation(pendingOrderConfirmation.id);
+                    continue;
+                }
+                if (
+                    pendingOrderConfirmation.confirmed ||
+                    !terminalTradeExecutionMatchesPendingOrder(
+                        message.payload,
+                        pendingOrderConfirmation.correlation,
+                    )
+                ) {
+                    continue;
+                }
 
-            applyTerminalTradeResultCorrelation(pendingOrderConfirmation.correlation, message.payload);
-            pendingOrderConfirmation.confirmed = true;
-            handleShowToast('success', 'Order submitted', pendingOrderConfirmation.message);
-            void refreshLiveTradingState({ forcePositionsRefresh: true });
+                applyTerminalTradeResultCorrelation(pendingOrderConfirmation.correlation, message.payload);
+                pendingOrderConfirmation.confirmed = true;
+                handleShowToast('success', 'Order submitted', pendingOrderConfirmation.message);
+                break;
+            }
         });
 
         return unsub;
-    }, [clearPendingOrderConfirmation, handleShowToast, refreshLiveTradingState, storeWsClient]);
+    }, [clearPendingOrderConfirmation, handleShowToast, storeWsClient]);
 
     const waitForPostTradeReconciliation = useCallback((
         options: TerminalPostTradeReconciliationOptions,
@@ -7352,6 +7419,38 @@ function TradingDashboardInner() {
         },
         [terminalPositions, selectedInstrument, activeAction, orderForm],
     );
+    const keptAliveChartEntries = useMemo(
+        () => renderedChartKeepAliveSymbols.flatMap((chartSymbol) => {
+            const symbolInfo = getSymbolInfoForInstrumentSymbol(chartSymbol);
+            if (!symbolInfo) {
+                return [];
+            }
+
+            const instrument = createTerminalInstrument(symbolInfo);
+            const isActive = Boolean(
+                selectedInstrument &&
+                symbolsMatch(instrument.symbol, selectedInstrument.symbol),
+            );
+            const positions = isActive
+                ? selectedSymbolPositions
+                : terminalPositions.filter((position) => symbolsMatch(position.symbol, instrument.symbol));
+
+            return [{
+                symbol: instrument.symbol,
+                instrument,
+                isActive,
+                positions,
+            }];
+        }),
+        [
+            createTerminalInstrument,
+            getSymbolInfoForInstrumentSymbol,
+            renderedChartKeepAliveSymbols,
+            selectedInstrument,
+            selectedSymbolPositions,
+            terminalPositions,
+        ],
+    );
     const positionPriceSeedsBySymbol = useMemo(() => {
         const seeds: Record<string, number> = {};
         for (const position of terminalPositions) {
@@ -7739,6 +7838,21 @@ function TradingDashboardInner() {
             symbol: exactSymbol,
             timeframeMinutes: chartTimeframeMinutes,
         });
+        // Synchronous switch-seed so layout/hydrate can paint candles immediately.
+        const normalizedTf = normalizeTerminalTimeframeMinutes(chartTimeframeMinutes);
+        prewarmTerminalChartSwitchSeed({
+            accountSessionScopeId,
+            symbol: exactSymbol,
+            timeframeMinutes: normalizedTf,
+        });
+        setChartKeepAliveSymbols((current) =>
+            reconcileTerminalChartKeepAliveSymbols(current, openTabs, exactSymbol),
+        );
+        setChartHistoryStatus(
+            chartHistoryStatusCacheRef.current.get(
+                getTerminalChartHistoryStatusKey(exactSymbol, chartTimeframeMinutes),
+            ) ?? null,
+        );
         setSelectedSymbol(exactSymbol);
         setSelectedSymbolAccountId(connectAccountId ?? null);
         startTransition(() => {
@@ -7783,10 +7897,12 @@ function TradingDashboardInner() {
             });
         });
     }, [
+        accountSessionScopeId,
         chartTimeframeMinutes,
         connectAccountId,
         handleShowToast,
         primeTerminalMarketData,
+        openTabs,
         selectedHistoryDiagnostics,
         storeSymbols,
     ]);
@@ -7834,6 +7950,9 @@ function TradingDashboardInner() {
     ]);
 
     const handleCloseTab = useCallback((symbol: string) => {
+        setChartKeepAliveSymbols((current) =>
+            current.filter((chartSymbol) => !symbolsMatch(chartSymbol, symbol)),
+        );
         startTransition(() => {
             setOpenTabs((prev) => {
                 const next = prev.filter((tab) => !symbolsMatch(tab, symbol));
@@ -7934,7 +8053,9 @@ function TradingDashboardInner() {
                 return;
             }
 
+            const clientRequestId = crypto.randomUUID();
             const tradeRequest: TradeRequest = {
+                clientRequestId,
                 symbol: order.symbol,
                 type: resolveOrderType(order.type, order.orderType),
                 volume: order.volume,
@@ -7975,6 +8096,7 @@ function TradingDashboardInner() {
                 tradeType: tradeRequest.type,
                 orderType: order.orderType,
                 volume: order.volume,
+                resultRequestId: clientRequestId,
                 ...(order.orderType !== 'market' ? { price: pendingOrderPrice } : {}),
             };
             const pendingOrderConfirmationId = registerPendingOrderConfirmation(
@@ -7982,8 +8104,16 @@ function TradingDashboardInner() {
                 pendingOrderCorrelation,
             );
             let tradeResult;
+            activeOrderMutationCountRef.current += 1;
             try {
-                tradeResult = await liveClient.placeOrder(tradeRequest);
+                try {
+                    tradeResult = await liveClient.placeOrder(tradeRequest);
+                } finally {
+                    activeOrderMutationCountRef.current = Math.max(
+                        0,
+                        activeOrderMutationCountRef.current - 1,
+                    );
+                }
             } catch (error) {
                 const msg = error instanceof Error ? error.message : String(error);
                 // Classify error: connection-lost means WS dropped while order was in-flight;
@@ -7993,8 +8123,9 @@ function TradingDashboardInner() {
 
                 if (isConnectionLost || isTimedOut) {
                     const consumeConfirmedPendingOrder = () => {
-                        const pendingOrderConfirmation = pendingOrderConfirmationRef.current;
-                        if (pendingOrderConfirmation?.id !== pendingOrderConfirmationId || !pendingOrderConfirmation.confirmed) {
+                        const pendingOrderConfirmation =
+                            pendingOrderConfirmationsRef.current.get(pendingOrderConfirmationId);
+                        if (!pendingOrderConfirmation?.confirmed) {
                             return null;
                         }
 
@@ -8236,8 +8367,8 @@ function TradingDashboardInner() {
                         : `${order.type.toUpperCase()} ${order.volume} ${order.symbol} @ ${pendingOrderPrice.toFixed(priceDigits)}`,
                 );
             }
-            void refreshLiveTradingState({ forcePositionsRefresh: true });
-            // Schedule a second refresh after 1.5s in case MT5 finalises balance after the first
+            // Reliable position/order events update the terminal immediately.
+            // Reconcile once, after the acknowledgement hot path has completed.
             schedulePostTradeRefresh(1500);
         };
 
@@ -8720,6 +8851,7 @@ function TradingDashboardInner() {
             {/* Header */}
             <Header
                 account={account}
+                positions={liveTerminalPositions}
                 selectedSymbol={selectedSymbol}
                 openTabs={openTabs}
                 userProfile={userProfile}
@@ -8859,30 +8991,46 @@ function TradingDashboardInner() {
                                     <TerminalChartLoadingShell />
                                 ) : selectedSymbolBelongsToActiveAccount && selectedInstrument ? (
                                     <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-                                        <div className="relative flex-1 flex flex-col z-10 bg-card">
-                                            <TradingChart
-                                                symbol={selectedInstrument.symbol}
-                                                accountSessionScopeId={accountSessionScopeId}
-                                                basePrice={selectedInstrument.bid}
-                                                instrument={selectedInstrument}
-                                                positions={selectedSymbolPositions}
-                                                onClosePosition={handleClosePosition}
-                                                onUpdatePosition={handleUpdatePosition}
-                                                onSell={handleSelectedSell}
-                                                onBuy={handleSelectedBuy}
-                                                onOpenOrderPanel={handleOpenTradePanel}
-                                                isOrderPanelOpen={isOrderPanelOpen}
-                                                onToggleOrderPanel={handleToggleOrderPanel}
-                                                onHistoryStatusChange={handleChartHistoryStatusChange}
-                                                timeframeMinutes={chartTimeframeMinutes}
-                                                onTimeframeChange={setChartTimeframeMinutes}
-                                                chartType={chartType}
-                                                onChartTypeChange={setChartType}
-                                                layoutPanes={chartLayoutPanes}
-                                                onLayoutPanesChange={setChartLayoutPanes}
-                                                chartBarSpacing={chartBarSpacing}
-                                                onChartBarSpacingChange={setChartBarSpacing}
-                                            />
+                                        <div className="relative flex-1 bg-card">
+                                            {keptAliveChartEntries.map((chartEntry, chartIndex) => (
+                                                <div
+                                                    key={`${accountSessionScopeId ?? connectAccountId ?? 'terminal'}:${getTerminalSymbolKey(chartEntry.symbol)}`}
+                                                    className={`absolute inset-0 flex min-h-0 min-w-0 flex-col overflow-hidden bg-card ${
+                                                        chartEntry.isActive
+                                                            ? 'visible z-10'
+                                                            : 'invisible pointer-events-none z-0'
+                                                    }`}
+                                                    aria-hidden={!chartEntry.isActive}
+                                                >
+                                                    <TradingChart
+                                                        symbol={chartEntry.symbol}
+                                                        accountSessionScopeId={accountSessionScopeId}
+                                                        basePrice={chartEntry.instrument.bid}
+                                                        instrument={chartEntry.instrument}
+                                                        positions={chartEntry.positions}
+                                                        onClosePosition={handleClosePosition}
+                                                        onUpdatePosition={handleUpdatePosition}
+                                                        onSell={handleSelectedSell}
+                                                        onBuy={handleSelectedBuy}
+                                                        onOpenOrderPanel={handleOpenTradePanel}
+                                                        isOrderPanelOpen={chartEntry.isActive && isOrderPanelOpen}
+                                                        onToggleOrderPanel={handleToggleOrderPanel}
+                                                        onHistoryStatusChange={handleChartHistoryStatusChange}
+                                                        timeframeMinutes={chartTimeframeMinutes}
+                                                        onTimeframeChange={setChartTimeframeMinutes}
+                                                        chartType={chartType}
+                                                        onChartTypeChange={setChartType}
+                                                        layoutPanes={chartEntry.isActive ? chartLayoutPanes : 1}
+                                                        onLayoutPanesChange={setChartLayoutPanes}
+                                                        chartBarSpacing={chartBarSpacing}
+                                                        onChartBarSpacingChange={setChartBarSpacing}
+                                                        isActive={chartEntry.isActive}
+                                                        backgroundHydrationDelayMs={
+                                                            chartEntry.isActive ? 0 : (chartIndex + 1) * 350
+                                                        }
+                                                    />
+                                                </div>
+                                            ))}
                                         </div>
                                     </div>
                                 ) : (terminalConnectionStatus === 'error' || activeGroupSymbolsState.error) ? (
@@ -9071,6 +9219,7 @@ function TradingDashboardInner() {
                                 status={networkConnectionStatus}
                                 error={isSoftQuoteFeedNotice(networkConnectionError) ? null : networkConnectionError}
                                 activeAccount={activeTradingAccount}
+                                wsClient={storeWsClient}
                             />
                         </div>
                     </div>

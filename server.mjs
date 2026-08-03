@@ -1,5 +1,11 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { createReadStream, existsSync, readdirSync, readFileSync } from "node:fs";
+import {
+  createReadStream,
+  existsSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+} from "node:fs";
 import { createServer } from "node:http";
 import { createConnection } from "node:net";
 import path from "node:path";
@@ -471,24 +477,56 @@ const verifyWebtraderToken = (token) => {
   return payload;
 };
 
-const sendJson = (socket, payload) => {
+const sendJson = (socket, payload, onFlushed) => {
   if (socket.readyState !== WebSocket.OPEN) {
+    onFlushed?.();
     return;
   }
 
+  let settled = false;
+  const finish = () => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    onFlushed?.();
+  };
+
   try {
-    socket.send(JSON.stringify(payload));
+    socket.send(JSON.stringify(payload), finish);
   } catch {
     // Best-effort diagnostics only; transport cleanup happens through ws events.
+    finish();
   }
 };
 
-const sendError = (socket, requestId, code, message) => {
+const sendError = (socket, requestId, code, message, onFlushed) => {
   sendJson(socket, {
     event: "error",
     requestId,
     error: { code, message },
-  });
+  }, onFlushed);
+};
+
+const sendErrorAndClose = (
+  socket,
+  requestId,
+  code,
+  message,
+  closeCode,
+  closeReason,
+) => {
+  let closeTimer = null;
+  const closeAfterSend = () => {
+    if (closeTimer != null) {
+      clearTimeout(closeTimer);
+      closeTimer = null;
+    }
+    closeSocket(socket, closeCode, closeReason);
+  };
+
+  closeTimer = setTimeout(closeAfterSend, 250);
+  sendError(socket, requestId, code, message, closeAfterSend);
 };
 
 const frameToUtf8Text = (data) => {
@@ -599,13 +637,14 @@ const createBridgeConnection = (client, request) => {
   bridgeStats.activeClients += 1;
 
   const authTimer = setTimeout(() => {
-    sendError(
+    sendErrorAndClose(
       client,
       undefined,
       "WS_AUTH_TIMEOUT",
       "WebSocket authentication timed out.",
+      1008,
+      "Authentication timed out",
     );
-    closeSocket(client, 1008, "Authentication timed out");
   }, authTimeoutMs);
 
   const markAuthenticated = () => {
@@ -685,13 +724,14 @@ const createBridgeConnection = (client, request) => {
         remote,
         message,
       });
-      sendError(
+      sendErrorAndClose(
         client,
         undefined,
         "UPSTREAM_WS_ERROR",
         upstreamDiagnosticMessage("Realtime upstream write failed."),
+        1011,
+        "Realtime upstream unavailable",
       );
-      closeSocket(client, 1011, "Realtime upstream unavailable");
       cleanup();
       return false;
     }
@@ -700,13 +740,14 @@ const createBridgeConnection = (client, request) => {
   const enqueueOrForward = (data, isBinary) => {
     if (!upstream || !upstreamOpen) {
       if (pendingFrames.length >= maxPendingFrames) {
-        sendError(
+        sendErrorAndClose(
           client,
           undefined,
           "WS_BACKPRESSURE",
           "Realtime bridge queue is full.",
+          1013,
+          "Bridge queue is full",
         );
-        closeSocket(client, 1013, "Bridge queue is full");
         return;
       }
 
@@ -854,15 +895,16 @@ const createBridgeConnection = (client, request) => {
       bridgeStats.lastUpstreamCloseCode = code || null;
       bridgeStats.lastUpstreamCloseReason = reason;
       if (client.readyState === WebSocket.OPEN) {
-        sendError(
+        sendErrorAndClose(
           client,
           undefined,
           "UPSTREAM_WS_CLOSED",
           upstreamDiagnosticMessage(
             `Realtime upstream closed${code ? ` with code ${code}` : ""}: ${reason}.`,
           ),
+          code || 1011,
+          reason,
         );
-        closeSocket(client, code || 1011, reason);
       }
       cleanup();
     });
@@ -876,15 +918,16 @@ const createBridgeConnection = (client, request) => {
       bridgeStats.lastUpstreamErrorAt = new Date().toISOString();
       bridgeStats.lastUpstreamErrorMessage = error.message;
       markUpstreamClosed();
-      sendError(
+      sendErrorAndClose(
         client,
         undefined,
         "UPSTREAM_WS_ERROR",
         upstreamDiagnosticMessage(
           `Realtime upstream is unavailable: ${error.message}.`,
         ),
+        1011,
+        "Realtime upstream unavailable",
       );
-      closeSocket(client, 1011, "Realtime upstream unavailable");
       cleanup();
     });
   };
@@ -904,8 +947,14 @@ const createBridgeConnection = (client, request) => {
         const message =
           error instanceof Error ? error.message : "WebSocket auth failed.";
         bridgeStats.lastAuthFailureAt = new Date().toISOString();
-        sendError(client, requestId, "WS_AUTH_FAILED", message);
-        closeSocket(client, 1008, "Authentication failed");
+        sendErrorAndClose(
+          client,
+          requestId,
+          "WS_AUTH_FAILED",
+          message,
+          1008,
+          "Authentication failed",
+        );
         return;
       }
 
@@ -923,15 +972,16 @@ const createBridgeConnection = (client, request) => {
           message,
         });
         bridgeStats.lastUpstreamErrorAt = new Date().toISOString();
-        sendError(
+        sendErrorAndClose(
           client,
           requestId,
           "UPSTREAM_WS_ERROR",
           upstreamDiagnosticMessage(
             `Realtime upstream could not be opened: ${message}.`,
           ),
+          1011,
+          "Realtime upstream unavailable",
         );
-        closeSocket(client, 1011, "Realtime upstream unavailable");
         cleanup();
       }
       return;
@@ -978,6 +1028,175 @@ const findBuiltChunk = (...segments) => {
     (entry) => entry === `${basename}.js` || entry.startsWith(`${basename}-`),
   );
   return match ? path.join(directory, match) : null;
+};
+
+const getStaticAssetContentType = (filePath) => {
+  const extension = path.extname(filePath).toLowerCase();
+  if (extension === ".js") return "application/javascript; charset=utf-8";
+  if (extension === ".css") return "text/css; charset=utf-8";
+  if (extension === ".json") return "application/json; charset=utf-8";
+  if (extension === ".map") return "application/json; charset=utf-8";
+  if (extension === ".svg") return "image/svg+xml";
+  if (extension === ".png") return "image/png";
+  if (extension === ".jpg" || extension === ".jpeg") return "image/jpeg";
+  if (extension === ".gif") return "image/gif";
+  if (extension === ".webp") return "image/webp";
+  if (extension === ".avif") return "image/avif";
+  if (extension === ".ico") return "image/x-icon";
+  if (extension === ".woff") return "font/woff";
+  if (extension === ".woff2") return "font/woff2";
+  return "application/octet-stream";
+};
+
+const isFile = (filePath) => {
+  try {
+    return statSync(filePath).isFile();
+  } catch {
+    return false;
+  }
+};
+
+const resolveSafeNextStaticFile = (staticRelativePath) => {
+  const segments = staticRelativePath
+    .split("/")
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+
+  if (
+    segments.length === 0 ||
+    segments.some(
+      (segment) =>
+        segment === "." ||
+        segment === ".." ||
+        segment.includes("\\") ||
+        path.isAbsolute(segment),
+    )
+  ) {
+    return null;
+  }
+
+  const filePath = path.join(__dirname, ".next", "static", ...segments);
+  const staticRoot = path.join(__dirname, ".next", "static");
+  const relativeToStaticRoot = path.relative(staticRoot, filePath);
+  if (
+    relativeToStaticRoot.startsWith("..") ||
+    path.isAbsolute(relativeToStaticRoot)
+  ) {
+    return null;
+  }
+
+  return isFile(filePath) ? filePath : null;
+};
+
+const findHashedStaticSibling = (staticRelativePath) => {
+  const directMatch = resolveSafeNextStaticFile(staticRelativePath);
+  if (directMatch) {
+    return directMatch;
+  }
+
+  const segments = staticRelativePath
+    .split("/")
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+  const filename = segments.pop();
+  if (!filename || segments.length === 0) {
+    return null;
+  }
+
+  const directory = path.join(__dirname, ".next", "static", ...segments);
+  if (!existsSync(directory)) {
+    return null;
+  }
+
+  const extension = path.extname(filename);
+  const basename = path.basename(filename, extension);
+  const match = readdirSync(directory).find(
+    (entry) =>
+      entry === filename ||
+      (entry.startsWith(`${basename}-`) && entry.endsWith(extension)),
+  );
+
+  return match ? path.join(directory, match) : null;
+};
+
+const findCssFileContaining = (pattern) => {
+  const cssDirectory = path.join(__dirname, ".next", "static", "css");
+  if (!existsSync(cssDirectory)) {
+    return null;
+  }
+
+  return (
+    readdirSync(cssDirectory)
+      .filter((entry) => entry.endsWith(".css"))
+      .map((entry) => path.join(cssDirectory, entry))
+      .find((filePath) => {
+        try {
+          return readFileSync(filePath, "utf8").includes(pattern);
+        } catch {
+          return false;
+        }
+      }) ?? null
+  );
+};
+
+const findLargestCssFile = () => {
+  const cssDirectory = path.join(__dirname, ".next", "static", "css");
+  if (!existsSync(cssDirectory)) {
+    return null;
+  }
+
+  return readdirSync(cssDirectory)
+    .filter((entry) => entry.endsWith(".css"))
+    .map((entry) => path.join(cssDirectory, entry))
+    .filter(isFile)
+    .sort((left, right) => statSync(right).size - statSync(left).size)[0] ?? null;
+};
+
+const findNextStaticAssetFallback = (pathname) => {
+  if (!pathname.startsWith("/_next/static/")) {
+    return null;
+  }
+
+  let staticRelativePath;
+  try {
+    staticRelativePath = decodeURIComponent(
+      pathname.slice("/_next/static/".length),
+    );
+  } catch {
+    return null;
+  }
+
+  const directOrHashed = findHashedStaticSibling(staticRelativePath);
+  if (directOrHashed) {
+    return directOrHashed;
+  }
+
+  if (staticRelativePath === "css/app/terminal/layout.css") {
+    return findCssFileContaining(".terminal-root");
+  }
+
+  if (staticRelativePath === "css/app/layout.css") {
+    return findLargestCssFile();
+  }
+
+  return null;
+};
+
+const handleNextStaticAssetRequest = (pathname, response) => {
+  const filePath = findNextStaticAssetFallback(pathname);
+  if (!filePath) {
+    return false;
+  }
+
+  response.writeHead(200, {
+    "content-type": getStaticAssetContentType(filePath),
+    "cache-control": dev
+      ? "no-store"
+      : "public, max-age=31536000, immutable",
+    "x-next-static-fallback": "custom-server",
+  });
+  createReadStream(filePath).pipe(response);
+  return true;
 };
 
 const staleNextChunkFallbacks = new Map(
@@ -1317,7 +1536,10 @@ const server = createServer(async (request, response) => {
     return;
   }
 
-  if (handleStaleNextChunkRequest(url.pathname, response)) {
+  if (
+    handleNextStaticAssetRequest(url.pathname, response) ||
+    handleStaleNextChunkRequest(url.pathname, response)
+  ) {
     return;
   }
 

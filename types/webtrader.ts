@@ -289,6 +289,8 @@ export interface TradingAccountInfo {
 // ============================================================================
 
 export interface TradeRequest {
+  /** Frontend correlation/idempotency key for one placement attempt. */
+  clientRequestId?: string;
   symbol: string;
   type: OrderType;
   volume: number;
@@ -450,6 +452,11 @@ export interface TradeResultPayload {
   requestId: string;
   action?: string;
   request?: unknown;
+  clientTiming?: {
+    clientSentAtMs: number;
+    clientAckReceivedAtMs: number;
+    roundTripMs: number;
+  };
 }
 
 export interface TerminalBootstrapState {

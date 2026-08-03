@@ -771,18 +771,25 @@ const mapAccountInfo = (payload: unknown): TradingAccountInfo | null => {
     source.marginAvailable ??
     source.margin_available ??
     marginFree;
+  const equity = parseNumber(source.equity);
+  const margin = parseNumber(source.margin);
+  const resolvedMarginFree = parseNumber(marginFree, equity - margin);
+  const resolvedMarginLevel = parseNumber(
+    source.marginLevel ?? source.margin_level,
+    margin > 0 ? (equity / margin) * 100 : 0,
+  );
 
   return {
     login: parseInteger(source.login),
     name: typeof source.name === 'string' ? source.name : '',
     server: typeof source.server === 'string' ? source.server : '',
     currency: typeof source.currency === 'string' ? source.currency : 'USD',
-    leverage: parseInteger(source.leverage, 1),
+    leverage: parseInteger(source.leverage, 0),
     balance: parseNumber(source.balance),
-    equity: parseNumber(source.equity),
-    margin: parseNumber(source.margin),
-    marginFree: parseNumber(marginFree),
-    marginLevel: parseNumber(source.marginLevel ?? source.margin_level),
+    equity,
+    margin,
+    marginFree: resolvedMarginFree,
+    marginLevel: resolvedMarginLevel,
     marginInitial: parseNumber(source.marginInitial ?? source.margin_initial),
     marginMaintenance: parseNumber(source.marginMaintenance ?? source.margin_maintenance),
     profit: parseNumber(source.profit),
@@ -790,7 +797,7 @@ const mapAccountInfo = (payload: unknown): TradingAccountInfo | null => {
     commission: parseNumber(source.commission),
     credit: parseNumber(source.credit),
     limitOrders: parseInteger(source.limitOrders ?? source.limit_orders),
-    availableMargin: parseNumber(availableMargin),
+    availableMargin: parseNumber(availableMargin, resolvedMarginFree),
   };
 };
 
@@ -3399,23 +3406,31 @@ export class WebSocketTradingClient {
   }
 
   async placeOrder(request: TradeRequest): Promise<TradeResult> {
-    const serverPricedRequest: TradeRequest & { requestId?: string } = { ...request };
+    const clientRequestId = request.clientRequestId?.trim() || crypto.randomUUID();
+    const {
+      clientRequestId: _clientRequestId,
+      ...serverPricedRequestPayload
+    } = request;
+    const serverPricedRequest: Omit<TradeRequest, 'clientRequestId'> & { requestId: string } = {
+      ...serverPricedRequestPayload,
+      requestId: clientRequestId,
+    };
     if (serverPricedRequest.type === 'buy' || serverPricedRequest.type === 'sell') {
       delete serverPricedRequest.price;
     }
-    serverPricedRequest.requestId = crypto.randomUUID();
 
     const payload = await this.sendRequest<Record<string, unknown>>(
       'place_order',
       serverPricedRequest,
       TRADE_EXECUTION_TIMEOUT_MS,
+      clientRequestId,
     );
     const result = mapTradeResult(payload.result ?? payload);
     this.clearPositionsRequestCache();
     this.publishStream('trade.execution', {
       action: 'place_order',
       request: serverPricedRequest,
-      requestId: result.requestId !== undefined ? String(result.requestId) : '',
+      requestId: clientRequestId,
       result,
     });
     return result;
@@ -3851,6 +3866,15 @@ export class WebSocketTradingClient {
         const source = isObject(eventData) ? eventData : {};
         const requestId = getFrameRequestId(envelope, source);
         const tradeRequestCorrelation = this.getTradeRequestCorrelation(requestId);
+        const pendingRequest = requestId ? this.pendingRequests.get(requestId) : undefined;
+        const clientAckReceivedAtMs = Date.now();
+        const clientTiming = pendingRequest
+          ? {
+              clientSentAtMs: pendingRequest.clientSentAtMs,
+              clientAckReceivedAtMs,
+              roundTripMs: Math.max(0, clientAckReceivedAtMs - pendingRequest.clientSentAtMs),
+            }
+          : undefined;
         if (requestId) {
           this.resolvePendingRequest(requestId, source);
         }
@@ -3863,6 +3887,7 @@ export class WebSocketTradingClient {
               : requestId ?? '',
           ...(tradeRequestCorrelation?.action ? { action: tradeRequestCorrelation.action } : {}),
           ...(tradeRequestCorrelation ? { request: tradeRequestCorrelation.data } : {}),
+          ...(clientTiming ? { clientTiming } : {}),
         };
         this.clearPositionsRequestCache();
         this.callbacks.onTradeResult?.(tradeResultPayload);
@@ -4208,6 +4233,7 @@ export class WebSocketTradingClient {
     action: string,
     data?: unknown,
     timeoutMs: number = WS_CONFIG.TIMEOUT,
+    requestIdOverride?: string,
   ): Promise<T> {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
       return Promise.reject(new Error('Not connected'));
@@ -4221,7 +4247,7 @@ export class WebSocketTradingClient {
       );
     }
 
-    const requestId = this.nextRequestId(action);
+    const requestId = requestIdOverride?.trim() || this.nextRequestId(action);
     const stream = getStreamForAction(action);
 
     return new Promise<T>((resolve, reject) => {
@@ -5199,7 +5225,7 @@ export class WebSocketTradingClient {
       name: typeof source.name === 'string' ? source.name : '',
       company: typeof source.company === 'string' ? source.company : '',
       currency: typeof source.currency === 'string' ? source.currency : 'USD',
-      leverage: parseInteger(source.leverage, 1),
+      leverage: parseInteger(source.leverage, 0),
       status: 'connected',
       connectedAt: parseDate(source.connectedAt),
       lastPingAt: parseDate(source.lastHeartbeatAt),

@@ -1371,7 +1371,6 @@ export const OHLCSANITY_REJECTED_LOG_KEY_LIMIT = 2_048;
 const OHLCSANITY_MIN_STALE_REFERENCE_GAP_MS = 10 * 60 * 1000;
 const OHLCSANITY_STALE_REFERENCE_GAP_BUCKETS = 20;
 const LIVE_BUCKET_ROLLOVER_GRACE_MS = 0;
-const LIVE_BUCKET_ROLLOVER_MAX_CATCHUP_BARS = 30;
 
 const OHLCSANITY_THRESHOLDS: Record<OhlcSanitySymbolClass, OhlcSanityThresholds> = {
   // Major FX pairs (EUR/USD, GBP/USD, AUD/USD, USD/CHF …)
@@ -2503,6 +2502,7 @@ function preferRealBar(
   existing: OHLCBar | undefined,
   incoming: OHLCBar,
   bucketMs?: number,
+  nowMs = Date.now(),
 ): OHLCBar {
   if (!existing) {
     return { ...incoming };
@@ -2530,7 +2530,10 @@ function preferRealBar(
     if (existingIsLive !== incomingIsLive && existingIsHistorical !== incomingIsHistorical) {
       const historicalBar = existingIsHistorical ? existing : incoming;
       const liveBar = existingIsLive ? existing : incoming;
-      if (!isClosedBucket(historicalBar, bucketMs)) {
+      if (
+        liveBar.basis !== 'rollover_last_close' &&
+        !isClosedBucket(historicalBar, bucketMs, nowMs)
+      ) {
         return {
           ...liveBar,
           time: existing.time,
@@ -5274,7 +5277,12 @@ class OhlcWebSocketService {
     let storedBar: OHLCBar;
 
     if (index >= 0) {
-      storedBar = preferRealBar(history[index], bar, bucketMs);
+      storedBar = preferRealBar(
+        history[index],
+        bar,
+        bucketMs,
+        this.getServerNowMs(),
+      );
       history[index] = storedBar;
     } else {
       storedBar = { ...bar };
@@ -5517,13 +5525,14 @@ class OhlcWebSocketService {
 
   private _normalizeBars(bars: OHLCBar[], bucketMs: number): OHLCBar[] {
     const byBucketTime = new Map<number, OHLCBar>();
+    const serverNowMs = this.getServerNowMs();
 
     for (const rawBar of bars) {
       const canonicalTime = getCanonicalIncomingBarTime(rawBar);
       const time = bucketMs > 0 ? bucketTime(canonicalTime, bucketMs) : canonicalTime;
       const bar = { ...rawBar, time, sourceTimeMs: rawBar.sourceTimeMs ?? canonicalTime };
       const existing = byBucketTime.get(time);
-      byBucketTime.set(time, preferRealBar(existing, bar, bucketMs));
+      byBucketTime.set(time, preferRealBar(existing, bar, bucketMs, serverNowMs));
     }
 
     const sorted = [...byBucketTime.values()].sort((left, right) => left.time - right.time);
@@ -5810,7 +5819,7 @@ class OhlcWebSocketService {
       latestLiveTickMs > current.time &&
       isLiveGeneratedBar(current) &&
       isHistoricalOhlcBar(incomingBar) &&
-      !isClosedBucket(incomingBar, bucketMs)
+      !isClosedBucket(incomingBar, bucketMs, this.getServerNowMs())
     ) {
       // Open bucket: history bar has the correct open and full tick range/volume
       // accumulated since the minute started; live bar has the latest close.
@@ -5832,7 +5841,12 @@ class OhlcWebSocketService {
       return mergedBar;
     }
 
-    return preferRealBar(current, incomingBar, bucketMs);
+    return preferRealBar(
+      current,
+      incomingBar,
+      bucketMs,
+      this.getServerNowMs(),
+    );
   }
 
   private _backfillMissingBars(key: SubKey, previousBar: OHLCBar, nextBarTime: number) {
@@ -6023,6 +6037,15 @@ class OhlcWebSocketService {
 
     const currentBucketTime = bucketTime(nowMs, bucketMs);
     const latestTick = this._getLatestTickForSymbol(this._symbolFromKey(key));
+    const latestTickBucketTime = latestTick
+      ? bucketTime(latestTick.timestampMs, bucketMs)
+      : 0;
+    if (
+      currentBucketTime > previousBar.time &&
+      latestTickBucketTime !== currentBucketTime
+    ) {
+      return false;
+    }
     const price = latestTick?.price && latestTick.price > 0
       ? latestTick.price
       : previousBar.close;
@@ -6078,6 +6101,14 @@ class OhlcWebSocketService {
     if (!latestTick) {
       return false;
     }
+    const bucketMs = this._bucketMsForKey(key);
+    if (
+      bucketMs <= 0 ||
+      bucketTime(latestTick.timestampMs, bucketMs) !==
+        bucketTime(this.getServerNowMs(), bucketMs)
+    ) {
+      return false;
+    }
 
     return this._seedCurrentBarFromPrice(
       key,
@@ -6118,12 +6149,15 @@ class OhlcWebSocketService {
             : liveSnapshot.bid > 0
               ? liveSnapshot.bid
               : liveSnapshot.ask;
-      const snapTime = typeof liveSnapshot.receivedAtMs === 'number' && liveSnapshot.receivedAtMs > 0
-        ? liveSnapshot.receivedAtMs
-        : liveSnapshot.time instanceof Date
-          ? liveSnapshot.time.getTime()
-          : Date.now();
-      timestampMs = snapTime > 0 ? snapTime : Date.now();
+      timestampMs = normalizeIncomingTickTimestampMs(
+        liveSnapshot.mt5_time_msc ??
+          liveSnapshot.mt5TimeMsc ??
+          liveSnapshot.mt5_time ??
+          liveSnapshot.mt5Time ??
+          liveSnapshot.time ??
+          liveSnapshot.receivedAtMs,
+        Date.now(),
+      );
     } else {
       const price = findValueBySymbol(useWebtraderStore.getState().prices ?? {}, symbol);
       seedPrice = priceFromTickLike(price);
@@ -6132,6 +6166,14 @@ class OhlcWebSocketService {
     }
 
     if (!seedPrice) {
+      return false;
+    }
+    const bucketMs = this._bucketMsForKey(key);
+    if (
+      bucketMs <= 0 ||
+      bucketTime(timestampMs, bucketMs) !==
+        bucketTime(this.getServerNowMs(), bucketMs)
+    ) {
       return false;
     }
 
@@ -6218,46 +6260,11 @@ class OhlcWebSocketService {
             this.lastKnownCandleTimestampMs.set(key, closedBar.time);
           }
           this.liveAggregateAnchoredSpikeBaselines.delete(key);
-
-          const currentBucketTime = bucketTime(nowMs, bucketMs);
-          const firstRolloverTime = current.time + bucketMs;
-          const catchUpBars = Math.max(
-            1,
-            Math.floor((currentBucketTime - firstRolloverTime) / bucketMs) + 1,
-          );
-          const limitedFirstRolloverTime = catchUpBars > LIVE_BUCKET_ROLLOVER_MAX_CATCHUP_BARS
-            ? currentBucketTime - ((LIVE_BUCKET_ROLLOVER_MAX_CATCHUP_BARS - 1) * bucketMs)
-            : firstRolloverTime;
-          let previousRolloverBar: OHLCBar = closedBar;
-
-          for (
-            let rolloverTime = limitedFirstRolloverTime;
-            rolloverTime <= currentBucketTime;
-            rolloverTime += bucketMs
-          ) {
-            const rolloverBar = this._liveRolloverBar(
-              rolloverTime,
-              previousRolloverBar.close,
-              previousRolloverBar,
-            );
-
-            if (rolloverTime < currentBucketTime) {
-              const closedRolloverBar: OHLCBar = { ...rolloverBar, closed: true };
-              this._pushToHistory(key, closedRolloverBar);
-              this._notifySubscribers(key, closedRolloverBar);
-              const known = this.lastKnownCandleTimestampMs.get(key) ?? 0;
-              if (closedRolloverBar.time > known) {
-                this.lastKnownCandleTimestampMs.set(key, closedRolloverBar.time);
-              }
-              previousRolloverBar = closedRolloverBar;
-              continue;
-            }
-
-            this.currentBars.set(key, rolloverBar);
-            this.currentBarLatestTickMs.set(key, rolloverTime);
-            this._notifySubscribers(key, rolloverBar);
-            previousRolloverBar = rolloverBar;
-          }
+          // A candle exists only when at least one market tick exists in its bucket.
+          // Leave the current slot empty until the next tick arrives; history catch-up
+          // will supply any candles missed while the feed was disconnected.
+          this.currentBars.delete(key);
+          this.currentBarLatestTickMs.delete(key);
         }
       }
     }, 1000);
@@ -7127,7 +7134,12 @@ class OhlcWebSocketService {
 
     if (current && current.time === bar.time) {
       const incomingBar = bar;
-      const preferredBar = preferRealBar(current, incomingBar, bucketMs);
+      const preferredBar = preferRealBar(
+        current,
+        incomingBar,
+        bucketMs,
+        this.getServerNowMs(),
+      );
       bar = this._acceptOhlcBarForKey(
         key,
         preferredBar,
@@ -7139,7 +7151,12 @@ class OhlcWebSocketService {
       this.currentBars.set(key, bar);
     } else if (!current && previousCommitted && previousCommitted.time === bar.time) {
       const incomingBar = bar;
-      const preferredBar = preferRealBar(previousCommitted, incomingBar, bucketMs);
+      const preferredBar = preferRealBar(
+        previousCommitted,
+        incomingBar,
+        bucketMs,
+        this.getServerNowMs(),
+      );
       bar = this._acceptOhlcBarForKey(
         key,
         preferredBar,

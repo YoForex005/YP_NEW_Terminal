@@ -224,6 +224,10 @@ interface TradingChartProps {
     onLayoutPanesChange?: (layoutPanes: ChartLayoutPanes) => void;
     chartBarSpacing?: number | null;
     onChartBarSpacingChange?: (barSpacing: number) => void;
+    /** Visible chart gets foreground hydration and interactive global controls. */
+    isActive?: boolean;
+    /** Staggers initial hydration for hidden keep-alive charts. */
+    backgroundHydrationDelayMs?: number;
 }
 
 type ChartTypeOption = { id: string; label: ChartType; icon: JSX.Element };
@@ -345,6 +349,7 @@ function ChartPaneWithPriceSeed({
     showTitle,
     hydrationDelayMs = 0,
     isPrimaryPane = true,
+    isForegroundChart = true,
 }: {
     symbol: string;
     accountSessionScopeId?: string | null;
@@ -365,16 +370,23 @@ function ChartPaneWithPriceSeed({
     showTitle?: boolean;
     hydrationDelayMs?: number;
     isPrimaryPane?: boolean;
+    isForegroundChart?: boolean;
 }) {
-    const [isChartRuntimeReady, setIsChartRuntimeReady] = useState(false);
+    const [isChartRuntimeReady, setIsChartRuntimeReady] = useState(
+        () => isForegroundChart && isPrimaryPane !== false && !(hydrationDelayMs && hydrationDelayMs > 0),
+    );
 
     useEffect(() => {
         if (isChartRuntimeReady) {
             return;
         }
+        if (isForegroundChart) {
+            setIsChartRuntimeReady(true);
+            return;
+        }
 
         return scheduleChartRuntimeMount(() => setIsChartRuntimeReady(true), hydrationDelayMs);
-    }, [hydrationDelayMs, isChartRuntimeReady]);
+    }, [hydrationDelayMs, isChartRuntimeReady, isForegroundChart]);
 
     if (!isChartRuntimeReady) {
         return <ChartPaneLoadingFallback />;
@@ -400,6 +412,7 @@ function ChartPaneWithPriceSeed({
             onChartBarSpacingChange={onChartBarSpacingChange}
             showTitle={showTitle}
             isPrimaryPane={isPrimaryPane}
+            isForegroundChart={isForegroundChart}
         />
     );
 }
@@ -423,6 +436,7 @@ function KlineFallbackChartPane({
     onChartBarSpacingChange,
     showTitle,
     isPrimaryPane = true,
+    isForegroundChart = true,
 }: {
     symbol: string;
     accountSessionScopeId?: string | null;
@@ -442,6 +456,7 @@ function KlineFallbackChartPane({
     onChartBarSpacingChange?: (barSpacing: number) => void;
     showTitle?: boolean;
     isPrimaryPane?: boolean;
+    isForegroundChart?: boolean;
 }) {
     return (
         <KlineChartContainer
@@ -464,6 +479,7 @@ function KlineFallbackChartPane({
             onChartBarSpacingChange={onChartBarSpacingChange}
             showTitle={showTitle}
             isPrimaryPane={isPrimaryPane}
+            isForegroundChart={isForegroundChart}
         />
     );
 }
@@ -490,6 +506,8 @@ function TradingChart({
     onLayoutPanesChange,
     chartBarSpacing,
     onChartBarSpacingChange,
+    isActive = true,
+    backgroundHydrationDelayMs = 0,
 }: TradingChartProps) {
     const { resolvedTheme, setTheme } = useTheme();
     const tvTheme = resolvedTheme === 'light' ? 'Light' : 'Dark';
@@ -595,6 +613,10 @@ function TradingChart({
     }, []);
 
     useEffect(() => {
+        if (!isActive) {
+            return;
+        }
+
         const handleClickOutside = () => {
             setIsChartTypeOpen(false);
             setIsLayoutMenuOpen(false);
@@ -604,9 +626,28 @@ function TradingChart({
         const doc = document;
         doc.addEventListener('mousedown', handleClickOutside);
         return () => doc.removeEventListener('mousedown', handleClickOutside);
-    }, []);
+    }, [isActive]);
 
     useEffect(() => {
+        if (isActive) {
+            return;
+        }
+
+        setIsIndicatorsOpen(false);
+        setIsCompareOpen(false);
+        setIsSettingsOpen(false);
+        setIsChartTypeOpen(false);
+        setIsLayoutMenuOpen(false);
+        setIsLayoutGridOpen(false);
+        setIsCameraMenuOpen(false);
+        setContextMenu((current) => current.visible ? { ...current, visible: false } : current);
+    }, [isActive]);
+
+    useEffect(() => {
+        if (!isActive) {
+            return;
+        }
+
         const onKey = (e: KeyboardEvent) => {
             const target = e.target as HTMLElement | null;
             const isEditable = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
@@ -618,7 +659,7 @@ function TradingChart({
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
-    }, []);
+    }, [isActive]);
 
     const chartTypes = useMemo<ChartTypeOption[]>(() => {
         const chartTypeIcons: Record<ChartType, JSX.Element> = {
@@ -761,7 +802,7 @@ function TradingChart({
                                     <ChevronDown size={14} style={{ marginLeft: '4px' }} />
                                 </button>
                                 
-                                {isChartTypeOpen && iframeBody && createPortal(
+                                {isActive && isChartTypeOpen && iframeBody && createPortal(
                                     <div
                                         className="qa-portal-dropdown qa-dropdown-portal-item"
                                         style={{ 
@@ -867,17 +908,21 @@ function TradingChart({
                     onTimeframeChange={onTimeframeChange}
                     chartBarSpacing={chartBarSpacing}
                     onChartBarSpacingChange={onChartBarSpacingChange}
-                    hydrationDelayMs={paneIndex * SECONDARY_PANE_HYDRATION_STAGGER_MS}
+                    hydrationDelayMs={
+                        backgroundHydrationDelayMs +
+                        paneIndex * SECONDARY_PANE_HYDRATION_STAGGER_MS
+                    }
+                    isForegroundChart={isActive}
                 />
                 </div>
                 ))}
             </div>
 
-            {isIndicatorsOpen ? <IndicatorsModal isOpen={isIndicatorsOpen} onClose={() => setIsIndicatorsOpen(false)} /> : null}
-            {isCompareOpen ? <CompareSymbolModal isOpen={isCompareOpen} onClose={() => setIsCompareOpen(false)} /> : null}
-            {isSettingsOpen ? <ChartSettingsModal isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} symbol={symbol} /> : null}
+            {isActive && isIndicatorsOpen ? <IndicatorsModal isOpen={isIndicatorsOpen} onClose={() => setIsIndicatorsOpen(false)} /> : null}
+            {isActive && isCompareOpen ? <CompareSymbolModal isOpen={isCompareOpen} onClose={() => setIsCompareOpen(false)} /> : null}
+            {isActive && isSettingsOpen ? <ChartSettingsModal isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} symbol={symbol} /> : null}
 
-            {contextMenu.visible ? (
+            {isActive && contextMenu.visible ? (
                 <ChartContextMenu
                     visible={contextMenu.visible}
                     x={contextMenu.x}
@@ -896,7 +941,7 @@ function TradingChart({
             ) : null}
 
             {/* Layout Portal */}
-            {isLayoutMenuOpen && iframeBody && createPortal(
+            {isActive && isLayoutMenuOpen && iframeBody && createPortal(
                 <div
                     className="qa-portal-dropdown qa-dropdown-portal-item"
                     style={{ 
@@ -936,7 +981,7 @@ function TradingChart({
             )}
 
             {/* Layout Grid Portal */}
-            {isLayoutGridOpen && iframeBody && createPortal(
+            {isActive && isLayoutGridOpen && iframeBody && createPortal(
                 <div
                     className="qa-portal-dropdown qa-dropdown-portal-item p-3"
                     style={{ 
@@ -993,7 +1038,7 @@ function TradingChart({
             )}
 
             {/* Camera Options Portal */}
-            {isCameraMenuOpen && iframeBody && createPortal(
+            {isActive && isCameraMenuOpen && iframeBody && createPortal(
                 <div
                     className="qa-portal-dropdown qa-dropdown-portal-item"
                     style={{ 

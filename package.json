@@ -42,7 +42,6 @@
     "gsap": "^3.15.0",
     "immer": "^11.1.4",
     "install": "^0.13.0",
-    "ioredis": "^5.11.1",
     "jspdf": "^4.2.1",
     "klinecharts": "^9.8.12",
     "lightweight-charts": "^5.1.0",

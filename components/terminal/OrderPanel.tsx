@@ -50,6 +50,7 @@ const ORDER_PANEL_FLASH_CLASSES = [
 ] as const;
 
 const DISPLAY_QUOTE_THROTTLE_MS = 200;
+const MAX_IN_FLIGHT_ORDER_SUBMISSIONS = 5;
 
 const getDisplayBid = (bid: number, ask: number, last: number) =>
     bid > 0 ? bid : bid <= 0 && ask <= 0 && last > 0 ? last : 0;
@@ -302,7 +303,10 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
     const [volume, setVolume] = useState('0.01');
     const [tp, setTp] = useState('');
     const [sl, setSl] = useState('');
-    const [isPlacingOrder, setIsPlacingOrder] = useState(false);
+    const [inFlightOrderCount, setInFlightOrderCount] = useState(0);
+    const inFlightOrderCountRef = useRef(0);
+    const isAtOrderSubmissionCapacity =
+        inFlightOrderCount >= MAX_IN_FLIGHT_ORDER_SUBMISSIONS;
     const [pendingPrice, setPendingPrice] = useState('');
     const [lastInitializedSide, setLastInitializedSide] = useState<TradeSide | null>(null);
 
@@ -636,7 +640,7 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
 
     const limitPrice = parseFloat(pendingPriceDisplay);
     const canSubmitOneClickLimit = (side: TradeSide) => {
-        if (!hasLiveQuote || isPlacingOrder || !Number.isFinite(limitPrice) || limitPrice <= 0) {
+        if (!hasLiveQuote || isAtOrderSubmissionCapacity || !Number.isFinite(limitPrice) || limitPrice <= 0) {
             return false;
         }
 
@@ -655,7 +659,7 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
         if (!canSubmitSideOrder(side)) {
             return;
         }
-        if (isPlacingOrder) {
+        if (inFlightOrderCountRef.current >= MAX_IN_FLIGHT_ORDER_SUBMISSIONS) {
             return;
         }
 
@@ -680,11 +684,13 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
             ...(resolvedOrderType !== 'market' ? { price: resolvedPrice } : {}),
         };
 
-        setIsPlacingOrder(true);
+        inFlightOrderCountRef.current += 1;
+        setInFlightOrderCount(inFlightOrderCountRef.current);
         try {
             await onPlaceOrder?.(nextOrder);
         } finally {
-            setIsPlacingOrder(false);
+            inFlightOrderCountRef.current = Math.max(0, inFlightOrderCountRef.current - 1);
+            setInFlightOrderCount(inFlightOrderCountRef.current);
         }
     };
 
@@ -802,12 +808,12 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
         const isFilled = mode !== 'regular';
         const isLimit = mode === 'one-click-limit';
         const sellDisabled = mode === 'one-click-market'
-            ? !hasLiveQuote || isPlacingOrder
+            ? !hasLiveQuote || isAtOrderSubmissionCapacity
             : isLimit
                 ? !canSubmitOneClickLimit('sell')
                 : false;
         const buyDisabled = mode === 'one-click-market'
-            ? !hasLiveQuote || isPlacingOrder
+            ? !hasLiveQuote || isAtOrderSubmissionCapacity
             : isLimit
                 ? !canSubmitOneClickLimit('buy')
                 : false;
@@ -1095,13 +1101,13 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
                     <div className="pt-1 flex flex-col gap-[8px]">
                         <button
                             onClick={() => handlePlaceOrder(selectedSide)}
-                            disabled={!canSubmitOrder || isPlacingOrder}
+                            disabled={!canSubmitOrder || isAtOrderSubmissionCapacity}
                             className={`w-full h-[36px] flex items-center justify-center px-3 rounded-[3px] active:scale-[0.98] text-primary-foreground transition-all duration-300 text-[13px] font-bold tracking-wide
-                                ${!canSubmitOrder || isPlacingOrder ? 'cursor-not-allowed bg-accent border border-border text-muted-foreground' : selectedSide === 'sell' ? 'bg-destructive hover:bg-destructive/90' : 'bg-success hover:bg-success/90 text-background'}
+                                ${!canSubmitOrder || isAtOrderSubmissionCapacity ? 'cursor-not-allowed bg-accent border border-border text-muted-foreground' : selectedSide === 'sell' ? 'bg-destructive hover:bg-destructive/90' : 'bg-success hover:bg-success/90 text-background'}
                             `}
                         >
-                            {isPlacingOrder
-                                ? 'Placing order...'
+                            {isAtOrderSubmissionCapacity
+                                ? `Processing ${inFlightOrderCount} orders...`
                                 : `Confirm ${selectedSide === 'buy' ? 'Buy' : 'Sell'} ${volume} lots`}
                         </button>
                         <button

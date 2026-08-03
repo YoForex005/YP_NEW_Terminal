@@ -67,6 +67,16 @@ const parseLogin = (context: Record<string, unknown> | undefined): number => {
   ));
 };
 
+const LAUNCH_CODE_PARAM_NAMES = ['launch', 'launch_code', 'launchCode', 'code'] as const;
+
+const firstLaunchCodeFromParams = (params: URLSearchParams): string | null => {
+  for (const name of LAUNCH_CODE_PARAM_NAMES) {
+    const value = params.get(name)?.trim();
+    if (value) return value;
+  }
+  return null;
+};
+
 const hasAccountIdQueryParam = (): boolean => {
   if (typeof window === 'undefined') return false;
   return new URLSearchParams(window.location.search).has('accountId');
@@ -150,26 +160,43 @@ const buildLaunchOhlcSessionScopeId = (
     normalizeOhlcSessionGroup(session.group),
   ].filter(Boolean).join('|');
 
-const readLaunchCodeFromHash = (): string | null => {
+const readLaunchCodeFromLocation = (): string | null => {
   if (typeof window === 'undefined') return null;
+
+  const searchCode = firstLaunchCodeFromParams(new URLSearchParams(window.location.search));
+  if (searchCode) return searchCode;
+
   const hash = window.location.hash.startsWith('#')
     ? window.location.hash.slice(1)
     : window.location.hash;
-  const params = new URLSearchParams(hash);
-  return params.get('launch')?.trim() || null;
+  return firstLaunchCodeFromParams(new URLSearchParams(hash));
 };
 
-const removeLaunchCodeFromHash = (): void => {
+const removeLaunchCodeFromLocation = (): void => {
   if (typeof window === 'undefined') return;
+  const searchParams = new URLSearchParams(window.location.search);
   const hash = window.location.hash.startsWith('#')
     ? window.location.hash.slice(1)
     : window.location.hash;
-  const params = new URLSearchParams(hash);
-  if (!params.has('launch')) return;
+  const hashParams = new URLSearchParams(hash);
+  let removed = false;
 
-  params.delete('launch');
-  const nextHash = params.toString();
-  const nextUrl = `${window.location.pathname}${window.location.search}${nextHash ? `#${nextHash}` : ''}`;
+  for (const name of LAUNCH_CODE_PARAM_NAMES) {
+    if (searchParams.has(name)) {
+      searchParams.delete(name);
+      removed = true;
+    }
+    if (hashParams.has(name)) {
+      hashParams.delete(name);
+      removed = true;
+    }
+  }
+
+  if (!removed) return;
+
+  const nextSearch = searchParams.toString();
+  const nextHash = hashParams.toString();
+  const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ''}${nextHash ? `#${nextHash}` : ''}`;
   window.history.replaceState(window.history.state, '', nextUrl);
 };
 
@@ -197,7 +224,7 @@ export const useTerminalLaunchSession = (): UseTerminalLaunchSessionResult => {
   useEffect(() => {
     if (initializedRef.current) return;
 
-    const nextLaunchCode = readLaunchCodeFromHash();
+    const nextLaunchCode = readLaunchCodeFromLocation();
     if (nextLaunchCode) {
       initializedRef.current = true;
       setSessionStart({ mode: 'launch-code', launchCode: nextLaunchCode });
@@ -260,7 +287,7 @@ export const useTerminalLaunchSession = (): UseTerminalLaunchSessionResult => {
 
         didExchange = true;
         setExchange(payload);
-        removeLaunchCodeFromHash();
+        removeLaunchCodeFromLocation();
         ohlcService.setUseHistoryApi(false);
         const accountContext = getAccountContext(payload);
         const launchLogin = parseLogin(accountContext);

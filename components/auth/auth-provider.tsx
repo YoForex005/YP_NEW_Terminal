@@ -175,11 +175,18 @@ const isTerminalLaunchCodePage = (): boolean => {
   if (typeof window === "undefined") return false;
   if (window.location.pathname !== "/terminal") return false;
 
+  const launchCodeParamNames = ["launch", "launch_code", "launchCode", "code"];
+  const searchParams = new URLSearchParams(window.location.search);
+  if (launchCodeParamNames.some((name) => searchParams.has(name))) {
+    return true;
+  }
+
   const hash = window.location.hash.startsWith("#")
     ? window.location.hash.slice(1)
     : window.location.hash;
 
-  return new URLSearchParams(hash).has("launch");
+  const hashParams = new URLSearchParams(hash);
+  return launchCodeParamNames.some((name) => hashParams.has(name));
 };
 
 /**

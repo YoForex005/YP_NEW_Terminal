@@ -1,9 +1,6 @@
 import { createHash } from "node:crypto";
 import type { NextRequest } from "next/server";
 import { getCanonicalSymbol, normalizeSymbolKey } from "@/lib/market-symbols";
-import Redis from "ioredis";
-
-const redisCache = new Redis(process.env.REDIS_URL || "redis://127.0.0.1:6379");
 
 type JsonRecord = Record<string, unknown>;
 
@@ -1995,48 +1992,6 @@ export const requestTerminalOhlcGapRepair = async (
     normalized,
   );
 
-  // Tier 0: Check Redis Memory Cache first to avoid hitting MT5 or Gateway
-  if (normalized.requestType !== "get_before") {
-    try {
-      const redisKey = `market:history:${normalized.symbol}:${normalized.timeframeMinutes}`;
-      const cachedStr = await redisCache.get(redisKey);
-      if (cachedStr) {
-        const cachedBars = JSON.parse(cachedStr);
-        if (Array.isArray(cachedBars) && cachedBars.length > 0) {
-          console.info(`[terminal-ws-bridge] Redis cache hit for ${normalized.symbol} ${normalized.timeframeMinutes}m - ${cachedBars.length} bars`);
-          const diagnostics: TerminalOhlcRepairDiagnostics = {
-            ready: true,
-            repaired: false,
-            repairAttempted: false,
-            gaps: false,
-            stale: false,
-            source: "redis_cache",
-            phase: "repair",
-            symbol: normalized.symbol,
-            timeframeMinutes: normalized.timeframeMinutes,
-            requestedLimit: normalized.limit,
-            returnedBarCount: cachedBars.length,
-            realBarCount: cachedBars.length,
-            historySparse: false,
-            historyGapped: false,
-            historyStale: false,
-            managerFetchDeferred: false,
-            managerFetchPending: false,
-            managerFetchSucceeded: true,
-          };
-          return {
-            ...diagnostics,
-            accountId,
-            checkedAt: new Date().toISOString(),
-            probe: diagnostics,
-            bars: cachedBars,
-          };
-        }
-      }
-    } catch (e) {
-      console.error(`[terminal-ws-bridge] Redis read failed for ${normalized.symbol}:`, e);
-    }
-  }
   const pending = pendingTerminalOhlcRepairRequests.get(dedupeKey);
   if (pending) {
     return pending;
@@ -2399,14 +2354,6 @@ export const requestTerminalOhlcGapRepair = async (
 
     if (!shouldRepairTerminalOhlcHistory(probe)) {
       const bars = extractOhlcResponseBars(probePayload);
-      if (bars && bars.length > 0 && normalized.requestType !== "get_before") {
-        try {
-          const redisKey = `market:history:${normalized.symbol}:${normalized.timeframeMinutes}`;
-          await redisCache.set(redisKey, JSON.stringify(bars), "EX", 86400);
-        } catch (e) {
-          console.error(`[terminal-ws-bridge] Redis cache write failed for ${normalized.symbol}:`, e);
-        }
-      }
       return {
         ...probe,
         accountId,
@@ -2675,14 +2622,6 @@ export const requestTerminalOhlcGapRepair = async (
     const repaired = repair.ready || repair.managerFetchSucceeded;
 
     const bars = extractOhlcResponseBars(repairPayload);
-    if (bars && bars.length > 0 && normalized.requestType !== "get_before") {
-      try {
-        const redisKey = `market:history:${normalized.symbol}:${normalized.timeframeMinutes}`;
-        await redisCache.set(redisKey, JSON.stringify(bars), "EX", 86400);
-      } catch (e) {
-        console.error(`[terminal-ws-bridge] Redis cache write failed for ${normalized.symbol}:`, e);
-      }
-    }
 
     return {
       ...repair,
