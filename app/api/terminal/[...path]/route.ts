@@ -1,7 +1,15 @@
 import { NextRequest, NextResponse } from "next/server";
 
+import { authenticateRequest } from "@/lib/server/auth";
+
 const TERMINAL_PROXY_TIMEOUT_MS = 15_000;
 const DEFAULT_TERMINAL_PROXY_ORIGIN = "https://terminal.yopips.com";
+
+// Public terminal session exchange may run without a CRM cookie when using a
+// one-time launch code. Everything else requires an authenticated session.
+const PUBLIC_TERMINAL_PROXY_PATHS = new Set([
+  "sessions/exchange",
+]);
 
 const isUsableHttpOrigin = (value: string | undefined): value is string => {
   const normalized = value?.trim() ?? "";
@@ -44,8 +52,39 @@ const getTerminalProxyOrigin = (): string => {
   return DEFAULT_TERMINAL_PROXY_ORIGIN;
 };
 
+const sanitizeTerminalProxyPath = (path: string[] | undefined): string[] | null => {
+  const segments = (path ?? [])
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+  if (segments.length === 0) {
+    return null;
+  }
+
+  for (const segment of segments) {
+    // Block path traversal and absolute/URL-ish segments.
+    if (
+      segment === "." ||
+      segment === ".." ||
+      segment.includes("\\") ||
+      segment.includes("\0") ||
+      /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(segment)
+    ) {
+      return null;
+    }
+  }
+
+  return segments;
+};
+
 const buildTargetUrl = (request: NextRequest, path: string[]): string => {
-  const target = new URL(`/api/terminal/${path.join("/")}`, getTerminalBackendBase());
+  const joined = path.map(encodeURIComponent).join("/");
+  const target = new URL(`/api/terminal/${joined}`, getTerminalBackendBase());
+  // Re-normalize and ensure we never leave /api/terminal/.
+  const normalizedPath = target.pathname.replace(/\/+/g, "/");
+  if (!normalizedPath.startsWith("/api/terminal/")) {
+    throw new Error("Terminal proxy path escaped allowlist");
+  }
+  target.pathname = normalizedPath;
   target.search = request.nextUrl.search;
   return target.toString();
 };
@@ -54,7 +93,26 @@ const proxyTerminalRequest = async (
   request: NextRequest,
   context: { params: { path?: string[] } },
 ): Promise<NextResponse> => {
-  const targetUrl = buildTargetUrl(request, context.params.path ?? []);
+  const safePath = sanitizeTerminalProxyPath(context.params.path);
+  if (!safePath) {
+    return NextResponse.json({ error: "Invalid terminal proxy path" }, { status: 400 });
+  }
+
+  const publicPathKey = safePath.join("/");
+  const isPublicLaunchExchange = PUBLIC_TERMINAL_PROXY_PATHS.has(publicPathKey);
+  if (!isPublicLaunchExchange) {
+    const auth = await authenticateRequest(request);
+    if (!auth) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+  }
+
+  let targetUrl: string;
+  try {
+    targetUrl = buildTargetUrl(request, safePath);
+  } catch {
+    return NextResponse.json({ error: "Invalid terminal proxy path" }, { status: 400 });
+  }
   const headers = new Headers();
 
   const authorization = request.headers.get("authorization");
@@ -108,7 +166,7 @@ const proxyTerminalRequest = async (
       {
         error: message,
         code: "TERMINAL_BACKEND_UNREACHABLE",
-        upstream: getTerminalBackendBase(),
+        // Do not leak internal upstream base URLs to clients.
       },
       { status: 502 },
     );

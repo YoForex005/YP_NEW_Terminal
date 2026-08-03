@@ -1,8 +1,6 @@
 import {
   extractMt5LoginFromAccount,
   fetchBackendDashboardSnapshot,
-  requestAccountsBackend,
-  withBrokerContext,
 } from "@/lib/server/accounts-backend";
 import { resolveBackendEnvValue } from "@/lib/server/backend-env";
 import {
@@ -53,7 +51,6 @@ const EXPLICIT_GROUP_ALLOWLIST_ENV_KEYS = [
   "NEXT_PRIVATE_MT5_GROUP_ALLOWLIST",
 ];
 const OWNED_ACCOUNT_FALLBACK_TIMEOUT_MS = 900;
-const DEFAULT_MISSING_ACCOUNT_SYNC_TIMEOUT_MS = 2_500;
 
 const firstTrimmed = (...values: unknown[]): string => {
   for (const value of values) {
@@ -96,13 +93,6 @@ const parseDelimitedList = (value: string | undefined): string[] =>
 
 const resolveEnvValue = (key: string): string | undefined =>
   (resolveBackendEnvValue(key) ?? process.env[key]?.trim()) || undefined;
-
-const resolveMissingAccountSyncTimeoutMs = (): number => {
-  const parsed = Number(process.env.MT5_ACCOUNT_RESOLVE_SYNC_TIMEOUT_MS);
-  return Number.isFinite(parsed) && parsed > 0
-    ? Math.trunc(parsed)
-    : DEFAULT_MISSING_ACCOUNT_SYNC_TIMEOUT_MS;
-};
 
 export const normalizeMt5Login = (
   value: string | number | null | undefined,
@@ -304,39 +294,6 @@ const fetchBackendOwnedTradingAccounts = async (
   }
 };
 
-const syncMissingOwnedMt5Account = async (
-  scope: { userId: string; brokerId?: string },
-  login: string,
-): Promise<boolean> => {
-  if (!/^\d+$/.test(login)) {
-    return false;
-  }
-
-  try {
-    await requestAccountsBackend("/accounts/sync-broker", {
-      method: "POST",
-      body: withBrokerContext(
-        {
-          ownerId: scope.userId,
-          owner_id: scope.userId,
-          login,
-          accountId: `mt5-${login}`,
-          account_id: `mt5-${login}`,
-        },
-        scope.brokerId,
-      ),
-      timeoutMs: resolveMissingAccountSyncTimeoutMs(),
-    });
-    return true;
-  } catch (error) {
-    console.warn(
-      "Targeted MT5 account sync failed:",
-      error instanceof Error ? error.message : error,
-    );
-    return false;
-  }
-};
-
 const loadOwnedTradingAccounts = async (
   scope: { userId: string; brokerId?: string },
 ): Promise<TradingAccount[]> => {
@@ -473,21 +430,13 @@ export const resolveOwnedMt5Account = async (
     requestedLogin,
     scope.brokerId,
   );
+  // Fail-closed: never auto-claim ownership of an arbitrary MT5 login via sync-broker.
+  // Ownership must be established through account provisioning / verified attach flows only.
   if (mergedMatch || !requestedLogin) {
     return mergedMatch;
   }
 
-  const synced = await syncMissingOwnedMt5Account(scope, requestedLogin);
-  if (!synced) {
-    return null;
-  }
-
-  return findOwnedMt5Account(
-    await fetchPgOwnedTradingAccounts(scope),
-    requestedAccountId,
-    requestedLogin,
-    scope.brokerId,
-  );
+  return null;
 };
 
 export const resolveOwnedMt5Login = async (

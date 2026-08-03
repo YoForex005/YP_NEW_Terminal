@@ -2,19 +2,24 @@ import { NextResponse } from 'next/server';
 
 export const dynamic = 'force-dynamic';
 
-const MARKETAUX_API_TOKEN = typeof process !== 'undefined' && process.env.MARKETAUX_API_TOKEN 
-  ? process.env.MARKETAUX_API_TOKEN 
-  : "rXANlY6iJxpvaOREjsL8B4PB9xwizy3HO00IAkk2";
-
 export async function GET(request: Request) {
   try {
+    // Never hardcode third-party secrets in source. Fail closed if unset.
+    const marketauxApiToken = process.env.MARKETAUX_API_TOKEN?.trim() ?? '';
+    if (!marketauxApiToken) {
+      return NextResponse.json(
+        { error: 'Market news is not configured.' },
+        { status: 503 },
+      );
+    }
+
     const { searchParams } = new URL(request.url);
     const limit = searchParams.get('limit') || '3';
     const page = searchParams.get('page') || '1';
     const search = searchParams.get('search');
 
     const queryParams = new URLSearchParams({
-      api_token: MARKETAUX_API_TOKEN,
+      api_token: marketauxApiToken,
       language: "en",
       limit,
       page

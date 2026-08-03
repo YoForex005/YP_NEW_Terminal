@@ -560,13 +560,14 @@ type CanonicalRealtimeEvent =
 const normalizeRealtimeEventName = (
   eventName: string,
 ): CanonicalRealtimeEvent | null => {
-  switch (eventName.trim().toLowerCase()) {
+  switch (eventName.trim().toLowerCase().replace(/-/g, '_')) {
     case 'price_update':
     case 'tick':
     case 'quote':
     case 'quotes':
       return 'PRICE_UPDATE';
     case 'position_update':
+    case 'positions_update':
       return 'POSITION_UPDATE';
     case 'order_update':
       return 'ORDER_UPDATE';
@@ -3770,7 +3771,7 @@ export class WebSocketTradingClient {
         return;
       }
 
-      const normalizedEventName = eventName.trim().toLowerCase();
+      const normalizedEventName = eventName.trim().toLowerCase().replace(/-/g, '_');
 
       if (normalizedEventName === 'ack') {
         this.resolvePendingRequest(envelope.requestId, eventData);
@@ -3921,6 +3922,17 @@ export class WebSocketTradingClient {
 
       if (canonicalRealtimeEvent === 'POSITION_UPDATE') {
         const source = isObject(eventData) ? eventData : {};
+        const sourceLogin = source.accountLogin ?? source.account_login ?? source.login;
+        const mapRealtimePosition = (payload: unknown): Position | null => {
+          if (!isObject(payload) || sourceLogin === undefined) {
+            return mapPosition(payload);
+          }
+
+          return mapPosition({
+            ...payload,
+            login: payload.login ?? sourceLogin,
+          });
+        };
         const hasPositionsSnapshot =
           Array.isArray(eventData) || Array.isArray(source.positions);
         const rawPositions = Array.isArray(eventData)
@@ -3929,9 +3941,35 @@ export class WebSocketTradingClient {
             ? source.positions
             : [];
 
+        // The legacy C++ `positions-update` channel sends a one-row `positions`
+        // collection for live changes and marks only periodic full snapshots with
+        // `snapshot: true`. Treating every collection as authoritative would drop
+        // other open positions, so dispatch live rows as incremental upserts.
+        const isIncrementalLegacyPositionsUpdate =
+          normalizedEventName === 'positions_update' &&
+          !Array.isArray(eventData) &&
+          source.snapshot !== true;
+        if (hasPositionsSnapshot && isIncrementalLegacyPositionsUpdate) {
+          const action = normalizeUpdateAction(source.action);
+          const positions = rawPositions
+            .map(mapRealtimePosition)
+            .filter((position): position is Position => Boolean(position));
+          for (const position of positions) {
+            this.applyPositionUpdateToCachedSnapshot(action, position);
+            if (this.shouldSkipDuplicateRealtimeDispatch(getPositionDedupeKey(action, position))) {
+              continue;
+            }
+
+            const positionPayload = { action, position };
+            this.callbacks.onPositionUpdate?.(positionPayload);
+            this.publishStream('account.positions', positionPayload, envelope);
+          }
+          return;
+        }
+
         if (hasPositionsSnapshot) {
           const positions = rawPositions
-            .map((position) => mapPosition(position))
+            .map(mapRealtimePosition)
             .filter((position): position is Position => Boolean(position));
           const snapshotGeneration = this.advancePositionsSnapshotGeneration();
           this.cachePositionsSnapshot(positions, snapshotGeneration);
@@ -3944,7 +3982,7 @@ export class WebSocketTradingClient {
           return;
         }
 
-        const position = mapPosition(source.position ?? source);
+        const position = mapRealtimePosition(source.position ?? source);
         if (position) {
           const action = normalizeUpdateAction(source.action ?? source.type);
           this.applyPositionUpdateToCachedSnapshot(action, position);

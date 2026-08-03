@@ -15,7 +15,6 @@ import {
     HelpCircle,
     GripVertical,
     ExternalLink,
-    ChevronRight,
     Bell,
     CheckCheck,
     LayoutGrid,
@@ -601,18 +600,20 @@ function Header({ account, positions = [], selectedSymbol, openTabs, userProfile
                     ))}
                 </div>
 
-                <button
-                    className="w-full py-[7px] bg-accent hover:bg-accent/80 text-foreground text-[13px] font-bold rounded-[4px] transition-colors mt-1"
-                    onClick={() => {
-                        if (onTopUp) {
-                            onTopUp();
-                            setIsAccountMenuOpen(false);
-                            setIsMobileAccountMenuOpen(false);
-                        }
-                    }}
-                >
-                    Top Up
-                </button>
+                {activeAcc.isReal && (
+                    <button
+                        className="w-full py-[7px] bg-accent hover:bg-accent/80 text-foreground text-[13px] font-bold rounded-[4px] transition-colors mt-1"
+                        onClick={() => {
+                            if (onTopUp) {
+                                onTopUp();
+                                setIsAccountMenuOpen(false);
+                                setIsMobileAccountMenuOpen(false);
+                            }
+                        }}
+                    >
+                        Top Up
+                    </button>
+                )}
             </div>
 
             <div className="h-[1px] bg-accent mx-4 mb-2" />
@@ -628,33 +629,6 @@ function Header({ account, positions = [], selectedSymbol, openTabs, userProfile
                 </div>
             </button>
 
-            <button 
-                className="mt-1 flex items-center justify-between px-5 py-2.5 hover:bg-accent cursor-pointer transition-colors group w-full"
-                onClick={() => {
-                    onShowToast?.('success', 'Download Started', 'Your trading history log is being generated.');
-                    setIsAccountMenuOpen(false);
-                }}
-            >
-                <div className="flex items-center gap-2">
-                    <span className="text-[13px] text-foreground font-medium">Download Trading Log</span>
-                    <ExternalLink size={14} className="text-foreground" />
-                </div>
-            </button>
-
-            <div className="h-[1px] bg-accent mx-4 my-2" />
-
-            <button 
-                type="button"
-                className="w-full flex items-center justify-between px-5 pt-3 hover:bg-accent cursor-pointer transition-colors group pb-1"
-                onClick={(e) => { 
-                    e.preventDefault(); 
-                    e.stopPropagation(); 
-                    setAccountDropdownView('switch'); 
-                }}
-            >
-                <span className="text-[13px] text-foreground font-medium">Switch account</span>
-                <ChevronRight size={14} className="text-foreground transition-transform group-hover:translate-x-0.5" />
-            </button>
         </div>
         );
     };

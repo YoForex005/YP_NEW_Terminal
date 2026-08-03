@@ -25,6 +25,11 @@ export async function POST(request: NextRequest, context: RouteContext) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  // Admin surface — any authenticated user must not mutate MT5 group config.
+  if (auth.user.role !== "admin") {
+    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+  }
+
   const groupName = (await context.params).groupName?.trim() ?? "";
   if (!groupName) {
     return NextResponse.json({ error: "groupName is required." }, { status: 400 });

@@ -308,7 +308,7 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
     const isAtOrderSubmissionCapacity =
         inFlightOrderCount >= MAX_IN_FLIGHT_ORDER_SUBMISSIONS;
     const [pendingPrice, setPendingPrice] = useState('');
-    const [lastInitializedSide, setLastInitializedSide] = useState<TradeSide | null>(null);
+    const [lastInitializedOrderKey, setLastInitializedOrderKey] = useState<string | null>(null);
 
     // Live quote readiness is boolean-only (not per-tick bid/ask) so React does not
     // re-render the full panel on every price tick. Price text + flash are DOM-driven.
@@ -428,8 +428,8 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
     // Reads bid/ask from the latest snapshot ref — does NOT depend on per-tick prices.
     useEffect(() => {
         if (activeAction === null) {
-            if (lastInitializedSide !== null) {
-                setLastInitializedSide(null);
+            if (lastInitializedOrderKey !== null) {
+                setLastInitializedOrderKey(null);
                 setTp('');
                 setSl('');
             }
@@ -440,7 +440,8 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
             return;
         }
 
-        if (selectedSide !== lastInitializedSide) {
+        const orderKey = `${instrument.symbol}:${selectedSide}`;
+        if (orderKey !== lastInitializedOrderKey) {
             const snap = getSafeOrderPanelLivePriceSnapshot(instrument.symbol) ?? latestSnapRef.current;
             const snapBid = (snap?.bid ?? 0) > 0 ? (snap?.bid ?? 0) : liveInstrumentBid;
             const snapAsk = (snap?.ask ?? 0) > 0 ? (snap?.ask ?? 0) : liveInstrumentAsk;
@@ -452,12 +453,12 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
 
                 setTp(defaultTp.toFixed(instrument.digits));
                 setSl(defaultSl.toFixed(instrument.digits));
-                setLastInitializedSide(selectedSide);
+                setLastInitializedOrderKey(orderKey);
             }
         }
     }, [
         selectedSide,
-        lastInitializedSide,
+        lastInitializedOrderKey,
         liveQuoteReady,
         hasInstrumentExecutableQuote,
         liveInstrumentBid,

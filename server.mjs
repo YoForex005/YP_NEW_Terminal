@@ -44,6 +44,68 @@ const clientBackpressureBytes = parsePort(
   process.env.NODE_WS_CLIENT_BACKPRESSURE_BYTES,
   512 * 1024,
 );
+/** Max new bridge upgrades per IP per window (DoS / reconnect storms). */
+const wsUpgradeLimitPerIp = parsePort(process.env.NODE_WS_UPGRADE_LIMIT_PER_IP, 30);
+const wsUpgradeWindowMs = parsePort(process.env.NODE_WS_UPGRADE_WINDOW_MS, 60_000);
+/** Max simultaneous bridge sockets per IP. */
+const wsMaxConnectionsPerIp = parsePort(process.env.NODE_WS_MAX_CONNECTIONS_PER_IP, 12);
+/** Global cap on concurrent bridge clients (0 = unlimited). */
+const wsMaxActiveClients = parsePort(process.env.NODE_WS_MAX_ACTIVE_CLIENTS, 2_000);
+
+/** @type {Map<string, { count: number, windowStartedAt: number }>} */
+const wsUpgradeBucketsByIp = new Map();
+/** @type {Map<string, number>} */
+const wsActiveConnectionsByIp = new Map();
+
+const getRequestClientIp = (request) => {
+  const forwarded = request.headers?.["x-forwarded-for"] || request.headers?.["X-Forwarded-For"];
+  if (typeof forwarded === "string" && forwarded.trim()) {
+    return forwarded.split(",")[0].trim();
+  }
+  const realIp = request.headers?.["x-real-ip"] || request.headers?.["X-Real-Ip"];
+  if (typeof realIp === "string" && realIp.trim()) {
+    return realIp.trim();
+  }
+  return request.socket?.remoteAddress || "unknown";
+};
+
+const consumeWsUpgradeBudget = (ip) => {
+  const now = Date.now();
+  const existing = wsUpgradeBucketsByIp.get(ip);
+  if (!existing || now - existing.windowStartedAt >= wsUpgradeWindowMs) {
+    wsUpgradeBucketsByIp.set(ip, { count: 1, windowStartedAt: now });
+    return { ok: true };
+  }
+  existing.count += 1;
+  if (existing.count > wsUpgradeLimitPerIp) {
+    return { ok: false, retryAfterSec: Math.max(1, Math.ceil((existing.windowStartedAt + wsUpgradeWindowMs - now) / 1000)) };
+  }
+  return { ok: true };
+};
+
+const canAcceptWsConnection = (ip) => {
+  if (wsMaxActiveClients > 0 && bridgeStats.activeClients >= wsMaxActiveClients) {
+    return { ok: false, reason: "server_capacity" };
+  }
+  const activeForIp = wsActiveConnectionsByIp.get(ip) || 0;
+  if (activeForIp >= wsMaxConnectionsPerIp) {
+    return { ok: false, reason: "ip_connection_limit" };
+  }
+  return { ok: true };
+};
+
+const trackWsConnectionOpen = (ip) => {
+  wsActiveConnectionsByIp.set(ip, (wsActiveConnectionsByIp.get(ip) || 0) + 1);
+};
+
+const trackWsConnectionClose = (ip) => {
+  const current = wsActiveConnectionsByIp.get(ip) || 0;
+  if (current <= 1) {
+    wsActiveConnectionsByIp.delete(ip);
+    return;
+  }
+  wsActiveConnectionsByIp.set(ip, current - 1);
+};
 const requiredUpstreamEvents = [
   "SYMBOL_LIST",
   "PRICE_UPDATE",
@@ -618,10 +680,11 @@ const closeSocket = (socket, code, reason) => {
 };
 
 const createBridgeConnection = (client, request) => {
+  const clientIp = getRequestClientIp(request);
   const remote =
     request.socket.remoteAddress && request.socket.remotePort
       ? `${request.socket.remoteAddress}:${request.socket.remotePort}`
-      : "unknown";
+      : clientIp || "unknown";
   let upstream = null;
   let upstreamOpen = false;
   let upstreamCounted = false;
@@ -635,6 +698,7 @@ const createBridgeConnection = (client, request) => {
 
   bridgeStats.acceptedConnections += 1;
   bridgeStats.activeClients += 1;
+  trackWsConnectionOpen(clientIp);
 
   const authTimer = setTimeout(() => {
     sendErrorAndClose(
@@ -694,6 +758,7 @@ const createBridgeConnection = (client, request) => {
     clearPriceFlushTimer();
     pendingPriceByKey.clear();
     bridgeStats.activeClients = Math.max(0, bridgeStats.activeClients - 1);
+    trackWsConnectionClose(clientIp);
     if (authenticatedCounted) {
       authenticatedCounted = false;
       bridgeStats.authenticatedClients = Math.max(
@@ -1557,6 +1622,29 @@ server.on("upgrade", (request, socket, head) => {
   }
 
   if (bridgePaths.has(pathname)) {
+    const clientIp = getRequestClientIp(request);
+    const upgradeBudget = consumeWsUpgradeBudget(clientIp);
+    if (!upgradeBudget.ok) {
+      bridgeStats.lastClientErrorAt = new Date().toISOString();
+      bridgeStats.lastClientErrorMessage = `WS upgrade rate limited for ${clientIp}`;
+      closeUpgradeSocket(socket, 429, "Too many WebSocket upgrades");
+      return;
+    }
+
+    const capacity = canAcceptWsConnection(clientIp);
+    if (!capacity.ok) {
+      bridgeStats.lastClientErrorAt = new Date().toISOString();
+      bridgeStats.lastClientErrorMessage = `WS connection rejected (${capacity.reason}) for ${clientIp}`;
+      closeUpgradeSocket(
+        socket,
+        503,
+        capacity.reason === "ip_connection_limit"
+          ? "Too many connections from this IP"
+          : "WebSocket bridge at capacity",
+      );
+      return;
+    }
+
     try {
       wss.handleUpgrade(request, socket, head, (client) => {
         createBridgeConnection(client, request);

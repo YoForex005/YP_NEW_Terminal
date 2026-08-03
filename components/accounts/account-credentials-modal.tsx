@@ -211,6 +211,15 @@ export function AccountCredentialsModal({
   } | null>(null);
   const [fetchedCredentials, setFetchedCredentials] = useState<Partial<TradingAccountCredentials> | null>(null);
   const [fetchingCredentials, setFetchingCredentials] = useState(false);
+  const [stepUpPassword, setStepUpPassword] = useState("");
+  const [stepUpError, setStepUpError] = useState<string | null>(null);
+  const [credentialsUnlocked, setCredentialsUnlocked] = useState(false);
+  const [credentialMeta, setCredentialMeta] = useState<{
+    login?: string;
+    server?: string;
+    hasTradingPassword?: boolean;
+    hasInvestorPassword?: boolean;
+  } | null>(null);
   const { addToast } = useToastStore();
   const { hydrateFromSnapshot } = useTradingStore();
 
@@ -226,10 +235,14 @@ export function AccountCredentialsModal({
       setVerifyingType(null);
       setLastVerified(null);
       setFetchedCredentials(null);
+      setStepUpPassword("");
+      setStepUpError(null);
+      setCredentialsUnlocked(false);
+      setCredentialMeta(null);
     }
   }, [isOpen, account?.id]);
 
-  // Fetch real credentials from C++ DB whenever the modal opens
+  // Metadata only on open — passwords require CRM step-up (POST).
   useEffect(() => {
     if (!isOpen || !account?.id) return;
 
@@ -240,18 +253,79 @@ export function AccountCredentialsModal({
       .then(async (res) => {
         if (cancelled) return;
         if (!res.ok) return;
-        const payload = (await res.json()) as { ok?: boolean; credentials?: Partial<TradingAccountCredentials> };
-        if (!cancelled && payload.ok && payload.credentials) {
-          setFetchedCredentials(payload.credentials);
-        }
+        const payload = (await res.json()) as {
+          ok?: boolean;
+          login?: string;
+          server?: string;
+          hasTradingPassword?: boolean;
+          hasInvestorPassword?: boolean;
+          // Legacy: never trust credentials on GET if present.
+          credentials?: Partial<TradingAccountCredentials>;
+        };
+        if (cancelled || !payload.ok) return;
+        setCredentialMeta({
+          login: payload.login,
+          server: payload.server,
+          hasTradingPassword: payload.hasTradingPassword,
+          hasInvestorPassword: payload.hasInvestorPassword,
+        });
       })
-      .catch(() => { /* silently fall back to account.credentials */ })
+      .catch(() => { /* metadata optional */ })
       .finally(() => {
         if (!cancelled) setFetchingCredentials(false);
       });
 
     return () => { cancelled = true; };
   }, [isOpen, account?.id]);
+
+  const unlockStoredCredentials = async () => {
+    if (!account?.id) return;
+    const password = stepUpPassword.trim();
+    if (!password) {
+      setStepUpError("Enter your CRM password to reveal stored credentials.");
+      return;
+    }
+
+    setFetchingCredentials(true);
+    setStepUpError(null);
+    try {
+      const response = await fetch(
+        `/api/private/accounts/${encodeURIComponent(account.id)}/stored-credentials`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password }),
+        },
+      );
+      const payload = (await response.json().catch(() => ({}))) as {
+        ok?: boolean;
+        credentials?: Partial<TradingAccountCredentials>;
+        error?: string;
+        code?: string;
+        retryAfterSec?: number;
+      };
+
+      if (!response.ok || !payload.ok || !payload.credentials) {
+        const retryHint =
+          payload.code === "RATE_LIMITED" && payload.retryAfterSec
+            ? ` Try again in ${payload.retryAfterSec}s.`
+            : "";
+        setStepUpError((payload.error ?? "Could not unlock credentials.") + retryHint);
+        setCredentialsUnlocked(false);
+        setFetchedCredentials(null);
+        return;
+      }
+
+      setFetchedCredentials(payload.credentials);
+      setCredentialsUnlocked(true);
+      setStepUpPassword("");
+      addToast("Credentials unlocked for this session.", "success");
+    } catch {
+      setStepUpError("Could not unlock credentials. Check your connection and try again.");
+    } finally {
+      setFetchingCredentials(false);
+    }
+  };
 
   // Merge freshly fetched credentials with the snapshot so partial backend payloads
   // cannot hide passwords that are already available on the account.
@@ -407,7 +481,7 @@ export function AccountCredentialsModal({
                     Login
                   </p>
                   <code className="mt-1 block text-sm font-semibold text-slate-900 dark:text-slate-100">
-                    {account.accountNumber}
+                    {credentialMeta?.login || account.accountNumber}
                   </code>
                 </div>
                 <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-700 dark:bg-slate-950">
@@ -415,12 +489,72 @@ export function AccountCredentialsModal({
                     Server
                   </p>
                   <code className="mt-1 block text-sm font-semibold text-slate-900 dark:text-slate-100">
-                    {credentials?.server ?? account.serverIp ?? "Not assigned"}
+                    {credentials?.server ?? credentialMeta?.server ?? account.serverIp ?? "Not assigned"}
                   </code>
                 </div>
               </div>
 
-              {credentials ? (
+              {!credentialsUnlocked ? (
+                <div className="space-y-3 rounded-xl border border-amber-200/80 bg-amber-50/60 p-4 dark:border-amber-900/50 dark:bg-amber-950/20">
+                  <div className="flex items-start gap-2">
+                    <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-amber-700 dark:text-amber-400" />
+                    <div>
+                      <p className="text-xs font-bold text-slate-900 dark:text-slate-100">
+                        Re-enter your CRM password to reveal MT5 credentials
+                      </p>
+                      <p className="mt-1 text-[11px] leading-relaxed text-slate-600 dark:text-slate-400">
+                        Stored trading passwords are hidden until you confirm your dashboard login.
+                        {credentialMeta?.hasTradingPassword === false &&
+                        credentialMeta?.hasInvestorPassword === false
+                          ? " No stored passwords were found for this account."
+                          : ""}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <label className="block text-[11px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                      CRM password
+                    </label>
+                    <input
+                      type="password"
+                      autoComplete="current-password"
+                      value={stepUpPassword}
+                      onChange={(event) => {
+                        setStepUpPassword(event.target.value);
+                        if (stepUpError) setStepUpError(null);
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          void unlockStoredCredentials();
+                        }
+                      }}
+                      className="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-900 outline-none ring-primary/30 focus:ring-2 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+                      placeholder="Your dashboard password"
+                    />
+                    {stepUpError ? (
+                      <p className="text-[11px] font-medium text-red-600 dark:text-red-400">{stepUpError}</p>
+                    ) : null}
+                    <Button
+                      type="button"
+                      className="h-9 w-full rounded-lg text-xs font-bold"
+                      disabled={fetchingCredentials || !stepUpPassword.trim()}
+                      onClick={() => {
+                        void unlockStoredCredentials();
+                      }}
+                    >
+                      {fetchingCredentials ? (
+                        <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Lock className="mr-2 h-3.5 w-3.5" />
+                      )}
+                      Unlock credentials
+                    </Button>
+                  </div>
+                </div>
+              ) : null}
+
+              {credentialsUnlocked && credentials ? (
                 <div className="space-y-4">
                   <div className="space-y-3 rounded-xl border border-slate-200 p-4 dark:border-slate-700">
                     <div className="flex items-center justify-between gap-2">
@@ -538,7 +672,7 @@ export function AccountCredentialsModal({
                     ) : null}
                   </div>
                 </div>
-              ) : (
+              ) : credentialsUnlocked ? (
                 <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 dark:border-amber-800 dark:bg-amber-900/20">
                   <p className="text-sm text-amber-900 dark:text-amber-300">
                     Credentials are not available for this account. This usually means it was created
@@ -556,7 +690,7 @@ export function AccountCredentialsModal({
                     </Button>
                   )}
                 </div>
-              )}
+              ) : null}
 
               <div
                 className={cn(

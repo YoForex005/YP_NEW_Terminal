@@ -16,8 +16,21 @@ import {
   overlayPropfirmSnapshot,
 } from "@/lib/server/propfirm-backend";
 import type { DashboardSnapshot } from "@/types/dashboard";
+import { redactDashboardSnapshotForClient } from "@/lib/server/redact-credentials";
 
 export const dynamic = "force-dynamic";
+
+const jsonSnapshot = (
+  snapshot: DashboardSnapshot,
+  init?: { status?: number; headers?: Record<string, string> },
+) =>
+  NextResponse.json(redactDashboardSnapshotForClient(normalizeSnapshotTransactions(snapshot)), {
+    status: init?.status ?? 200,
+    headers: {
+      "Cache-Control": "no-store",
+      ...(init?.headers ?? {}),
+    },
+  });
 
 const DASHBOARD_SNAPSHOT_PROPFIRM_TIMEOUT_MS = 4_000;
 
@@ -140,9 +153,8 @@ export async function GET(request: NextRequest) {
       console.warn(
         `[snapshot] ${err.phase} timed out after ${err.elapsedMs}ms; returning empty fallback snapshot.`,
       );
-      return NextResponse.json(normalizeSnapshotTransactions(cloneEmptySnapshot()), {
-        status: 200,
-        headers: { "Cache-Control": "no-store", "X-Dashboard-Snapshot-Fallback": "local-timeout" },
+      return jsonSnapshot(cloneEmptySnapshot(), {
+        headers: { "X-Dashboard-Snapshot-Fallback": "local-timeout" },
       });
     }
 
@@ -168,18 +180,9 @@ export async function GET(request: NextRequest) {
         DASHBOARD_SNAPSHOT_PROPFIRM_TIMEOUT_MS + 500,
       );
       if (backendData && backendData.tradingAccounts.length > 0) {
-        return NextResponse.json(
-          normalizeSnapshotTransactions(
-            overlayPropfirmSnapshot(localSnapshot, backendData),
-          ),
-          {
-            status: 200,
-            headers: {
-              "Cache-Control": "no-store",
-              "X-Dashboard-Snapshot-Source": "propfirm-backend",
-            },
-          },
-        );
+        return jsonSnapshot(overlayPropfirmSnapshot(localSnapshot, backendData), {
+          headers: { "X-Dashboard-Snapshot-Source": "propfirm-backend" },
+        });
       }
     } catch (err) {
       console.warn(
@@ -201,12 +204,8 @@ export async function GET(request: NextRequest) {
       auth.user.brokerId,
     );
     if (pgAccounts.length === 0) {
-      return NextResponse.json(normalizeSnapshotTransactions(localSnapshot), {
-        status: 200,
-        headers: {
-          "Cache-Control": "no-store",
-          ...(timedOut ? { "X-Dashboard-Snapshot-Fallback": "pg-timeout" } : {}),
-        },
+      return jsonSnapshot(localSnapshot, {
+        headers: timedOut ? { "X-Dashboard-Snapshot-Fallback": "pg-timeout" } : {},
       });
     }
 
@@ -215,10 +214,7 @@ export async function GET(request: NextRequest) {
       tradingAccounts: mergeFullPgAccounts(localSnapshot.tradingAccounts, pgAccounts),
     };
 
-    return NextResponse.json(normalizeSnapshotTransactions(mergedSnapshot), {
-      status: 200,
-      headers: { "Cache-Control": "no-store" },
-    });
+    return jsonSnapshot(mergedSnapshot);
   }
 
   // Slow path (first load or forced refresh): query the accounts table directly.
@@ -230,12 +226,8 @@ export async function GET(request: NextRequest) {
   );
 
   if (pgAccounts.length === 0 && !localHasAccounts) {
-    return NextResponse.json(normalizeSnapshotTransactions(localSnapshot), {
-      status: 200,
-      headers: {
-        "Cache-Control": "no-store",
-        ...(timedOut ? { "X-Dashboard-Snapshot-Fallback": "pg-timeout" } : {}),
-      },
+    return jsonSnapshot(localSnapshot, {
+      headers: timedOut ? { "X-Dashboard-Snapshot-Fallback": "pg-timeout" } : {},
     });
   }
 
@@ -243,6 +235,7 @@ export async function GET(request: NextRequest) {
   const mergedSnapshot: DashboardSnapshot = { ...localSnapshot, tradingAccounts: mergedAccounts };
 
   // Persist newly discovered accounts so the next request hits the fast path.
+  // Keep full credentials in the server-side snapshot; only browser responses are redacted.
   if (mergedAccounts.length > localSnapshot.tradingAccounts.length) {
     void updateUserSnapshot(auth.user.id, (current) => {
       current.tradingAccounts = mergedAccounts;
@@ -252,8 +245,5 @@ export async function GET(request: NextRequest) {
     });
   }
 
-  return NextResponse.json(normalizeSnapshotTransactions(mergedSnapshot), {
-    status: 200,
-    headers: { "Cache-Control": "no-store" },
-  });
+  return jsonSnapshot(mergedSnapshot);
 }

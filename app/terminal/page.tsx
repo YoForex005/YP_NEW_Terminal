@@ -131,7 +131,11 @@ const LEFT_PANEL_STORAGE_KEY = 'term_left_w';
 const RIGHT_PANEL_STORAGE_KEY = 'term_right_w';
 const POSITIONS_HEIGHT_STORAGE_KEY = 'term_positions_h';
 const LIVE_QUOTE_INITIAL_WAIT_MS = 6000;
-const INITIAL_TERMINAL_CHART_GATE_TIMEOUT_MS = 450;
+// Hold the black "opening terminal" overlay until first chart candles (or this timeout).
+// Prefer a longer open wait over revealing a blank chart section.
+// Soft fail-open only: after this, show terminal chrome + chart loading shell.
+// Full reveal still requires hasCandles (never open an empty chart grid).
+const INITIAL_TERMINAL_CHART_GATE_TIMEOUT_MS = 20_000;
 const INITIAL_TERMINAL_ACCOUNT_DATA_GATE_TIMEOUT_MS = 600;
 const FIRST_TICK_NOTICE_MESSAGE =
     'Waiting for the first MT5 tick. Chart history can load independently while bid/ask prices initialize.';
@@ -150,6 +154,7 @@ const TERMINAL_ORDER_VOLUME_DELTA_TOLERANCE = 1e-8;
 const TERMINAL_POST_TRADE_RECONCILE_TIMEOUT_MS = 12_000;
 const TERMINAL_POST_TRADE_FAST_RECONCILE_TIMEOUT_MS = 4_000;
 const TERMINAL_POST_TRADE_FAST_RECONCILE_REFRESH_DELAYS_MS = [0, 300, 800, 1_600, 3_000] as const;
+const TERMINAL_POST_TRADE_SUCCESS_REFRESH_DELAYS_MS = [250, 1_000, 2_500] as const;
 const TERMINAL_POST_CLOSE_RECONCILE_TIMEOUT_MS = 5_000;
 const TERMINAL_POST_TRADE_RECONCILE_REFRESH_DELAYS_MS = [0, 500, 1_200, 2_500, 5_000, 9_000] as const;
 const TERMINAL_OPTIMISTIC_POSITION_TTL_MS = 30_000;
@@ -1945,9 +1950,12 @@ function getTerminalPositionLogin(position: WebtraderPosition): string | null {
 
 function terminalPositionMatchesAccount(position: WebtraderPosition, accountId: string | null | undefined): boolean {
     const requestedLogin = normalizeTerminalAccountLogin(accountId);
+    // No active account scope → keep rows (boot / pre-select).
     if (!requestedLogin) return true;
     const positionLogin = getTerminalPositionLogin(position);
-    return !positionLogin || positionLogin === requestedLogin;
+    // Fail-closed: untagged positions must not appear under a selected account.
+    if (!positionLogin) return false;
+    return positionLogin === requestedLogin;
 }
 
 function filterTerminalPositionsForAccount(
@@ -4137,6 +4145,8 @@ function TradingDashboardInner() {
     const [quoteFeedWarning, setQuoteFeedWarning] = useState<string | null>(null);
     const [chartHistoryStatus, setChartHistoryStatus] = useState<ChartHistoryStatus | null>(null);
     const chartHistoryStatusCacheRef = useRef<Map<string, ChartHistoryStatus>>(new Map());
+    /** Symbols/TFs that have actually painted candles in this session (keep-alive warm path). */
+    const confirmedChartPaintRef = useRef<Map<string, true>>(new Map());
     const activeChartSymbolRef = useRef(selectedBrokerSymbol);
     activeChartSymbolRef.current = selectedBrokerSymbol;
     const activeChartTimeframeRef = useRef(normalizeTerminalTimeframeMinutes(chartTimeframeMinutes));
@@ -4149,19 +4159,47 @@ function TradingDashboardInner() {
             return;
         }
 
-        const cachedStatus = chartHistoryStatusCacheRef.current.get(
-            getTerminalChartHistoryStatusKey(selectedBrokerSymbol, selectedChartTimeframeMinutes),
-        ) ?? null;
-        setChartHistoryStatus((current) =>
-            isMatchingTerminalChartHistoryStatus(
-                current,
-                selectedBrokerSymbol,
-                selectedChartTimeframeMinutes,
-            )
-                ? current
-                : cachedStatus,
+        const statusKey = getTerminalChartHistoryStatusKey(
+            selectedBrokerSymbol,
+            selectedChartTimeframeMinutes,
         );
-    }, [selectedBrokerSymbol, selectedChartTimeframeMinutes]);
+        setChartHistoryStatus((current) => {
+            // Already tracking this symbol/TF (handleSelectSymbol / TF handler set it).
+            if (
+                isMatchingTerminalChartHistoryStatus(
+                    current,
+                    selectedBrokerSymbol,
+                    selectedChartTimeframeMinutes,
+                )
+            ) {
+                return current;
+            }
+
+            // Warm keep-alive: this symbol already painted in-session and is still mounted.
+            const keepAliveWarm = renderedChartKeepAliveSymbols.some((symbol) =>
+                symbolsMatch(symbol, selectedBrokerSymbol),
+            );
+            if (keepAliveWarm && confirmedChartPaintRef.current.has(statusKey)) {
+                const warmStatus = {
+                    symbol: selectedBrokerSymbol,
+                    timeframeMinutes: selectedChartTimeframeMinutes,
+                    isLoading: false,
+                    hasCandles: true,
+                };
+                chartHistoryStatusCacheRef.current.set(statusKey, warmStatus);
+                return warmStatus;
+            }
+
+            const pending = {
+                symbol: selectedBrokerSymbol,
+                timeframeMinutes: selectedChartTimeframeMinutes,
+                isLoading: true,
+                hasCandles: false,
+            };
+            chartHistoryStatusCacheRef.current.set(statusKey, pending);
+            return pending;
+        });
+    }, [renderedChartKeepAliveSymbols, selectedBrokerSymbol, selectedChartTimeframeMinutes]);
     const selectedBrokerChartHasCandles = Boolean(
         selectedBrokerSymbol &&
         chartHistoryStatus?.hasCandles &&
@@ -4171,6 +4209,9 @@ function TradingDashboardInner() {
             selectedChartTimeframeMinutes,
         ),
     );
+    // Reveal chart section only when real candles exist for active symbol/TF.
+    // Never treat "settled empty" as ready — that shows a blank chart grid.
+    const selectedChartSectionReady = selectedBrokerChartHasCandles;
     const selectedHistoryTimeframeMinutes = selectedBrokerSymbol ? selectedChartTimeframeMinutes : null;
     const selectedOhlcHistoryBackfillTarget = useMemo<{
         key: string;
@@ -4301,21 +4342,31 @@ function TradingDashboardInner() {
     }, [clearNonBlockingConnectionWarning]);
 
     const handleChartHistoryStatusChange = useCallback((nextStatus: ChartHistoryStatus) => {
-        chartHistoryStatusCacheRef.current.set(
-            getTerminalChartHistoryStatusKey(nextStatus.symbol, nextStatus.timeframeMinutes),
-            nextStatus,
+        const statusKey = getTerminalChartHistoryStatusKey(
+            nextStatus.symbol,
+            nextStatus.timeframeMinutes,
         );
+        chartHistoryStatusCacheRef.current.set(statusKey, nextStatus);
+
+        // Track in-session painted symbols for instant keep-alive switches.
+        if (nextStatus.hasCandles) {
+            confirmedChartPaintRef.current.set(statusKey, true);
+        } else if (!nextStatus.isLoading) {
+            // Settled without candles — do not treat as warm.
+            confirmedChartPaintRef.current.delete(statusKey);
+        }
+
         const activeChartSymbol = activeChartSymbolRef.current;
         if (
             (activeChartSymbol && !symbolsMatch(nextStatus.symbol, activeChartSymbol)) ||
             nextStatus.timeframeMinutes !== activeChartTimeframeRef.current
         ) {
+            // Still cache for later warm switch; do not drive the active gate.
             return;
         }
 
-        startTransition(() => {
-            setChartHistoryStatus(nextStatus);
-        });
+        // Always sync for the active symbol (no transition lag on unlock or lock).
+        setChartHistoryStatus(nextStatus);
     }, []);
 
     useEffect(() => {
@@ -6683,7 +6734,7 @@ function TradingDashboardInner() {
     }, [activeTradingAccount, applyPositionsForActiveAccount, connectAccountId, setStoreAccountInfo, setStoreOrders, shouldUseTerminalRestPositions, storeWsClient, terminalConnectionStatus]);
 
     const schedulePostTradeRefresh = useCallback((
-        delayMs: number,
+        delayOrDelaysMs: number | readonly number[],
         onError: (error: unknown) => void = () => {},
     ) => {
         if (!isTerminalMountedRef.current) {
@@ -6695,18 +6746,23 @@ function TradingDashboardInner() {
         });
         delayedPostTradeRefreshTimeoutsRef.current.clear();
 
-        const timeoutId = window.setTimeout(() => {
-            delayedPostTradeRefreshTimeoutsRef.current.delete(timeoutId);
-            if (!isTerminalMountedRef.current) {
-                return;
-            }
+        const delaysMs = typeof delayOrDelaysMs === 'number'
+            ? [delayOrDelaysMs]
+            : [...delayOrDelaysMs];
+        for (const delayMs of [...new Set(delaysMs)]) {
+            const timeoutId = window.setTimeout(() => {
+                delayedPostTradeRefreshTimeoutsRef.current.delete(timeoutId);
+                if (!isTerminalMountedRef.current) {
+                    return;
+                }
 
-            void refreshLiveTradingState({
-                forcePositionsRefresh: true,
-                coalescePositionsRefresh: true,
-            }).catch(onError);
-        }, delayMs);
-        delayedPostTradeRefreshTimeoutsRef.current.add(timeoutId);
+                void refreshLiveTradingState({
+                    forcePositionsRefresh: true,
+                    coalescePositionsRefresh: true,
+                }).catch(onError);
+            }, Math.max(0, delayMs));
+            delayedPostTradeRefreshTimeoutsRef.current.add(timeoutId);
+        }
     }, [refreshLiveTradingState]);
 
     const consumePendingOrderConfirmation = useCallback((id: number): PendingTerminalOrderConfirmation | null => {
@@ -7474,7 +7530,7 @@ function TradingDashboardInner() {
         openPrice: number,
     ) => {
         if (!connectAccountId || openPrice <= 0 || !Number.isFinite(openPrice)) {
-            return;
+            return null;
         }
 
         const instrument = getInstrumentForSymbol(order.symbol);
@@ -7515,7 +7571,18 @@ function TradingDashboardInner() {
             error: null,
             warning: current.warning,
         }));
+        return optimisticPosition.id;
     }, [connectAccountId, getInstrumentForSymbol]);
+    const removeOptimisticOpenPosition = useCallback((positionId: string | null) => {
+        if (!positionId) {
+            return;
+        }
+
+        setOptimisticOpenPositions((current) => {
+            const next = current.filter((position) => position.id !== positionId);
+            return next.length === current.length ? current : next;
+        });
+    }, []);
     useEffect(() => {
         if (terminalConnectionStatus !== 'ready' || !connectAccountId || storeSymbols.length === 0) {
             setQuoteFeedWarning(null);
@@ -7745,35 +7812,22 @@ function TradingDashboardInner() {
         selectedChartHistory &&
         selectedChartHistory.hasCandles
     );
-    const terminalSymbolCatalogReadyForInitialRender =
-        activeGroupCatalogSettled || storeSymbols.length > 0;
-    const terminalShellReadyForInitialRender = Boolean(
-        !isLoadingTerminalAccountData &&
-        terminalConnectionStatus === 'ready' &&
-        selectedSymbolBelongsToActiveAccount &&
-        selectedInstrument &&
-        terminalSymbolCatalogReadyForInitialRender
-    );
     const terminalInitialGateKey =
         connectAccountId ??
         (hasAuthenticatedManualWebtraderSession
             ? `manual:${storeSession?.id ?? storeAccountInfo?.login ?? 'session'}`
-            : activeTradingAccount?.id ?? 'terminal');
+            : activeTradingAccount?.id ??
+                (terminalLaunchSession.isActive ? 'launch' : 'terminal'));
     const isInitialTerminalGateReleased = releasedInitialTerminalGateKey === terminalInitialGateKey;
     const isInitialTerminalGateTimedOut = timedOutInitialTerminalGateKey === terminalInitialGateKey;
+    // Do NOT release on shell-ready / launch-cache / timeout alone — that reveals a blank chart.
+    // Preferred: first real candles. Fail-open only on hard connection errors.
+    // Timed-out opens still keep the black overlay until hasCandles (see timeout effect).
     const shouldReleaseInitialTerminalGate = Boolean(
-        (
-            isInitialTerminalGateTimedOut &&
-            !isLoadingTerminalAccountData &&
-            hasTerminalAccountRestoreCandidate
-        ) ||
-        !connectAccountId ||
         terminalConnectionStatus === 'error' ||
         terminalConnectionStatus === 'locked' ||
         accountConnectionWarning ||
         activeGroupSymbolsState.error ||
-        hasFrontendLaunchCacheDataForInitialRender ||
-        terminalShellReadyForInitialRender ||
         selectedChartReadyForInitialTerminalRender
     );
     useEffect(() => {
@@ -7801,7 +7855,15 @@ function TradingDashboardInner() {
         terminalLaunchSession.isActive &&
         terminalLaunchSession.status !== 'ready',
     );
+    // Black dots stay up until launch is ready AND first chart candles exist (or timeout).
+    const terminalOpeningOverlayActive = Boolean(
+        terminalLaunchBlockingOverlayActive ||
+        initialTerminalGateActive
+    );
     useEffect(() => {
+        // Soft fail-open after a long wait: allow the terminal chrome, but only if we
+        // still have no candles. Chart area stays on loading shell until hasCandles.
+        // Hard release still requires selectedChartReadyForInitialTerminalRender above.
         if (!initialTerminalGateActive || isInitialTerminalGateTimedOut) {
             return;
         }
@@ -7810,14 +7872,66 @@ function TradingDashboardInner() {
             setTimedOutInitialTerminalGateKey((current) =>
                 current === terminalInitialGateKey ? current : terminalInitialGateKey,
             );
+            // Never unlock on a stale true hasCandles from a previous partial paint.
+            setChartHistoryStatus((current) => {
+                if (
+                    current &&
+                    isMatchingTerminalChartHistoryStatus(
+                        current,
+                        selectedBrokerSymbol,
+                        selectedChartTimeframeMinutes,
+                    ) &&
+                    current.hasCandles
+                ) {
+                    return current;
+                }
+                return {
+                    symbol: selectedBrokerSymbol || current?.symbol || '',
+                    timeframeMinutes: selectedChartTimeframeMinutes,
+                    isLoading: true,
+                    hasCandles: false,
+                };
+            });
+            // Soft-release overlay so user sees terminal chrome + chart loading shell,
+            // not a permanent black screen when MT5 history is very slow.
+            setReleasedInitialTerminalGateKey((current) =>
+                current === terminalInitialGateKey ? current : terminalInitialGateKey,
+            );
         }, INITIAL_TERMINAL_CHART_GATE_TIMEOUT_MS);
 
         return () => window.clearTimeout(timeoutId);
     }, [
         initialTerminalGateActive,
         isInitialTerminalGateTimedOut,
+        selectedBrokerSymbol,
+        selectedChartTimeframeMinutes,
         terminalInitialGateKey,
     ]);
+    const handleChartTimeframeChange = useCallback((timeframeMinutes: number) => {
+        const normalizedTf = normalizeTerminalTimeframeMinutes(timeframeMinutes);
+        // TF change remounts series data — only unlock immediately if this TF was painted before.
+        if (selectedBrokerSymbol) {
+            const key = getTerminalChartHistoryStatusKey(selectedBrokerSymbol, normalizedTf);
+            const confirmed = confirmedChartPaintRef.current.has(key);
+            const nextStatus = confirmed
+                ? {
+                    symbol: selectedBrokerSymbol,
+                    timeframeMinutes: normalizedTf,
+                    isLoading: false,
+                    hasCandles: true as const,
+                }
+                : {
+                    symbol: selectedBrokerSymbol,
+                    timeframeMinutes: normalizedTf,
+                    isLoading: true,
+                    hasCandles: false as const,
+                };
+            chartHistoryStatusCacheRef.current.set(key, nextStatus);
+            setChartHistoryStatus(nextStatus);
+        }
+        setChartTimeframeMinutes(normalizedTf);
+    }, [selectedBrokerSymbol]);
+
     const handleSelectSymbol = useCallback((symbol: string) => {
         const exactSymbol = resolveCatalogSymbolName(
             storeSymbols,
@@ -7848,11 +7962,29 @@ function TradingDashboardInner() {
         setChartKeepAliveSymbols((current) =>
             reconcileTerminalChartKeepAliveSymbols(current, openTabs, exactSymbol),
         );
-        setChartHistoryStatus(
-            chartHistoryStatusCacheRef.current.get(
-                getTerminalChartHistoryStatusKey(exactSymbol, chartTimeframeMinutes),
-            ) ?? null,
-        );
+        // Warm keep-alive path: symbol already mounted + confirmed paint this session → show immediately.
+        // Cold path: loading until the chart re-confirms real candles (never empty grid).
+        const switchStatusKey = getTerminalChartHistoryStatusKey(exactSymbol, normalizedTf);
+        const keepAliveWarm =
+            chartKeepAliveSymbols.some((symbol) => symbolsMatch(symbol, exactSymbol)) ||
+            openTabs.some((symbol) => symbolsMatch(symbol, exactSymbol)) ||
+            renderedChartKeepAliveSymbols.some((symbol) => symbolsMatch(symbol, exactSymbol));
+        const confirmedWarm = Boolean(confirmedChartPaintRef.current.get(switchStatusKey));
+        const nextSwitchStatus = keepAliveWarm && confirmedWarm
+            ? {
+                symbol: exactSymbol,
+                timeframeMinutes: normalizedTf,
+                isLoading: false,
+                hasCandles: true,
+            }
+            : {
+                symbol: exactSymbol,
+                timeframeMinutes: normalizedTf,
+                isLoading: true,
+                hasCandles: false,
+            };
+        chartHistoryStatusCacheRef.current.set(switchStatusKey, nextSwitchStatus);
+        setChartHistoryStatus(nextSwitchStatus);
         setSelectedSymbol(exactSymbol);
         setSelectedSymbolAccountId(connectAccountId ?? null);
         startTransition(() => {
@@ -7898,11 +8030,13 @@ function TradingDashboardInner() {
         });
     }, [
         accountSessionScopeId,
+        chartKeepAliveSymbols,
         chartTimeframeMinutes,
         connectAccountId,
         handleShowToast,
         primeTerminalMarketData,
         openTabs,
+        renderedChartKeepAliveSymbols,
         selectedHistoryDiagnostics,
         storeSymbols,
     ]);
@@ -8103,6 +8237,21 @@ function TradingDashboardInner() {
                 orderSubmittedMessage,
                 pendingOrderCorrelation,
             );
+            // Show submitted market exposure without waiting for the dealer ACK.
+            // A definitive rejection removes this temporary row below; uncertain
+            // outcomes keep it marked as Syncing until reconciliation or expiry.
+            const submittedOptimisticPositionId = order.orderType === 'market'
+                ? addOptimisticOpenPosition(
+                    {
+                        symbol: order.symbol,
+                        type: order.type,
+                        volume: order.volume,
+                        sl: order.sl,
+                        tp: order.tp,
+                    },
+                    liveMarketPrice,
+                )
+                : null;
             let tradeResult;
             activeOrderMutationCountRef.current += 1;
             try {
@@ -8146,7 +8295,7 @@ function TradingDashboardInner() {
                             );
                         }
                         void refreshLiveTradingState({ forcePositionsRefresh: true });
-                        schedulePostTradeRefresh(1500);
+                        schedulePostTradeRefresh(TERMINAL_POST_TRADE_SUCCESS_REFRESH_DELAYS_MS);
                         return;
                     }
 
@@ -8205,7 +8354,7 @@ function TradingDashboardInner() {
                             );
                         }
                         void refreshLiveTradingState({ forcePositionsRefresh: true });
-                        schedulePostTradeRefresh(1500);
+                        schedulePostTradeRefresh(TERMINAL_POST_TRADE_SUCCESS_REFRESH_DELAYS_MS);
                         return;
                     }
 
@@ -8230,7 +8379,7 @@ function TradingDashboardInner() {
                             'Order placed',
                             `${order.type.toUpperCase()} ${order.volume} ${order.symbol} ΓÇö confirmed after reconnect.`,
                         );
-                        schedulePostTradeRefresh(1500);
+                        schedulePostTradeRefresh(TERMINAL_POST_TRADE_SUCCESS_REFRESH_DELAYS_MS);
                         return;
                     }
 
@@ -8247,6 +8396,7 @@ function TradingDashboardInner() {
                     return;
                 }
                 clearPendingOrderConfirmation(pendingOrderConfirmationId);
+                removeOptimisticOpenPosition(submittedOptimisticPositionId);
                 throw error;
             }
 
@@ -8277,7 +8427,7 @@ function TradingDashboardInner() {
                         );
                     }
                     void refreshLiveTradingState({ forcePositionsRefresh: true });
-                    schedulePostTradeRefresh(1500);
+                    schedulePostTradeRefresh(TERMINAL_POST_TRADE_SUCCESS_REFRESH_DELAYS_MS);
                     return;
                 }
 
@@ -8302,7 +8452,7 @@ function TradingDashboardInner() {
                         'Order placed',
                         `${order.type.toUpperCase()} ${order.volume} ${order.symbol} ΓÇö confirmed after trade-server check.`,
                     );
-                    schedulePostTradeRefresh(1500);
+                    schedulePostTradeRefresh(TERMINAL_POST_TRADE_SUCCESS_REFRESH_DELAYS_MS);
                     return;
                 }
 
@@ -8339,6 +8489,7 @@ function TradingDashboardInner() {
                     || MT5_REJECT_REASONS[tradeResult.retcode]
                     || `Trade rejected (MT5 code ${tradeResult.retcode}).`;
                 clearPendingOrderConfirmation(pendingOrderConfirmationId);
+                removeOptimisticOpenPosition(submittedOptimisticPositionId);
                 handleShowToast('error', 'Order rejected', reason);
                 setIsOrderPanelOpen(true);
                 return;
@@ -8367,9 +8518,9 @@ function TradingDashboardInner() {
                         : `${order.type.toUpperCase()} ${order.volume} ${order.symbol} @ ${pendingOrderPrice.toFixed(priceDigits)}`,
                 );
             }
-            // Reliable position/order events update the terminal immediately.
-            // Reconcile once, after the acknowledgement hot path has completed.
-            schedulePostTradeRefresh(1500);
+            // Push events remain the fastest authoritative path. These bounded
+            // retries cover MT5 snapshots that settle shortly after the ACK.
+            schedulePostTradeRefresh(TERMINAL_POST_TRADE_SUCCESS_REFRESH_DELAYS_MS);
         };
 
         const run = async () => {
@@ -8423,6 +8574,7 @@ function TradingDashboardInner() {
         priceDigits,
         refreshLiveTradingState,
         registerPendingOrderConfirmation,
+        removeOptimisticOpenPosition,
         schedulePostTradeRefresh,
         storeWsClient,
         waitForPostTradeReconciliation,
@@ -8836,22 +8988,23 @@ function TradingDashboardInner() {
     }, []);
 
     if (isLoadingTerminalAccountData) {
-        return <TerminalPageLoadingShell />;
+        // Same black-dots open experience as launch; do not flash a skeleton then a blank chart.
+        return <TerminalLaunchLoadingOverlay />;
     }
 
     return (
         <>
-        {terminalLaunchBlockingOverlayActive && (
+        {terminalOpeningOverlayActive && (
             <TerminalLaunchLoadingOverlay error={terminalLaunchSession.error} />
         )}
         <div
-            aria-hidden={initialTerminalGateActive || terminalLaunchBlockingOverlayActive ? true : undefined}
+            aria-hidden={terminalOpeningOverlayActive ? true : undefined}
             className="flex h-[100dvh] w-full min-w-0 max-w-[100dvw] flex-col overflow-hidden bg-background p-0"
         >
             {/* Header */}
             <Header
                 account={account}
-                positions={liveTerminalPositions}
+                positions={terminalPositions}
                 selectedSymbol={selectedSymbol}
                 openTabs={openTabs}
                 userProfile={userProfile}
@@ -8987,11 +9140,21 @@ function TradingDashboardInner() {
                         >
                             {/* Main Chart Area */}
                             <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-none bg-card md:min-h-[240px]">
-                                {isTerminalRestoreInProgress ? (
-                                    <TerminalChartLoadingShell />
-                                ) : selectedSymbolBelongsToActiveAccount && selectedInstrument ? (
+                                {/*
+                                  Mount charts as soon as the instrument is known (even while session
+                                  restore is in progress) so first candles can arrive under the black
+                                  open-terminal overlay. Do not wait for full restore before hydrate.
+                                */}
+                                {selectedSymbolBelongsToActiveAccount && selectedInstrument ? (
                                     <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-                                        <div className="relative flex-1 bg-card">
+                                        {/*
+                                          Charts stay mounted so seed/history can load and emit hasCandles.
+                                          Chart section is revealed only once real candles arrive for the active symbol/TF.
+                                        */}
+                                        <div
+                                            className="relative flex-1 bg-card"
+                                            aria-hidden={!selectedChartSectionReady}
+                                        >
                                             {keptAliveChartEntries.map((chartEntry, chartIndex) => (
                                                 <div
                                                     key={`${accountSessionScopeId ?? connectAccountId ?? 'terminal'}:${getTerminalSymbolKey(chartEntry.symbol)}`}
@@ -9000,7 +9163,7 @@ function TradingDashboardInner() {
                                                             ? 'visible z-10'
                                                             : 'invisible pointer-events-none z-0'
                                                     }`}
-                                                    aria-hidden={!chartEntry.isActive}
+                                                    aria-hidden={!chartEntry.isActive || !selectedChartSectionReady}
                                                 >
                                                     <TradingChart
                                                         symbol={chartEntry.symbol}
@@ -9013,11 +9176,15 @@ function TradingDashboardInner() {
                                                         onSell={handleSelectedSell}
                                                         onBuy={handleSelectedBuy}
                                                         onOpenOrderPanel={handleOpenTradePanel}
-                                                        isOrderPanelOpen={chartEntry.isActive && isOrderPanelOpen}
+                                                        isOrderPanelOpen={
+                                                            chartEntry.isActive &&
+                                                            selectedChartSectionReady &&
+                                                            isOrderPanelOpen
+                                                        }
                                                         onToggleOrderPanel={handleToggleOrderPanel}
                                                         onHistoryStatusChange={handleChartHistoryStatusChange}
                                                         timeframeMinutes={chartTimeframeMinutes}
-                                                        onTimeframeChange={setChartTimeframeMinutes}
+                                                        onTimeframeChange={handleChartTimeframeChange}
                                                         chartType={chartType}
                                                         onChartTypeChange={setChartType}
                                                         layoutPanes={chartEntry.isActive ? chartLayoutPanes : 1}
@@ -9032,7 +9199,22 @@ function TradingDashboardInner() {
                                                 </div>
                                             ))}
                                         </div>
+                                        {/*
+                                          In-pane loading only after the terminal is visible.
+                                          During open, black dots cover the whole app instead.
+                                        */}
+                                        {!selectedChartSectionReady && !terminalOpeningOverlayActive ? (
+                                            <div
+                                                className="absolute inset-0 z-20 bg-card"
+                                                aria-busy="true"
+                                                aria-live="polite"
+                                            >
+                                                <TerminalChartLoadingShell />
+                                            </div>
+                                        ) : null}
                                     </div>
+                                ) : isTerminalRestoreInProgress ? (
+                                    <TerminalChartLoadingShell />
                                 ) : (terminalConnectionStatus === 'error' || activeGroupSymbolsState.error) ? (
                                     <div className="flex h-full flex-col items-center justify-center px-6 py-8">
                                         <div className="flex max-w-[420px] flex-col items-center text-center">

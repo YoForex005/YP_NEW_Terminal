@@ -130,12 +130,6 @@ export async function GET(request: NextRequest) {
         payload,
       );
     }
-    
-    // Dump for debugging
-    try {
-      require('fs').writeFileSync('C:/Users/aitra/Desktop/CRM-BACKEND-C++/Forex-CRM/history-dump.json', JSON.stringify(history, null, 2));
-    } catch(e) {}
-
     return tradingApiJson({
       success: true,
       accountId,

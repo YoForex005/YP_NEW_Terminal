@@ -32,6 +32,19 @@ export async function POST(request: NextRequest) {
     // no body or non-JSON body — purgePg stays false
   }
 
+  // Hard-delete of PG account rows is a destructive ops action — admin + non-prod only.
+  if (purgePg) {
+    if (process.env.NODE_ENV === "production") {
+      return NextResponse.json(
+        { error: "purgePg is disabled in production." },
+        { status: 403 },
+      );
+    }
+    if (auth.user.role !== "admin") {
+      return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+    }
+  }
+
   const userId = auth.user.id;
 
   try {

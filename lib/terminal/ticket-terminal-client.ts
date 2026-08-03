@@ -1605,7 +1605,15 @@ export class TerminalTicketRealtimeClient {
       : isRecord(frame.position)
         ? frame.position
         : payload;
-    const position = mapPosition(rawPosition);
+    const accountContext = this.options.accountContext ?? {};
+    const position = mapPosition({
+      ...rawPosition,
+      login:
+        rawPosition.login ??
+        rawPosition.account_login ??
+        accountContext.login ??
+        accountContext.mt5_login,
+    });
     if (!position) return;
 
     const eventName = parseString(payload.event ?? frame.event ?? payload.action ?? frame.action).toLowerCase();

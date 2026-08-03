@@ -1988,13 +1988,8 @@ export function useAutoConnectTrading(
             return;
           }
 
-          if (
-            positions.length === 0 &&
-            useWebtraderStore.getState().positions.length > 0
-          ) {
-            return;
-          }
-
+          // Always accept authoritative snapshots, including empty ones.
+          // Ignoring empty snapshots left ghost open positions after close-all / last close.
           callbacksRef.current.setPositions(positions);
         },
         onTradeResult: (payload) => {

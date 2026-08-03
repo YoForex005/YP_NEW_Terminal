@@ -7,6 +7,15 @@ import {
 } from "@/lib/server/auth";
 import { getUserByEmail, registerUser } from "@/lib/server/database";
 import { hashPassword } from "@/lib/server/password";
+import {
+  applyRateLimitHeaders,
+  consumeRateLimit,
+  getClientIpFromRequest,
+} from "@/lib/server/rate-limit";
+
+const LOGIN_IP_LIMIT = 20;
+const LOGIN_EMAIL_LIMIT = 8;
+const LOGIN_RATE_WINDOW_MS = 15 * 60_000;
 
 interface LoginRequestBody {
   email?: string;
@@ -93,6 +102,37 @@ export async function POST(request: Request) {
 
   const email = payload.email?.trim() ?? "";
   const password = payload.password ?? "";
+  const normalizedEmail = email.toLowerCase();
+  const ip = getClientIpFromRequest(request);
+
+  // Rate limit by IP and email separately so one attacker cannot spray many accounts
+  // from one IP without limit, and one email cannot be brute-forced from many IPs freely.
+  const ipRate = consumeRateLimit(`login:ip:${ip}`, {
+    limit: LOGIN_IP_LIMIT,
+    windowMs: LOGIN_RATE_WINDOW_MS,
+  });
+  const emailRate = consumeRateLimit(`login:email:${normalizedEmail || "empty"}`, {
+    limit: LOGIN_EMAIL_LIMIT,
+    windowMs: LOGIN_RATE_WINDOW_MS,
+  });
+  const limited = !ipRate.ok
+    ? ipRate
+    : !emailRate.ok
+      ? emailRate
+      : null;
+
+  if (limited) {
+    const headers = new Headers();
+    applyRateLimitHeaders(headers, limited);
+    return NextResponse.json(
+      {
+        error: "Too many login attempts. Please try again later.",
+        code: "RATE_LIMITED",
+        retryAfterSec: limited.retryAfterSec,
+      },
+      { status: 429, headers },
+    );
+  }
 
   if (!email || !password) {
     return NextResponse.json(
@@ -106,9 +146,11 @@ export async function POST(request: Request) {
     (await issueBackendSessionForCredentials(email, password)) ??
     (await issueDevelopmentSessionForMissingUser(request, email, password));
   if (!authResult) {
+    const headers = new Headers();
+    applyRateLimitHeaders(headers, emailRate.ok ? emailRate : ipRate);
     return NextResponse.json(
       { error: "Invalid email or password." },
-      { status: 401 },
+      { status: 401, headers },
     );
   }
 
@@ -118,6 +160,7 @@ export async function POST(request: Request) {
     },
     { status: 200 },
   );
+  applyRateLimitHeaders(response.headers, emailRate.ok ? emailRate : ipRate);
 
   setSessionCookie(response, authResult.token, authResult.session.expiresAt, request);
   return response;

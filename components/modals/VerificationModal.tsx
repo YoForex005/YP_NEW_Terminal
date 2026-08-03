@@ -245,6 +245,15 @@ export function VerificationModal({ isOpen, onClose }: VerificationModalProps) {
     
     // Set up cross-window message listener for desktop popups
     const handleMessage = (event: MessageEvent) => {
+      // Only accept completion signals from known Didit / same-origin windows.
+      const allowedOrigins = new Set<string>([
+        window.location.origin,
+        "https://verification.didit.me",
+        "https://didit.me",
+      ]);
+      if (!allowedOrigins.has(event.origin)) {
+        return;
+      }
       if (event.data && event.data.type === "didit-complete") {
         void pollDiditStatus();
       }
