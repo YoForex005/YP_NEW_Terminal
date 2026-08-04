@@ -1916,14 +1916,15 @@ function KlineChartContainer({
                 lastAppliedChartDataStreamKeyRef.current = chartDataStreamKey;
                 setNoDataMessage(null);
                 setActiveBarIfChanged(lastBar);
-                setIsLoading(false);
-                // Claim candles as soon as series has data. Resize/layout will fit them next frame.
-                // (Host-size gating blocked first-open unlock under the open overlay.)
+                const seedHasStableInitialWindow = compactEntries.length >= MIN_REAL_BARS_BEFORE_SUFFICIENT;
+                setIsLoading(!seedHasStableInitialWindow);
+                // Keep tiny cache seeds behind the stable loading shell. Revealing one
+                // or two bars before the history window arrives causes a visible jump.
                 onHistoryStatusChange?.({
                     symbol,
                     timeframeMinutes: selectedResolution.minutes,
-                    isLoading: false,
-                    hasCandles: compactEntries.length > 0,
+                    isLoading: !seedHasStableInitialWindow,
+                    hasCandles: seedHasStableInitialWindow,
                 });
                 if (compactEntries.length > 0) {
                     try {
@@ -4056,7 +4057,13 @@ function KlineChartContainer({
                 }
             }
             pendingNewBarWasPinnedToLatest = false;
-            notifyHistoryStatusChange({ isLoading: false, hasCandles: realBarsBySeriesTime.size > 0 });
+            // A live-only preview is useful behind the loading shell, but it is not
+            // enough to declare the chart ready. Otherwise a single forming candle
+            // unlocks the terminal before the historical baseline has arrived.
+            notifyHistoryStatusChange({
+                isLoading: !hasRenderedHistorySeed,
+                hasCandles: hasRenderedHistorySeed && realBarsBySeriesTime.size > 0,
+            });
             // Throttle position overlay DOM updates to â‰¤ 30fps in the live tick path.
             // Price-line Y positions don't meaningfully change faster than 30fps,
             // and every update forces priceToCoordinate + style writes for each position.
@@ -4398,6 +4405,10 @@ function KlineChartContainer({
         let renderedBarCount = 0;
         let resizeFrame: number | null = null;
         let dataLayoutFrame: number | null = null;
+        // Full range fitting is intentionally a one-time operation for each chart
+        // stream. Cache, authoritative history and backfill can arrive in separate
+        // waves; repeatedly fitting every wave makes the first-open chart jump.
+        let hasCompletedInitialHistoryLayout = false;
         let liveRenderFrame: number | null = null;
         let backgroundLiveRenderTimer: number | null = null;
         let progressiveHistorySeedFrame: number | null = null;
@@ -4902,6 +4913,7 @@ function KlineChartContainer({
             previousAnchor: VisibleAnchorSnapshot | null = null,
             wasPinnedToLatest = false,
             attempt = 0,
+            forceFocusLatest = false,
         ) => {
             if (dataLayoutFrame !== null) {
                 window.cancelAnimationFrame(dataLayoutFrame);
@@ -4922,20 +4934,50 @@ function KlineChartContainer({
                         previousAnchor,
                         wasPinnedToLatest,
                         attempt + 1,
+                        forceFocusLatest,
                     );
                     return;
                 }
 
-                if (layoutMode === 'focus-latest' || (layoutMode === 'preserve-or-follow-latest' && wasPinnedToLatest)) {
+                const shouldPerformFullFit = forceFocusLatest || !hasCompletedInitialHistoryLayout;
+                if (shouldPerformFullFit) {
                     focusLatestBars(barCount);
+                } else if (layoutMode === 'focus-latest') {
+                    // Follow the latest candle without resetting zoom/range. This is
+                    // the common path when cache history is upgraded a few seconds later.
+                    try {
+                        chart.timeScale().scrollToPosition(getPreferredRightOffset(), false);
+                    } catch {
+                        // Chart may be disposed during a fast symbol switch.
+                    }
+                } else if (layoutMode === 'preserve-or-follow-latest' && wasPinnedToLatest) {
+                    try {
+                        chart.timeScale().scrollToPosition(getPreferredRightOffset(), false);
+                    } catch {
+                        // Chart may be disposed during a fast symbol switch.
+                    }
                 } else {
                     restoreVisibleLogicalRange(previousRange, previousAnchor);
+                }
+                if (
+                    hasSize &&
+                    hasRenderedHistorySeed &&
+                    chartHasSetData &&
+                    renderedBarCount >= MIN_REAL_BARS_BEFORE_SUFFICIENT
+                ) {
+                    hasCompletedInitialHistoryLayout = true;
                 }
                 updateLivePriceOverlay();
                 scheduleVolumeSeriesRender();
                 // Claim visible candles only after a real host size exists. Prevents first-open
                 // gate unlock while LWC is still 0×0 under the open-terminal overlay.
-                if (hasSize && barCount > 0 && chartHasSetData && renderedBarCount > 0) {
+                if (
+                    hasRenderedHistorySeed &&
+                    hasSize &&
+                    barCount > 0 &&
+                    chartHasSetData &&
+                    renderedBarCount > 0
+                ) {
                     notifyHistoryStatusChange({ isLoading: false, hasCandles: true });
                 }
                 // Second-pass rAF: after the chart commits its layout, re-draw the live price
@@ -4948,10 +4990,10 @@ function KlineChartContainer({
                     updateLivePriceOverlay();
                     scheduleVolumeSeriesRender();
                     // Force price scale to refit based on currently visible bars only.
-                    if (layoutMode === 'focus-latest' || (layoutMode === 'preserve-or-follow-latest' && wasPinnedToLatest)) {
+                    if (shouldPerformFullFit) {
                         refitVisiblePriceScale();
                     }
-                    if (chartHasSetData && renderedBarCount > 0) {
+                    if (hasRenderedHistorySeed && chartHasSetData && renderedBarCount > 0) {
                         const size = getChartHostSize();
                         if (size) {
                             notifyHistoryStatusChange({ isLoading: false, hasCandles: true });
@@ -5426,10 +5468,64 @@ function KlineChartContainer({
             if (!isActiveRenderedChartSwitch()) {
                 return;
             }
-            // During a symbol switch, live quotes may arrive before authoritative
-            // history. Keep them cached for the eventual merge, but never publish a
-            // one-candle chart ahead of the history baseline.
-            if (!isHistoryLoaded || !hasRenderedHistorySeed || renderedBarCount === 0) {
+
+            // Cold first-open: quotes often arrive before OHLC history. Seed one forming
+            // candle from the live quote so the chart is never a blank grid with only a
+            // dashed price line. History still replaces/extends this when it arrives.
+            if (
+                isForegroundChartRef.current &&
+                renderedBarCount === 0 &&
+                !chartHasSetData
+            ) {
+                const coldSnapshot = getLivePriceSnapshotBySymbol(symbol);
+                const coldPrice = coldSnapshot ? getLiveQuotePrice(coldSnapshot) : null;
+                if (typeof coldPrice === 'number' && Number.isFinite(coldPrice) && coldPrice > 0) {
+                    const nowMs = getCurrentFrontendTime();
+                    const targetTime = bucketTimeMs(nowMs, bucketMs) || nowMs;
+                    const coldBar: OHLCBar = {
+                        symbol,
+                        timeframeMinutes: selectedResolution.minutes,
+                        time: targetTime,
+                        open: coldPrice,
+                        high: coldPrice,
+                        low: coldPrice,
+                        close: coldPrice,
+                        volume: 1,
+                        source: 'mt5_tick',
+                        sourceTimeMs: nowMs,
+                        closed: false,
+                    };
+                    if (isBarInsideChartSymbolPriceDomain(symbol, coldBar)) {
+                        const liveBar = cacheLiveBar(coldBar, {
+                            replaceExisting: true,
+                            skipSanity: true,
+                        });
+                        if (liveBar) {
+                            const painted = applyBars(
+                                [liveBar],
+                                undefined,
+                                false,
+                                LIVE_FIRST_SYMBOL_SWITCH_HISTORY_BARS,
+                                false,
+                                false,
+                                true,
+                                'focus-latest',
+                                true, // allowLiveOnlyPreview
+                            );
+                            if (painted.renderedCandles || (chartHasSetData && renderedBarCount > 0)) {
+                                notifyHistoryStatusChange({
+                                    isLoading: !hasRenderedHistorySeed,
+                                    hasCandles: hasRenderedHistorySeed,
+                                });
+                                // Continue into tip-update path below when possible.
+                            }
+                        }
+                    }
+                }
+            }
+
+            // No series yet — only keep the live price overlay until history/seed paints.
+            if (renderedBarCount === 0 || !chartHasSetData) {
                 updateLivePriceOverlay();
                 return;
             }
@@ -5978,10 +6074,27 @@ function KlineChartContainer({
                 liveCatchUpReferenceBars,
                 bucketMs,
             ).startTime;
-            const latestRenderWindow = getLatestCoherentRenderBars(mergedBars, bucketMs, maxBars);
+            // First authoritative history paint: do NOT run disconnect-prefix trimming.
+            // Cold open seeds one live tip candle first; merging history then used to look
+            // like "history | live tip disconnect" and getLatestCoherentRenderBars kept only
+            // the tip → single candle at "now" (user screenshot). Keep full history baseline.
+            const isEstablishingHistoryBaseline = markHistoryLoaded && (
+                !hasRenderedHistorySeed ||
+                renderedBarCount < MIN_REAL_BARS_BEFORE_SUFFICIENT
+            );
+            const latestRenderWindow = isEstablishingHistoryBaseline
+                ? {
+                    bars: limitBarsPreservingRealBars(
+                        sortBarsByTime(mergedBars.filter(hasValidBarPrices)),
+                        maxBars,
+                    ),
+                    trimmedDisconnectedPrefix: false,
+                }
+                : getLatestCoherentRenderBars(mergedBars, bucketMs, maxBars);
             const renderBars = latestRenderWindow.bars;
             const shouldScheduleLatestHistoryGapCatchUp = markHistoryLoaded
                 && includeLiveCache
+                && !isEstablishingHistoryBaseline
                 && (
                     shouldSuppressLiveCacheForPendingLatestHistory ||
                     latestRenderWindow.trimmedDisconnectedPrefix ||
@@ -5996,7 +6109,11 @@ function KlineChartContainer({
             // and reintroduce visible gaps between real backend history and live candles.
             const displayBars = alignOpenGapsToPreviousClose(realBars, bucketMs);
             const hasCandles = realBars.length > 0;
+            // Authoritative history loads (markHistoryLoaded) must always be allowed to paint.
+            // Some gateway payloads tag bars as realtime/tick sources; the old seed checks
+            // rejected them → first-open empty chart while quotes still moved.
             const renderHasHistorySeed = hasRenderedHistorySeed
+                || (markHistoryLoaded && acceptedInputBars.some(isRealMarketBar))
                 || (markHistoryLoaded && acceptedInputBars.some(isLatestHistoryCatchUpReferenceBar))
                 || (markHistoryLoaded && acceptedInputBars.some(isHistoryResponseSeedBar))
                 || hasCachedOrHistoricalSeedBars(acceptedInputBars)
@@ -6006,7 +6123,7 @@ function KlineChartContainer({
                 renderedCandles: false,
                 historySeedApplied: false,
             };
-            if (hasCandles && !renderHasHistorySeed && !allowLiveOnlyPreview) {
+            if (hasCandles && !renderHasHistorySeed && !allowLiveOnlyPreview && !markHistoryLoaded) {
                 return renderResult;
             }
             if (!hasCandles && hasRenderedAnyCandles) {
@@ -6132,15 +6249,18 @@ function KlineChartContainer({
                 );
                 // Unlock as soon as bars are on the series; layout rAF will resize/fit.
                 emitHistoryStatus({
-                    isLoading: false,
-                    hasCandles: hasCandles && chartHasSetData && renderedBarCount > 0,
+                    isLoading: !hasRenderedHistorySeed,
+                    hasCandles: hasRenderedHistorySeed && hasCandles && chartHasSetData && renderedBarCount > 0,
                 });
             } else {
                 if (hasRenderedAnyCandles) {
                     if (!deferHistoryStatus) { clearLoadingTimer(); setIsLoading(false); }
                     // Only claim candles when the series still has a successful setData paint.
-                    const hasVisibleCandles = chartHasSetData && renderedBarCount > 0;
-                    emitHistoryStatus({ isLoading: false, hasCandles: hasVisibleCandles });
+                    const hasVisibleCandles = hasRenderedHistorySeed && chartHasSetData && renderedBarCount > 0;
+                    emitHistoryStatus({
+                        isLoading: !hasRenderedHistorySeed,
+                        hasCandles: hasVisibleCandles,
+                    });
                     return renderResult;
                 }
 
@@ -6393,7 +6513,6 @@ function KlineChartContainer({
                         latestRealLivePreviewBarTime,
                         bucketMs,
                     );
-                appliedHistory = true;
                 clearHistoryReadinessRetryTimer();
                 if (shouldDeferHistoryForProvisionalLivePreview) {
                     const acceptedHistoryBars = filterAcceptedOhlcBarsForChart(
@@ -6405,14 +6524,17 @@ function KlineChartContainer({
                         },
                     );
                     rememberLoadedHistoryBars(acceptedHistoryBars, { skipSanity: true });
-                    const provisionalPainted = renderProvisionalLivePreview();
+                    renderProvisionalLivePreview();
                     const retryScheduled = ensureHistoryCatchUpRetry(historyStats);
                     if (retryScheduled) {
+                        // The preview is not a successful history application. Return false
+                        // so a cache-first response that is too stale falls through to the
+                        // authoritative request immediately instead of consuming the load.
                         notifyHistoryStatusChange({
-                            isLoading: false,
-                            hasCandles: provisionalPainted || (chartHasSetData && renderedBarCount > 0),
+                            isLoading: true,
+                            hasCandles: false,
                         });
-                        return true;
+                        return false;
                     }
                     // Retries exhausted — fall through to apply history now so bars
                     // don't remain stuck in the loaded-history cache without rendering.
@@ -6421,13 +6543,17 @@ function KlineChartContainer({
                 const isLateResult = loadSequence !== historyLoadSequence;
                 const historyHasRealBars = historyStats.realBars > 0;
                 const shouldResetFromProvisionalLivePreview = hasProvisionalLivePreview && historyHasRealBars;
+                // Tag as cached so seed/history classifiers accept gateway bars that omit source.
+                const historyForPaint = history.map((bar) => (
+                    bar.cached === true ? bar : { ...bar, cached: true as const }
+                ));
                 const renderResult = applyBars(
-                    history,
+                    historyForPaint,
                     emptyMessage,
                     false,
                     isLateResult
-                        ? getCurrentRenderLimit(history.length)
-                        : getLoadHistoryRenderLimit(history.length),
+                        ? getCurrentRenderLimit(historyForPaint.length)
+                        : getLoadHistoryRenderLimit(historyForPaint.length),
                     true,
                     true,
                     true,
@@ -6439,9 +6565,14 @@ function KlineChartContainer({
                         renderedBarCount,
                     ),
                 );
-                const historySeedRendered = renderResult.historySeedApplied && renderResult.renderedCandles;
+                const historySeedRendered = Boolean(
+                    renderResult.historySeedApplied && renderResult.renderedCandles,
+                );
                 if (shouldResetFromProvisionalLivePreview) {
                     hasProvisionalLivePreview = false;
+                }
+                if (historySeedRendered) {
+                    appliedHistory = true;
                 }
                 if (isLateResult) {
                     if (historySeedRendered) {
@@ -6450,12 +6581,12 @@ function KlineChartContainer({
                             hasCandles: true,
                         });
                     }
-                    return true;
+                    return historySeedRendered;
                 }
 
                 const retryScheduled = scheduleHistoryBackfillRetry(
                     renderResult.stats,
-                    renderResult.historySeedApplied,
+                    renderResult.historySeedApplied || historySeedRendered,
                 );
                 if (!retryScheduled) {
                     scheduleDeferredHistoryBackfill(history.length >= historyLimit);
@@ -6476,7 +6607,8 @@ function KlineChartContainer({
                         hasCandles: false,
                     });
                 }
-                return true;
+                // Only consume this history payload if it actually painted; otherwise retry.
+                return historySeedRendered;
             };
             try {
                 // First paint: prefer cache when the series is still empty so Open Terminal
@@ -6600,7 +6732,15 @@ function KlineChartContainer({
             }
 
             if (isCurrentChartSwitch() && loadSequence === historyLoadSequence) {
-                const renderedProvisionalLivePreview = renderProvisionalLivePreview(emptyMessage);
+                // If history failed/empty, still allow a live-only tip candle so first open
+                // is not a blank grid while quotes are already streaming.
+                const allowLiveOnlyFallback =
+                    isRealtimeOhlcClientReady() &&
+                    !(chartHasSetData && renderedBarCount > 0);
+                const renderedProvisionalLivePreview = renderProvisionalLivePreview(
+                    emptyMessage,
+                    allowLiveOnlyFallback,
+                );
                 const stats = summarizeHistoryBars([...liveBarsByTime.values()], bucketMs);
                 const hasVisibleCandles = chartHasSetData && renderedBarCount > 0;
                 const hasRenderedSeededCandles = hasRenderedHistorySeed && hasVisibleCandles;
@@ -6971,7 +7111,15 @@ function KlineChartContainer({
                 if (hasVisibleBars) {
                     // Force size + layout so candles painted while invisible are not blank.
                     scheduleResizeChartToHost();
-                    scheduleDataLayout(renderedBarCount, 'focus-latest');
+                    scheduleDataLayout(
+                        renderedBarCount,
+                        'focus-latest',
+                        null,
+                        null,
+                        false,
+                        0,
+                        true,
+                    );
                     notifyHistoryStatusChange({ isLoading: false, hasCandles: true });
                 } else {
                     notifyHistoryStatusChange({ isLoading: true, hasCandles: false });
@@ -7002,11 +7150,15 @@ function KlineChartContainer({
             },
         };
         foregroundLifecycleRef.current = foregroundLifecycle;
-        if (isSecondaryPane || !isForegroundChartRef.current) {
-            cancelInitialHistoryHydrate = scheduleChartBackgroundTask(hydrateInitialHistory);
+        // Exness-style: keep-alive / secondary charts still load history promptly so
+        // symbol switch is instant (history+live already painted while hidden).
+        if (isSecondaryPane) {
+            cancelInitialHistoryHydrate = scheduleChartBackgroundTask(hydrateInitialHistory, 120);
+        } else if (!isForegroundChartRef.current) {
+            // Inactive keep-alive tab: hydrate ASAP (not long idle defer).
+            cancelInitialHistoryHydrate = scheduleChartBackgroundTask(hydrateInitialHistory, 80);
         } else {
-            // The selected chart is foreground work. Start its authoritative request
-            // immediately instead of waiting for a browser idle period.
+            // Active chart: load history immediately.
             hydrateInitialHistory();
         }
 

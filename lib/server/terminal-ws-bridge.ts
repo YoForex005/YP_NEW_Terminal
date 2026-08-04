@@ -99,6 +99,10 @@ export const TERMINAL_OHLC_REPAIR_LANE_STAGGER_MS = 100;
 export const TERMINAL_OHLC_REPAIR_BUSY_RETRY_AFTER_MS = 30_000;
 export const TERMINAL_OHLC_REPAIR_LANE_BUSY_RETRY_AFTER_MS = 15_000;
 export const TERMINAL_OHLC_REPAIR_SESSION_RETRY_AFTER_MS = 5_000;
+// A latest-chart snapshot with only a forming tip candle is not usable history.
+// Treat it as sparse so the bridge continues to the repair/upstream tier instead
+// of returning `ready: true` and leaving the frontend with a one-candle chart.
+export const TERMINAL_OHLC_REPAIR_MIN_LATEST_REAL_BARS = 10;
 const TERMINAL_SESSION_CONTEXT_CACHE_REUSE_MARGIN_MS = 75_000;
 const TERMINAL_SESSION_CONTEXT_UNKNOWN_EXPIRY_REUSE_MS = 30_000;
 
@@ -548,7 +552,7 @@ export const summarizeTerminalOhlcRepairPayload = (
   const sourceName =
     parseOptionalString(source.source ?? metadata.source) ??
     (phase === "probe" ? "cache_probe" : "repair");
-  const historySparse =
+  const reportedHistorySparse =
     parseOptionalBoolean(source.historySparse ?? metadata.historySparse) ?? false;
   const historyGapped =
     parseOptionalBoolean(source.historyGapped ?? metadata.historyGapped) ?? false;
@@ -566,14 +570,23 @@ export const summarizeTerminalOhlcRepairPayload = (
   const managerFetchSucceeded =
     parseOptionalBoolean(source.managerFetchSucceeded ?? metadata.managerFetchSucceeded) ?? false;
   const pendingStatus = Boolean(status && /pending|deferred|queued|loading/i.test(status));
+  // Metadata counts can describe an upstream/cache result even when the response
+  // omitted most (or all) of the actual bar array. The chart can only render bars
+  // delivered in this payload, so readiness must be based on that intersection.
+  const deliveredRealBarCount = Math.min(realBarCount, bars.length);
+  const latestSnapshotTooSmall =
+    request.requestType === "latest" &&
+    deliveredRealBarCount < Math.min(request.limit, TERMINAL_OHLC_REPAIR_MIN_LATEST_REAL_BARS);
+  const historySparse = reportedHistorySparse || latestSnapshotTooSmall;
   const gaps = historyGapped || historySparse;
   const stale =
     historyStale ||
     managerFetchDeferred ||
     managerFetchPending ||
     pendingStatus ||
-    returnedBarCount <= 0;
-  const ready = returnedBarCount > 0 && realBarCount > 0 && !gaps && !stale;
+    returnedBarCount <= 0 ||
+    deliveredRealBarCount <= 0;
+  const ready = returnedBarCount > 0 && deliveredRealBarCount > 0 && !gaps && !stale;
 
   return {
     ready,

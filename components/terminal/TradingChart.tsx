@@ -372,8 +372,14 @@ function ChartPaneWithPriceSeed({
     isPrimaryPane?: boolean;
     isForegroundChart?: boolean;
 }) {
+    // Keep-alive charts should mount quickly (not multi-second idle) so history+live
+    // are ready before the user switches to them.
+    const effectiveHydrationDelayMs = isForegroundChart
+        ? 0
+        : Math.min(Math.max(0, hydrationDelayMs ?? 0), 200);
+
     const [isChartRuntimeReady, setIsChartRuntimeReady] = useState(
-        () => isForegroundChart && isPrimaryPane !== false && !(hydrationDelayMs && hydrationDelayMs > 0),
+        () => isForegroundChart && isPrimaryPane !== false && effectiveHydrationDelayMs === 0,
     );
 
     useEffect(() => {
@@ -385,8 +391,8 @@ function ChartPaneWithPriceSeed({
             return;
         }
 
-        return scheduleChartRuntimeMount(() => setIsChartRuntimeReady(true), hydrationDelayMs);
-    }, [hydrationDelayMs, isChartRuntimeReady, isForegroundChart]);
+        return scheduleChartRuntimeMount(() => setIsChartRuntimeReady(true), effectiveHydrationDelayMs);
+    }, [effectiveHydrationDelayMs, isChartRuntimeReady, isForegroundChart]);
 
     if (!isChartRuntimeReady) {
         return <ChartPaneLoadingFallback />;

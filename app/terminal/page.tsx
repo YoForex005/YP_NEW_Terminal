@@ -4346,12 +4346,29 @@ function TradingDashboardInner() {
             nextStatus.symbol,
             nextStatus.timeframeMinutes,
         );
-        chartHistoryStatusCacheRef.current.set(statusKey, nextStatus);
+        const alreadyConfirmed = confirmedChartPaintRef.current.has(statusKey);
+        // Readiness is monotonic for a mounted symbol/timeframe. Background retries
+        // may report loading again while upgrading cache history, but replacing an
+        // already-painted chart with the loading shell causes visible first-open shake.
+        const stableStatus = alreadyConfirmed && !nextStatus.hasCandles
+            ? {
+                ...nextStatus,
+                isLoading: false,
+                hasCandles: true,
+            }
+            : nextStatus;
+        chartHistoryStatusCacheRef.current.set(statusKey, stableStatus);
 
         // Track in-session painted symbols for instant keep-alive switches.
-        if (nextStatus.hasCandles) {
+        if (stableStatus.hasCandles) {
             confirmedChartPaintRef.current.set(statusKey, true);
-        } else if (!nextStatus.isLoading) {
+            // Refresh switch-seed so the next open of this symbol paints without network.
+            prewarmTerminalChartSwitchSeed({
+                accountSessionScopeId,
+                symbol: nextStatus.symbol,
+                timeframeMinutes: nextStatus.timeframeMinutes,
+            });
+        } else if (!stableStatus.isLoading) {
             // Settled without candles — do not treat as warm.
             confirmedChartPaintRef.current.delete(statusKey);
         }
@@ -4366,8 +4383,8 @@ function TradingDashboardInner() {
         }
 
         // Always sync for the active symbol (no transition lag on unlock or lock).
-        setChartHistoryStatus(nextStatus);
-    }, []);
+        setChartHistoryStatus(stableStatus);
+    }, [accountSessionScopeId]);
 
     useEffect(() => {
         setIsOhlcHistoryDebugPersistent(readTerminalOhlcHistoryDebugPreference());
@@ -4453,6 +4470,7 @@ function TradingDashboardInner() {
         }
         priceHistoryCache.current = {};
         chartHistoryStatusCacheRef.current.clear();
+        confirmedChartPaintRef.current.clear();
         setChartHistoryStatus(null);
         setSelectedHistoryDiagnostics(null);
         ohlcService.disconnect();
@@ -5854,6 +5872,35 @@ function TradingDashboardInner() {
         selectedBrokerSymbol,
         storeSymbols,
         livePriceSymbolKey,
+    ]);
+
+    // Exness-style: keep-alive / open-tab symbols stay warm (history + live quotes)
+    // so switching charts is instant with history already in memory.
+    useEffect(() => {
+        if (!isRealtimeClientReady || renderedChartKeepAliveSymbols.length === 0) {
+            return;
+        }
+
+        const warmSymbols = uniqueTerminalSymbols(renderedChartKeepAliveSymbols);
+        primeTerminalMarketData(warmSymbols, {
+            requestHistory: true,
+            historyLimit: TERMINAL_BACKGROUND_OHLC_PREWARM_LIMIT,
+        });
+
+        const normalizedTf = normalizeTerminalTimeframeMinutes(chartTimeframeMinutes);
+        for (const symbol of warmSymbols) {
+            prewarmTerminalChartSwitchSeed({
+                accountSessionScopeId,
+                symbol,
+                timeframeMinutes: normalizedTf,
+            });
+        }
+    }, [
+        accountSessionScopeId,
+        chartTimeframeMinutes,
+        isRealtimeClientReady,
+        primeTerminalMarketData,
+        renderedChartKeepAliveSymbols,
     ]);
 
     // Subscribe to real-time POSITION_UPDATE push events from the C++ backend.
@@ -7962,15 +8009,33 @@ function TradingDashboardInner() {
         setChartKeepAliveSymbols((current) =>
             reconcileTerminalChartKeepAliveSymbols(current, openTabs, exactSymbol),
         );
-        // Warm keep-alive path: symbol already mounted + confirmed paint this session → show immediately.
-        // Cold path: loading until the chart re-confirms real candles (never empty grid).
+        // Exness-style warm switch:
+        // 1) keep-alive + confirmed paint this session → instant
+        // 2) memory history already in ohlcService → near-instant (chart seeds same frame)
+        // 3) cold → loading until paint (never empty grid)
         const switchStatusKey = getTerminalChartHistoryStatusKey(exactSymbol, normalizedTf);
         const keepAliveWarm =
             chartKeepAliveSymbols.some((symbol) => symbolsMatch(symbol, exactSymbol)) ||
             openTabs.some((symbol) => symbolsMatch(symbol, exactSymbol)) ||
             renderedChartKeepAliveSymbols.some((symbol) => symbolsMatch(symbol, exactSymbol));
         const confirmedWarm = Boolean(confirmedChartPaintRef.current.get(switchStatusKey));
-        const nextSwitchStatus = keepAliveWarm && confirmedWarm
+        const memoryBars = ohlcService.getSyncBars(
+            exactSymbol,
+            normalizedTf,
+            accountSessionScopeId,
+        );
+        const memoryWarm = memoryBars.length >= 30;
+        if (memoryWarm) {
+            precomputeTerminalChartSwitchSeed({
+                accountSessionScopeId,
+                symbol: exactSymbol,
+                timeframeMinutes: normalizedTf,
+                bars: memoryBars,
+                limit: TERMINAL_CHART_SWITCH_SEED_LIMIT,
+            });
+        }
+        const canShowInstantly = (keepAliveWarm && confirmedWarm) || memoryWarm;
+        const nextSwitchStatus = canShowInstantly
             ? {
                 symbol: exactSymbol,
                 timeframeMinutes: normalizedTf,
@@ -7987,6 +8052,11 @@ function TradingDashboardInner() {
         setChartHistoryStatus(nextSwitchStatus);
         setSelectedSymbol(exactSymbol);
         setSelectedSymbolAccountId(connectAccountId ?? null);
+        // Live + history for this symbol immediately (not only on idle).
+        primeTerminalMarketData([exactSymbol], {
+            requestHistory: true,
+            historyLimit: TERMINAL_SELECTED_OHLC_HISTORY_PRIME_LIMIT,
+        });
         startTransition(() => {
             setWatchlistSymbols((prev) => upsertUniqueTerminalSymbol(prev, exactSymbol));
             setOpenTabs((prev) => upsertUniqueTerminalSymbol(prev, exactSymbol));
@@ -7998,6 +8068,7 @@ function TradingDashboardInner() {
         selectedSymbolMarketPrimeCancelRef.current = scheduleTerminalIdleTask(() => {
             selectedSymbolMarketPrimeCancelRef.current = undefined;
             const normalizedTimeframeMinutes = normalizeTerminalTimeframeMinutes(chartTimeframeMinutes);
+            // Extra prime / repair only — primary prime already ran sync above.
             primeTerminalMarketData([exactSymbol], {
                 requestHistory: true,
                 historyLimit: TERMINAL_SELECTED_OHLC_HISTORY_PRIME_LIMIT,
@@ -9193,7 +9264,8 @@ function TradingDashboardInner() {
                                                         onChartBarSpacingChange={setChartBarSpacing}
                                                         isActive={chartEntry.isActive}
                                                         backgroundHydrationDelayMs={
-                                                            chartEntry.isActive ? 0 : (chartIndex + 1) * 350
+                                                            // Keep-alive: mount quickly so history+live are warm before switch.
+                                                            chartEntry.isActive ? 0 : Math.min((chartIndex + 1) * 80, 200)
                                                         }
                                                     />
                                                 </div>
