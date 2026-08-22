@@ -6,6 +6,7 @@
     "dev": "next dev -H 0.0.0.0 -p 3002",
     "dev:next": "next dev -H 0.0.0.0 -p 3002",
     "dev:node-bridge": "node scripts/with-node-bridge-env.mjs --dev",
+    "prebuild": "node scripts/normalize-production-backend-url.mjs",
     "build": "next build",
     "build:node-bridge": "node scripts/with-node-bridge-env.mjs --build",
     "start": "next start",

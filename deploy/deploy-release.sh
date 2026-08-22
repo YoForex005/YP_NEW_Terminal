@@ -13,6 +13,17 @@ PREVIOUS_TARGET=""
 [[ -f "$ENV_FILE" ]] || { echo "Environment not found: $ENV_FILE" >&2; exit 1; }
 [[ "$RELEASE_ID" =~ ^[a-f0-9]{7,40}$ ]] || { echo "Invalid release id" >&2; exit 1; }
 
+# Production API is backend.yopips.com. api.yopips.com is a dead Cloudflare tunnel.
+sed -i \
+  -e 's#https://api.yopips.com#https://backend.yopips.com#g' \
+  -e 's#http://api.yopips.com#https://backend.yopips.com#g' \
+  -e 's#wss://api.yopips.com#wss://backend.yopips.com#g' \
+  -e 's#ws://api.yopips.com#wss://backend.yopips.com#g' \
+  -e 's#https://backend.yopips.com/docs#https://backend.yopips.com#g' \
+  -e 's#wss://backend.yopips.com/docs#wss://backend.yopips.com#g' \
+  "$ENV_FILE"
+chmod 0600 "$ENV_FILE"
+
 if [[ -L "$CURRENT_LINK" ]]; then
   PREVIOUS_TARGET="$(readlink -f "$CURRENT_LINK")"
 fi
