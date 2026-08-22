@@ -3,6 +3,7 @@ import { createHmac, randomUUID } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
 
 import { authenticateRequest, type AuthContext } from "@/lib/server/auth";
+import { resolveTerminalBackendOrigin } from "@/lib/server/backend-origin";
 import { resolveBackendEnvValue } from "@/lib/server/backend-env";
 
 const TERMINAL_PROXY_TIMEOUT_MS = 15_000;
@@ -15,31 +16,7 @@ const PUBLIC_TERMINAL_PROXY_PATHS = new Set([
   "sessions/exchange",
 ]);
 
-const isUsableHttpOrigin = (value: string | undefined): value is string => {
-  const normalized = value?.trim() ?? "";
-  if (!normalized) return false;
-  // "proxy" / same-origin are browser client flags, not upstream origins.
-  if (["proxy", "same-origin", "same_origin"].includes(normalized.toLowerCase())) {
-    return false;
-  }
-  return /^https?:\/\//i.test(normalized);
-};
-
-const getTerminalBackendBase = (): string => {
-  const candidates = [
-    process.env.TERMINAL_API_BASE,
-    process.env.RUST_GATEWAY_PUBLIC_API_BASE_URL,
-    process.env.RUST_GATEWAY_HTTP_URL,
-    process.env.NEXT_PUBLIC_API_BASE_URL,
-    process.env.ACCOUNTS_BACKEND_URL,
-  ];
-  for (const candidate of candidates) {
-    if (isUsableHttpOrigin(candidate)) {
-      return candidate.trim().replace(/\/+$/, "");
-    }
-  }
-  return "http://127.0.0.1:3001";
-};
+const getTerminalBackendBase = (): string => resolveTerminalBackendOrigin();
 
 const getTerminalProxyOrigin = (): string => {
   const candidates = [

@@ -20,8 +20,7 @@ import type {
   TradingAccount,
   WalletBalances,
 } from "@/types/dashboard";
-
-const trimTrailingSlash = (value: string): string => value.replace(/\/+$/, "");
+import { resolveTerminalBackendOrigin } from "@/lib/server/backend-origin";
 
 const DEV_AUTH_SENTINEL = "dev-auto-auth";
 
@@ -31,15 +30,7 @@ export const isForwardableToken = (
 ): token is string => Boolean(token && token !== DEV_AUTH_SENTINEL);
 
 /** Bare backend ORIGIN (no trailing slash, no `/api`). */
-export const resolvePropfirmOrigin = (): string => {
-  const configured =
-    process.env.TERMINAL_API_BASE ||
-    process.env.RUST_GATEWAY_PUBLIC_API_BASE_URL ||
-    process.env.RUST_GATEWAY_HTTP_URL ||
-    process.env.NEXT_PUBLIC_API_BASE_URL ||
-    "http://127.0.0.1:3001";
-  return trimTrailingSlash(configured);
-};
+export const resolvePropfirmOrigin = (): string => resolveTerminalBackendOrigin();
 
 export class PropfirmBackendError extends Error {
   public readonly status: number;

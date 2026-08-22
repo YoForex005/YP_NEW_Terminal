@@ -8,6 +8,18 @@ if [[ ! -f .env.production ]]; then
   exit 1
 fi
 
+# api.yopips.com is a dead Cloudflare tunnel. Point every origin at the live API
+# before the process reads env so session exchange cannot inherit HTTP 530.
+sed -i \
+  -e 's#https://api.yopips.com#https://backend.yopips.com#g' \
+  -e 's#http://api.yopips.com#https://backend.yopips.com#g' \
+  -e 's#wss://api.yopips.com#wss://backend.yopips.com#g' \
+  -e 's#ws://api.yopips.com#wss://backend.yopips.com#g' \
+  -e 's#https://backend.yopips.com/docs#https://backend.yopips.com#g' \
+  -e 's#wss://backend.yopips.com/docs#wss://backend.yopips.com#g' \
+  .env.production
+chmod 0600 .env.production || true
+
 set -a
 # shellcheck disable=SC1091
 source .env.production
