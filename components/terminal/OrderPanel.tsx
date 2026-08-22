@@ -146,6 +146,25 @@ const formatUnsignedMoney = (value: number, currency = 'USD', decimals = 2) => {
     return `${value.toFixed(decimals)} ${currency}`;
 };
 
+const classifyPendingOrderType = (
+    side: TradeSide,
+    price: number,
+    liveBid: number,
+    liveAsk: number,
+): 'limit' | 'stop' | null => {
+    if (!Number.isFinite(price) || price <= 0 || liveBid <= 0 || liveAsk <= 0) {
+        return null;
+    }
+    if (side === 'buy') {
+        if (price < liveAsk) return 'limit';
+        if (price > liveAsk) return 'stop';
+        return null;
+    }
+    if (price > liveBid) return 'limit';
+    if (price < liveBid) return 'stop';
+    return null;
+};
+
 function StepInput({
     label,
     value,
@@ -271,23 +290,25 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
 
     const [tab, setTab] = useState<OrderTab>('market');
     const [formType, setFormType] = useState<FormType>('regular');
-    
-    // Instead of local state, initialize to whatever activeAction is or 'buy'
-    const selectedSide = activeAction || 'buy';
+    const [selectedSide, setSelectedSideLocal] = useState<TradeSide>('buy');
+
     const setSelectedSide = (side: TradeSide) => {
-        setSelectedSideInStore(side);
+        setSelectedSideLocal(side);
+        // Market draft lines on the chart are driven by the store. Pending
+        // side must stay local — the effect below clears the store draft
+        // when the Pending tab is open, and must not wipe the chosen side.
+        if (tab === 'market') {
+            setActiveAction(side);
+        }
     };
 
-    const setSelectedSideInStore = (side: TradeSide) => {
-        setActiveAction(side);
-    };
-
-    // When the order panel unmounts or tab changes to pending, clear the draft
+    // Hide the market draft when switching to Pending. Depend on `tab` only
+    // so clicking Sell on Pending does not immediately reset the side to Buy.
     useEffect(() => {
-        if (tab !== 'market' && activeAction !== null) {
+        if (tab !== 'market') {
             setActiveAction(null);
         }
-    }, [tab, activeAction, setActiveAction]);
+    }, [tab, setActiveAction]);
 
     useEffect(() => {
         return () => setActiveAction(null);
@@ -482,18 +503,15 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
     const canSubmitSideOrder = (_side: TradeSide) => hasLiveQuote;
     const canSubmitOrder = canSubmitSideOrder(selectedSide);
     const formatQuote = (value: number) => (value > 0 ? `${isIndicativeQuote ? '~' : ''}${value.toFixed(instrument.digits)}` : '--');
-    const midpointPrice = bid > 0 && ask > 0
-        ? (bid + ask) / 2
-        : ask > 0
-            ? ask
-            : bid;
-    const defaultLimitPrice = midpointPrice > 0 ? midpointPrice.toFixed(instrument.digits) : '';
-    const pendingPriceDisplay = pendingPrice
-        || (isOneClickForm && defaultLimitPrice
-            ? defaultLimitPrice
-            : ask > 0
-                ? ask.toFixed(instrument.digits)
-                : '');
+    const pipStep = 1 / Math.pow(10, instrument.digits);
+    const defaultPendingPrice = (() => {
+        if (bid <= 0 || ask <= 0) return '';
+        const ref = selectedSide === 'buy' ? bid : ask;
+        const offset = Math.max(pipStep * 20, ref * 0.0003);
+        const raw = selectedSide === 'buy' ? bid - offset : ask + offset;
+        return raw > 0 ? raw.toFixed(instrument.digits) : '';
+    })();
+    const pendingPriceDisplay = pendingPrice || defaultPendingPrice;
 
     const spread = Math.abs(ask - bid);
     const leverageRatio = accountInfo?.leverage && accountInfo.leverage > 0 ? accountInfo.leverage : null;
@@ -529,18 +547,14 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
     const buySentiment = Math.round(bullPct);
 
     const pendingType = useMemo<'limit' | 'stop'>(() => {
-        if (!pendingPrice) return 'limit';
-        const p = parseFloat(pendingPrice);
-        // Buy: limit if price is below ask (buy cheaper), stop if above (buy on breakout).
-        // Sell: limit if price is above bid (sell higher), stop if below (sell on breakdown).
-        return selectedSide === 'buy' ? (p < ask ? 'limit' : 'stop') : (p > bid ? 'limit' : 'stop');
-    }, [pendingPrice, ask, bid, selectedSide]);
+        const p = parseFloat(pendingPriceDisplay);
+        return classifyPendingOrderType(selectedSide, p, bid, ask) ?? 'limit';
+    }, [ask, bid, pendingPriceDisplay, selectedSide]);
 
     const adjustVolume = (delta: number) => {
         setVolume(formatVolume(parseFloat(volume) + delta, volumeSpec));
     };
 
-    const pipStep = 1 / Math.pow(10, instrument.digits);
     const pipSize = instrument.pipSize > 0
         ? instrument.pipSize
         : symbolSpec?.point && symbolSpec.point > 0
@@ -645,7 +659,8 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
             return false;
         }
 
-        return side === 'buy' ? limitPrice < ask : limitPrice > bid;
+        const quote = readLatestExecutableQuote();
+        return classifyPendingOrderType(side, limitPrice, quote.bid, quote.ask) !== null;
     };
 
     const handlePlaceOrder = async (
@@ -666,11 +681,19 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
 
         const vol = normalizeVolumeToSpec(parseFloat(volume), volumeSpec);
         if (!vol || vol <= 0) return;
-        const resolvedOrderType = options.orderType ?? (tab === 'market' ? 'market' : pendingType);
         const resolvedPrice = options.price ?? parseFloat(pendingPriceDisplay);
+        const classifiedPendingType = classifyPendingOrderType(
+            side,
+            resolvedPrice,
+            quote.bid,
+            quote.ask,
+        );
+        const resolvedOrderType = tab === 'market'
+            ? 'market'
+            : (classifiedPendingType ?? options.orderType ?? pendingType);
         if (
             resolvedOrderType !== 'market' &&
-            (!Number.isFinite(resolvedPrice) || resolvedPrice <= 0)
+            (!Number.isFinite(resolvedPrice) || resolvedPrice <= 0 || !classifiedPendingType)
         ) {
             return;
         }
@@ -825,7 +848,9 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
             }
 
             void handlePlaceOrder('sell', {
-                orderType: isLimit ? 'limit' : 'market',
+                orderType: isLimit
+                    ? (classifyPendingOrderType('sell', limitPrice, bid, ask) ?? 'limit')
+                    : 'market',
                 ...(isLimit ? { price: limitPrice } : {}),
                 tp: null,
                 sl: null,
@@ -838,7 +863,9 @@ function OrderPanel({ instrument, onClose, onPlaceOrder }: OrderPanelProps) {
             }
 
             void handlePlaceOrder('buy', {
-                orderType: isLimit ? 'limit' : 'market',
+                orderType: isLimit
+                    ? (classifyPendingOrderType('buy', limitPrice, bid, ask) ?? 'limit')
+                    : 'market',
                 ...(isLimit ? { price: limitPrice } : {}),
                 tp: null,
                 sl: null,

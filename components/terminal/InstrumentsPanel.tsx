@@ -23,6 +23,7 @@ interface InstrumentsPanelProps {
 
 interface InstrumentColumns {
     description: boolean;
+    signal: boolean;
     bid: boolean;
     spread: boolean;
     ask: boolean;
@@ -31,12 +32,19 @@ interface InstrumentColumns {
     pnl: boolean;
 }
 
+interface VisibleInstrumentColumns {
+    signal: boolean;
+    bid: boolean;
+    ask: boolean;
+    oneDayChange: boolean;
+    pnl: boolean;
+}
+
 interface InstrumentRowProps {
     instrument: DisplayInstrument;
     selectedSymbol: string;
     isSearching: boolean;
-    panelWidth: number;
-    columns: InstrumentColumns;
+    visibleColumns: VisibleInstrumentColumns;
     priceHighlight: boolean;
     isFavorite: boolean;
     isHighlighted: boolean;
@@ -47,6 +55,31 @@ interface InstrumentRowProps {
     clearSearch: () => void;
     onHover?: (symbol: string) => void;
 }
+
+// Quote pair (Bid/Ask) is never dropped for width. Signal is the first optional
+// column to hide when the market-watch sidebar is too narrow.
+const INSTRUMENT_SIGNAL_MIN_WIDTH = 280;
+const INSTRUMENT_PNL_MIN_WIDTH = 360;
+const INSTRUMENT_CHANGE_MIN_WIDTH = 420;
+
+const getVisibleInstrumentColumns = (
+    columns: InstrumentColumns,
+    panelWidth: number,
+): VisibleInstrumentColumns => ({
+    signal: columns.signal && panelWidth >= INSTRUMENT_SIGNAL_MIN_WIDTH,
+    bid: columns.bid,
+    ask: columns.ask,
+    oneDayChange: columns.oneDayChange && panelWidth > INSTRUMENT_CHANGE_MIN_WIDTH,
+    pnl: columns.pnl && panelWidth > INSTRUMENT_PNL_MIN_WIDTH,
+});
+
+const countVisibleInstrumentColumns = (visible: VisibleInstrumentColumns) =>
+    1
+    + (visible.signal ? 1 : 0)
+    + (visible.bid ? 1 : 0)
+    + (visible.ask ? 1 : 0)
+    + (visible.oneDayChange ? 1 : 0)
+    + (visible.pnl ? 1 : 0);
 
 const MAX_VISIBLE_SUBSCRIPTION_SYMBOLS = 20;
 const VISIBLE_SEARCH_SYMBOL_DEBOUNCE_MS = 40;
@@ -167,8 +200,7 @@ const InstrumentRow = memo(function InstrumentRow({
     instrument,
     selectedSymbol,
     isSearching,
-    panelWidth,
-    columns,
+    visibleColumns,
     priceHighlight,
     isFavorite,
     isHighlighted,
@@ -199,17 +231,6 @@ const InstrumentRow = memo(function InstrumentRow({
     const lastSignalDirRef = useRef<'up' | 'down' | null>(null);
     // Track when the last real price tick arrived (to detect stale/closed markets)
     const lastTickAtRef = useRef<number>(0);
-    const [hasLiveQuote, setHasLiveQuote] = useState(() => {
-        const snap = getSafeInstrumentLivePriceSnapshot(instrument.symbol);
-        return hasDisplayQuote(
-            snap?.bid ?? 0,
-            snap?.ask ?? 0,
-            (snap as any)?.last ?? 0,
-        );
-    });
-    const hasLiveQuoteRef = useRef(hasLiveQuote);
-    hasLiveQuoteRef.current = hasLiveQuote;
-
     useLayoutEffect(() => {
         if (!priceHighlight) return;
         const reapplyActiveFlash = (
@@ -247,10 +268,6 @@ const InstrumentRow = memo(function InstrumentRow({
 
             // Bid / Ask cell color classes
             const hasQuote = hasDisplayQuote(bid, ask, liveLast);
-            if (hasQuote !== hasLiveQuoteRef.current) {
-                hasLiveQuoteRef.current = hasQuote;
-                startTransition(() => setHasLiveQuote(hasQuote));
-            }
             if (bidCellRef.current) {
                 bidCellRef.current.className = bidCellRef.current.className
                     .replace(/text-\S+/g, '')
@@ -356,7 +373,8 @@ const InstrumentRow = memo(function InstrumentRow({
     }, [instrument.symbol, positionPriceSeed, priceHighlight]);
 
     const isSelected = instrument.symbol === selectedSymbol;
-    // Only use React state for stable fields (isSelected, hasQuote initial render)
+    // Live quote fields update through the direct symbol subscription above;
+    // React only owns stable row structure and selection state.
     const snap0 = getSafeInstrumentLivePriceSnapshot(instrument.symbol);
     const bid0 = snap0?.bid ?? 0;
     const ask0 = snap0?.ask ?? 0;
@@ -436,46 +454,47 @@ const InstrumentRow = memo(function InstrumentRow({
                 </div>
             </td>
 
-            {/* Signal cell */}
-            <td className="text-center py-[4px] px-1 w-[40px]">
-                <div
-                    ref={signalRef}
-                    className={`flex items-center justify-center rounded-[2px] font-bold mx-auto ${signalClass0}`}
-                >
-                    {signalText0}
-                </div>
-            </td>
+            {visibleColumns.signal && (
+                <td className="text-center py-[4px] px-1 w-[40px]">
+                    <div
+                        ref={signalRef}
+                        className={`flex items-center justify-center rounded-[2px] font-bold mx-auto ${signalClass0}`}
+                    >
+                        {signalText0}
+                    </div>
+                </td>
+            )}
 
-            {columns.bid && (
+            {visibleColumns.bid && (
                 <td
                     ref={bidCellRef}
-                    className={`text-right py-[4px] px-3 border-r border-border/40 font-mono text-[12px] tabular-nums transition-none ${hasDisplayQuote0 ? 'text-success' : 'text-muted-foreground/60'}`}
+                    className={`text-right py-[4px] px-2 border-r border-border/40 font-mono text-[12px] tabular-nums transition-none ${hasDisplayQuote0 ? 'text-success' : 'text-muted-foreground/60'}`}
                 >
                     <span ref={bidTextRef}>{fmt0(displayBid0)}</span>
                 </td>
             )}
 
-            {columns.ask && panelWidth > 220 && (
+            {visibleColumns.ask && (
                 <td
                     ref={askCellRef}
-                    className={`text-right py-[4px] px-3 border-r border-border/40 font-mono text-[12px] tabular-nums transition-none ${hasDisplayQuote0 ? 'text-destructive' : 'text-muted-foreground/60'}`}
+                    className={`text-right py-[4px] px-2 border-r border-border/40 font-mono text-[12px] tabular-nums transition-none ${hasDisplayQuote0 ? 'text-destructive' : 'text-muted-foreground/60'}`}
                 >
                     <span ref={askTextRef}>{fmt0(displayAsk0)}</span>
                 </td>
             )}
 
-            {columns.oneDayChange && panelWidth > 300 && (
+            {visibleColumns.oneDayChange && (
                 <td
                     ref={changeCellRef}
-                    className="text-right py-[4px] px-3 font-mono text-[12px] tabular-nums"
+                    className="text-right py-[4px] px-2 font-mono text-[12px] tabular-nums"
                     style={{ color: 'rgba(156,163,175,0.7)' }}
                 >
                     <span ref={changeRef}>0.00%</span>
                 </td>
             )}
 
-            {columns.pnl && panelWidth > 240 && (
-                <td className="text-right py-[4px] px-3 text-muted-foreground/50 font-mono text-[12px] tabular-nums">
+            {visibleColumns.pnl && (
+                <td className="text-right py-[4px] px-2 text-muted-foreground/50 font-mono text-[12px] tabular-nums">
                     -
                 </td>
             )}
@@ -507,6 +526,7 @@ function InstrumentsPanel({
     const [priceHighlight, setPriceHighlight] = useState(true);
     const [columns, setColumns] = useState<InstrumentColumns>({
         description: false,
+        signal: true,
         bid: true,
         spread: false,
         ask: true,
@@ -514,6 +534,10 @@ function InstrumentsPanel({
         showChart: false,
         pnl: true,
     });
+    const visibleColumns = useMemo(
+        () => getVisibleInstrumentColumns(columns, panelWidth),
+        [columns, panelWidth],
+    );
     const dropdownRef = useRef<HTMLDivElement>(null);
     const settingsRef = useRef<HTMLDivElement>(null);
     const searchInputRef = useRef<HTMLInputElement>(null);
@@ -845,11 +869,7 @@ function InstrumentsPanel({
             ? cat
             : cat.charAt(0).toUpperCase() + cat.slice(1);
 
-    const columnCount = 2
-        + (columns.bid ? 1 : 0)
-        + (columns.ask && panelWidth > 220 ? 1 : 0)
-        + (columns.oneDayChange && panelWidth > 300 ? 1 : 0)
-        + (columns.pnl && panelWidth > 240 ? 1 : 0);
+    const columnCount = countVisibleInstrumentColumns(visibleColumns);
     const resultCountLabel = `${filteredInstruments.length} ${filteredInstruments.length === 1 ? 'symbol' : 'symbols'}`;
     const emptyStateLabel = isSearching
         ? `No symbols match "${search.trim()}"`
@@ -878,6 +898,7 @@ function InstrumentsPanel({
                                 <div className="px-4 pb-2 text-[10px] text-muted-foreground font-semibold tracking-wider">VISIBLE COLUMNS</div>
                                 {[
                                     { id: 'description', label: 'Description' },
+                                    { id: 'signal', label: 'Signal' },
                                     { id: 'bid', label: 'Bid' },
                                     { id: 'ask', label: 'Ask' },
                                     { id: 'oneDayChange', label: '1D Change' },
@@ -966,11 +987,11 @@ function InstrumentsPanel({
                     <thead className="sticky top-0 bg-card z-10 border-b border-border select-none text-muted-foreground/70 uppercase tracking-wider text-[10px]">
                         <tr>
                             <th className="text-left font-semibold py-[5px] px-3 border-r border-border">Symbol</th>
-                            <th className="text-center font-semibold py-[5px] px-1 border-r border-border w-[40px]">Signal</th>
-                            {columns.bid && <th className="text-right font-semibold py-[5px] px-3 border-r border-border min-w-[70px]">Bid</th>}
-                            {columns.ask && panelWidth > 220 && <th className="text-right font-semibold py-[5px] px-3 border-r border-border min-w-[70px]">Ask</th>}
-                            {columns.oneDayChange && panelWidth > 300 && <th className="text-right font-semibold py-[5px] px-3 border-r border-border min-w-[72px]">Change</th>}
-                            {columns.pnl && panelWidth > 240 && <th className="text-right font-semibold py-[5px] px-3 min-w-[48px]">P/L</th>}
+                            {visibleColumns.signal && <th className="text-center font-semibold py-[5px] px-1 border-r border-border w-[40px]">Signal</th>}
+                            {visibleColumns.bid && <th className="text-right font-semibold py-[5px] px-2 border-r border-border min-w-[64px]">Bid</th>}
+                            {visibleColumns.ask && <th className="text-right font-semibold py-[5px] px-2 border-r border-border min-w-[64px]">Ask</th>}
+                            {visibleColumns.oneDayChange && <th className="text-right font-semibold py-[5px] px-2 border-r border-border min-w-[72px]">Change</th>}
+                            {visibleColumns.pnl && <th className="text-right font-semibold py-[5px] px-2 min-w-[48px]">P/L</th>}
                         </tr>
                     </thead>
                     <tbody className="bg-background">
@@ -1007,8 +1028,7 @@ function InstrumentsPanel({
                                         instrument={row.instrument}
                                         selectedSymbol={selectedSymbol}
                                         isSearching={isSearching}
-                                        panelWidth={panelWidth}
-                                        columns={columns}
+                                        visibleColumns={visibleColumns}
                                         priceHighlight={priceHighlight}
                                         isFavorite={favoriteSymbolSet.has(row.instrument.symbol)}
                                         isHighlighted={highlightedSearchIndex >= 0 && filteredInstruments[highlightedSearchIndex]?.symbol === row.instrument.symbol}

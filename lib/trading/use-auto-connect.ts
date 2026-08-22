@@ -101,25 +101,13 @@ const MT5_UNAVAILABLE_MESSAGE =
 const BOOTSTRAP_FAILED_MESSAGE =
   'MT5 terminal bootstrap failed. Market data and account state are temporarily unavailable.';
 
-const normalizeOhlcSessionGroup = (group?: string): string =>
-  (group ?? '').trim().replace(/\//g, '\\');
-
 export const buildOhlcSessionScopeId = (
   accountId: string,
-  session: TradingSession,
 ): string =>
-  // ── Data identity only — NOT connection identity ──────────────────────────
-  // session.id is an ephemeral auth token that rotates on every WS
-  // reconnect (10053/10054). Including it here caused the OHLC history
-  // cache to be wiped on every disconnect → setIsLoading(true) spinner.
-  // The data identity is: accountId + MT5 login + server + group.
-  // That never changes within a continuous trading session.
-  [
-    accountId.trim(),
-    Number.isFinite(session.login) ? String(session.login) : '',
-    session.server.trim(),
-    normalizeOhlcSessionGroup(session.group),
-  ].filter(Boolean).join('|');
+  // The immutable account UUID is both sufficient for account isolation and
+  // available before websocket authentication. Session/login/server fields
+  // arrive later and must not change the scope or remount the initial chart.
+  `account:${accountId.trim()}`;
 
 export type AutoConnectStatus =
   | 'idle'
@@ -1040,7 +1028,7 @@ export function useAutoConnectTrading(
       clearScheduledParentReconnect();
       clearScheduledSymbolRefresh();
       connectedAccountId.current = resolvedAccountId;
-      const ohlcSessionScopeId = buildOhlcSessionScopeId(resolvedAccountId, session);
+      const ohlcSessionScopeId = buildOhlcSessionScopeId(resolvedAccountId);
       setWsClient(client);
       setSession(session);
       setOhlcSessionScopeId(ohlcSessionScopeId);

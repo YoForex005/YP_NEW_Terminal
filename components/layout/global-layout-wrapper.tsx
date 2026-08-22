@@ -66,7 +66,7 @@ export function GlobalLayoutWrapper({ children }: GlobalLayoutProps) {
                     body: JSON.stringify({
                         symbols: DEFAULT_REQUESTED_TERMINAL_WARM_SYMBOLS,
                         timeframeMinutes: 1,
-                        limit: 300,
+                        limit: 100,
                         reason: 'dashboard-preload',
                     }),
                 }).catch(() => {});

@@ -3,11 +3,12 @@ import { NextResponse } from "next/server";
 import { authenticateRequest } from "@/lib/server/auth";
 import { requestAccountsBackend } from "@/lib/server/accounts-backend";
 
-export async function GET(request: NextRequest, { params }: { params: { id: string } }) {
+export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
     const auth = await authenticateRequest(request);
     if (!auth) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    const { id } = await params;
     try {
-        const data = await requestAccountsBackend(`/support/tickets/${params.id}`);
+        const data = await requestAccountsBackend(`/support/tickets/${id}`);
         return NextResponse.json({ ok: true, data });
     } catch (error) {
         console.warn(
@@ -17,7 +18,7 @@ export async function GET(request: NextRequest, { params }: { params: { id: stri
         return NextResponse.json({
             ok: true,
             data: {
-                id: params.id,
+                id,
                 messages: [],
             },
             degraded: true,
@@ -26,12 +27,13 @@ export async function GET(request: NextRequest, { params }: { params: { id: stri
     }
 }
 
-export async function POST(request: NextRequest, { params }: { params: { id: string } }) {
+export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
     const auth = await authenticateRequest(request);
     if (!auth) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     const body = await request.json();
+    const { id } = await params;
     try {
-        const data = await requestAccountsBackend(`/support/tickets/${params.id}/reply`, { method: "POST", body });
+        const data = await requestAccountsBackend(`/support/tickets/${id}/reply`, { method: "POST", body });
         return NextResponse.json({ ok: true, data }, { status: 201 });
     } catch (error) {
         console.warn(
@@ -43,7 +45,7 @@ export async function POST(request: NextRequest, { params }: { params: { id: str
                 ok: true,
                 data: {
                     id: `local-${Date.now()}`,
-                    ticketId: params.id,
+                    ticketId: id,
                     ...body,
                     createdAt: new Date().toISOString(),
                 },

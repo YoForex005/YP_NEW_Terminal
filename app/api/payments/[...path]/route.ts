@@ -5,9 +5,9 @@ import { authenticateRequest } from "@/lib/server/auth";
 import { proxyBackendResponse } from "@/lib/server/backend-response-proxy";
 
 interface RouteContext {
-  params: {
+  params: Promise<{
     path: string[];
-  };
+  }>;
 }
 
 const sanitizePaymentsProxyPath = (path: string[] | undefined): string[] | null => {
@@ -38,7 +38,7 @@ const proxyPaymentsRoute = async (
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const safePath = sanitizePaymentsProxyPath(params.path);
+  const safePath = sanitizePaymentsProxyPath((await params).path);
   if (!safePath) {
     return NextResponse.json({ error: "Invalid payments proxy path" }, { status: 400 });
   }

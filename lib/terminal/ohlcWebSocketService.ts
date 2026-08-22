@@ -117,20 +117,36 @@ type LatestTick = {
 type PendingHistoryRequest = {
   limit: number;
   promise: Promise<OHLCBar[]>;
+  sessionId: string | null;
+  connectionGeneration: number;
   semanticKey?: string;
   historyKey?: SubKey;
   cacheFirst?: boolean;
   cacheOnly?: boolean;
+  priority?: HistoryRequestPriority;
+  createdAtMs?: number;
   started?: boolean;
+  startedWithLiveClient?: boolean;
 };
 type CachedHistoryRequest = {
   bars: OHLCBar[];
   limit: number;
   storedAtMs: number;
+  sessionId: string | null;
+  connectionGeneration: number;
   semanticKey?: string;
   historyKey?: SubKey;
   retryableEmpty?: boolean;
   retryableDeferred?: boolean;
+};
+type RetainedAuthoritativeLatestRequest = {
+  sessionId: string;
+  semanticKey: string;
+  limit: number;
+  promise: Promise<OHLCBar[]>;
+  createdAtMs: number;
+  completedAtMs: number | null;
+  bars: OHLCBar[] | null;
 };
 type OhlcHistoryPayloadResponse = {
   bars: unknown[];
@@ -151,9 +167,9 @@ type BackgroundHistoryRefreshRequest = {
   range: HistoryRequestRange;
   key: SubKey;
   bucketMs: number;
-  semanticLatestKey?: string;
 };
 type HistoryRequestType = 'latest' | 'get_before' | 'range';
+type HistoryRequestPriority = 'foreground' | 'background';
 type HistoryRequestRange = {
   fromUnixMs?: number;
   toUnixMs?: number;
@@ -162,6 +178,8 @@ type HistoryRequestRange = {
   cacheFirst?: boolean;
   cacheOnly?: boolean;
   bypassPendingLatest?: boolean;
+  priority?: HistoryRequestPriority;
+  expectedSessionId?: string | null;
 };
 type HistoryMergeOptions = {
   notifySubscribers?: boolean;
@@ -191,7 +209,7 @@ type RawOhlcHistoryRequester = {
 
 const EMPTY_HISTORY_RETRY_DELAY_MS = 900;
 const LIVE_CLIENT_ATTACH_WAIT_MS = 600;
-const HISTORY_CLIENT_ATTACH_WAIT_MS = 1_200;
+const HISTORY_CLIENT_ATTACH_WAIT_MS = 8_000;
 const LIVE_CLIENT_ATTACH_POLL_MS = 80;
 const LOCAL_HISTORY_POLL_MS = 100;
 const LOCAL_REPLAY_BATCH_SIZE = 100;
@@ -208,6 +226,12 @@ const MAX_ACCEPTED_PAST_LIVE_TICK_SKEW_MS = 2 * 60_000;
 const RAW_OHLC_HISTORY_LIMIT = 512;
 const RAW_OHLC_HISTORY_MAX_KEYS = 128;
 const HISTORY_RESULT_CACHE_TTL_MS = 15_000;
+// `cacheFirst:false` callers ask for an authoritative latest window, but several
+// chart/session warmers can ask for that same window while React mounts the chart.
+// Keep the handoff long enough to cover the measured page-prewarm -> chart-mount
+// delay without turning this into a general-purpose stale-data cache.
+const LATEST_HISTORY_AUTHORITATIVE_REUSE_TTL_MS = 5_000;
+const RETAINED_AUTHORITATIVE_LATEST_MAX_ENTRIES = 32;
 const HISTORY_RESULT_CACHE_MAX_ENTRIES = 24;
 const LATEST_HISTORY_REQUEST_COALESCE_DELAY_MS = 0;
 const BACKGROUND_HISTORY_REFRESH_STAGGER_MS = 1_200;
@@ -354,14 +378,19 @@ function normalizeHistoryRange(range?: HistoryRequestRange): HistoryRequestRange
   const beforeUnixMs = normalizeOptionalUnixMs(
     range?.beforeUnixMs ?? (range as { before?: unknown } | undefined)?.before,
   );
+  // Some callers serialize an unbounded latest request as from=0/to=0. Treat
+  // that pair as the same latest window; positive bounded ranges stay exact.
+  const hasZeroLatestSentinel = fromUnixMs === 0 && toUnixMs === 0;
   const normalizedRange: HistoryRequestRange = {
-    ...(fromUnixMs !== undefined ? { fromUnixMs } : {}),
-    ...(toUnixMs !== undefined ? { toUnixMs } : {}),
+    ...(!hasZeroLatestSentinel && fromUnixMs !== undefined ? { fromUnixMs } : {}),
+    ...(!hasZeroLatestSentinel && toUnixMs !== undefined ? { toUnixMs } : {}),
     ...(beforeUnixMs !== undefined ? { beforeUnixMs } : {}),
   };
   const requestType = parseOptionalString(range?.requestType);
-  if (requestType) {
+  if (requestType && !hasZeroLatestSentinel) {
     normalizedRange.requestType = requestType;
+  } else if (hasZeroLatestSentinel) {
+    normalizedRange.requestType = 'latest';
   }
   const cacheFirst = parseOptionalBoolean(range?.cacheFirst);
   if (cacheFirst !== undefined) {
@@ -374,6 +403,13 @@ function normalizeHistoryRange(range?: HistoryRequestRange): HistoryRequestRange
   const bypassPendingLatest = parseOptionalBoolean(range?.bypassPendingLatest);
   if (bypassPendingLatest !== undefined) {
     normalizedRange.bypassPendingLatest = bypassPendingLatest;
+  }
+  if (range?.priority === 'background' || range?.priority === 'foreground') {
+    normalizedRange.priority = range.priority;
+  }
+  const expectedSessionId = parseOptionalString(range?.expectedSessionId);
+  if (expectedSessionId) {
+    normalizedRange.expectedSessionId = expectedSessionId;
   }
 
   return normalizedRange;
@@ -461,6 +497,19 @@ function makeSemanticLatestHistoryRequestKey(
     normalizedSymbol,
     timeframeMinutes,
     'latest',
+  ].join(':');
+}
+
+function makeRetainedAuthoritativeLatestRequestKey(
+  sessionId: string,
+  symbol: string,
+  timeframeMinutes: number,
+  limit: number,
+): string {
+  return [
+    makeSemanticLatestHistoryRequestKey(sessionId, symbol, timeframeMinutes),
+    limit,
+    'authoritative',
   ].join(':');
 }
 
@@ -2591,6 +2640,12 @@ class OhlcWebSocketService {
   private pendingSubscribeRequests: Map<SubKey, Promise<void>> = new Map();
   private pendingSubscribeAliases: Map<SubKey, Set<string>> = new Map();
   private pendingHistoryRequests: Map<string, PendingHistoryRequest> = new Map();
+  // This registry intentionally outlives transport-generation rotations. Its
+  // identity is the concrete/expected account session plus canonical symbol
+  // family, timeframe, and limit, so only the exact authoritative latest window
+  // can join or reuse it.
+  private retainedAuthoritativeLatestRequests:
+    Map<string, RetainedAuthoritativeLatestRequest> = new Map();
   private pendingHistoryPayloadRequests: Map<string, Promise<OhlcHistoryPayloadResponse>> =
     new Map();
   private recentHistoryRequestResults: Map<string, CachedHistoryRequest> = new Map();
@@ -2599,7 +2654,7 @@ class OhlcWebSocketService {
   private backgroundHistoryRefreshPumpActive = false;
   private backgroundHistoryRefreshLastStartedAt = 0;
   private backgroundHistoryRefreshGeneration = 0;
-  private pendingClientAttachWaits: Map<number, Promise<boolean>> = new Map();
+  private pendingClientAttachWaits: Map<string, Promise<boolean>> = new Map();
   private clientAttachGeneration = 0;
   private resolvedRequestSymbols: Map<SubKey, string> = new Map();
   private latestTicks: Map<string, LatestTick> = new Map();
@@ -2670,18 +2725,38 @@ class OhlcWebSocketService {
 
   public connect(sessionId: string) {
     const normalizedSessionId = sessionId.trim() || sessionId;
-    const sessionChanged =
-      this.sessionId !== null && this.sessionId !== normalizedSessionId;
+    const sessionChanged = this.sessionId !== normalizedSessionId;
+    const adoptablePreSessionLatestRequests = this.sessionId === null
+      ? [...this.pendingHistoryRequests.entries()].filter(([, pendingRequest]) => (
+          pendingRequest.sessionId === normalizedSessionId &&
+          Boolean(pendingRequest.semanticKey) &&
+          (
+            pendingRequest.started !== true ||
+            pendingRequest.startedWithLiveClient === false
+          )
+        ))
+      : [];
 
     if (sessionChanged) {
-      // sessionId now encodes data identity only (accountId+login+server+group).
-      // session.id was removed — it is an ephemeral token, not data identity.
-      // sessionChanged=true means a REAL account switch, not a WS reconnect.
-      // Full cache wipe on account switch; history preserved on reconnects.
+      this._retainAuthoritativeLatestRequestsForSession(normalizedSessionId);
+      // sessionId now encodes the immutable account identity only. Ephemeral
+      // authentication/session details must not invalidate account history.
+      // A null-to-concrete transition also drops anonymous warmup work. A WS
+      // reconnect with the same concrete identity continues to preserve history.
       this._clearSessionScopedState(true);
     }
 
     this.sessionId = normalizedSessionId;
+    for (const [requestKey, pendingRequest] of adoptablePreSessionLatestRequests) {
+      pendingRequest.connectionGeneration = this.clientAttachGeneration;
+      this.pendingHistoryRequests.set(requestKey, pendingRequest);
+    }
+    if (adoptablePreSessionLatestRequests.length > 0) {
+      this._debugHistoryRequestCoordination('adopt-pre-session-latest', {
+        source: 'exact-expected-session-match',
+        adoptedRequests: adoptablePreSessionLatestRequests.length,
+      });
+    }
     this.ensureClientAttached();
 
     if (sessionChanged) {
@@ -2850,7 +2925,153 @@ class OhlcWebSocketService {
     };
   }
 
-  public async getHistory(
+  public getHistory(
+    symbol: string,
+    timeframeMinutes: number,
+    limit = DEFAULT_OHLC_HISTORY_LIMIT,
+    range?: HistoryRequestRange,
+  ): Promise<OHLCBar[]> {
+    const normalizedRange = normalizeHistoryRange(range);
+    const expectedSessionId = normalizedRange.expectedSessionId?.trim() || null;
+    const requestSessionId = this.sessionId ?? expectedSessionId;
+    const hasSessionMismatch = Boolean(
+      expectedSessionId &&
+      this.sessionId &&
+      expectedSessionId !== this.sessionId,
+    );
+    const parsedLimit = Number.isFinite(limit)
+      ? Math.trunc(limit)
+      : DEFAULT_OHLC_HISTORY_LIMIT;
+    const requestLimit = Math.min(
+      MAX_OHLC_HISTORY_LIMIT,
+      Math.max(1, parsedLimit),
+    );
+    const canRetainAuthoritativeLatest = Boolean(
+      requestSessionId &&
+      !hasSessionMismatch &&
+      normalizedRange.cacheOnly !== true &&
+      isSemanticLatestHistoryRange(normalizedRange),
+    );
+
+    if (!canRetainAuthoritativeLatest || !requestSessionId) {
+      return this._getHistoryTransportScoped(symbol, timeframeMinutes, limit, range);
+    }
+
+    const retainedKey = makeRetainedAuthoritativeLatestRequestKey(
+      requestSessionId,
+      symbol,
+      timeframeMinutes,
+      requestLimit,
+    );
+    this._pruneRetainedAuthoritativeLatestRequests();
+    const retainedRequest = this.retainedAuthoritativeLatestRequests.get(retainedKey);
+    if (retainedRequest) {
+      if (retainedRequest.completedAtMs === null) {
+        this._debugHistoryRequestCoordination('join-retained-authoritative-latest', {
+          source: 'session-semantic-single-flight',
+          symbol,
+          timeframeMinutes,
+          requestedLimit: requestLimit,
+          ageMs: Math.max(0, Date.now() - retainedRequest.createdAtMs),
+        });
+        return retainedRequest.promise.then((bars) =>
+          this._selectBarsForRequest(bars, requestLimit, normalizedRange),
+        );
+      }
+
+      if (
+        retainedRequest.bars &&
+        Date.now() - retainedRequest.completedAtMs <=
+          LATEST_HISTORY_AUTHORITATIVE_REUSE_TTL_MS
+      ) {
+        this._debugHistoryRequestCoordination('reuse-retained-authoritative-latest', {
+          source: 'session-authoritative-success',
+          symbol,
+          timeframeMinutes,
+          requestedLimit: requestLimit,
+          ageMs: Math.max(0, Date.now() - retainedRequest.completedAtMs),
+        });
+        return Promise.resolve(
+          this._selectBarsForRequest(
+            retainedRequest.bars,
+            requestLimit,
+            normalizedRange,
+          ),
+        );
+      }
+
+      this.retainedAuthoritativeLatestRequests.delete(retainedKey);
+    }
+
+    let newRetainedRequest!: RetainedAuthoritativeLatestRequest;
+    const authoritativeRange: HistoryRequestRange = {
+      ...(range ?? {}),
+      cacheFirst: false,
+      cacheOnly: false,
+    };
+    const request = this._getHistoryTransportScoped(
+      symbol,
+      timeframeMinutes,
+      limit,
+      authoritativeRange,
+    ).then(
+      (bars) => {
+        const isStillOwned =
+          this.retainedAuthoritativeLatestRequests.get(retainedKey) ===
+          newRetainedRequest;
+        if (
+          bars.length > 0 &&
+          isStillOwned &&
+          this.sessionId === requestSessionId
+        ) {
+          newRetainedRequest.bars = bars.map((bar) => ({ ...bar }));
+          newRetainedRequest.completedAtMs = Date.now();
+          this._trimRetainedAuthoritativeLatestRequests();
+        } else if (isStillOwned) {
+          // Empty, failed, or superseded session results are deliberately not
+          // retained. A later explicit caller may retry them.
+          this.retainedAuthoritativeLatestRequests.delete(retainedKey);
+        }
+        return bars;
+      },
+      (error) => {
+        if (
+          this.retainedAuthoritativeLatestRequests.get(retainedKey) ===
+          newRetainedRequest
+        ) {
+          this.retainedAuthoritativeLatestRequests.delete(retainedKey);
+        }
+        throw error;
+      },
+    );
+    newRetainedRequest = {
+      sessionId: requestSessionId,
+      semanticKey: makeSemanticLatestHistoryRequestKey(
+        requestSessionId,
+        symbol,
+        timeframeMinutes,
+      ),
+      limit: requestLimit,
+      promise: request,
+      createdAtMs: Date.now(),
+      completedAtMs: null,
+      bars: null,
+    };
+    this.retainedAuthoritativeLatestRequests.set(retainedKey, newRetainedRequest);
+    this._debugHistoryRequestCoordination('create-retained-authoritative-latest', {
+      source: 'session-semantic-owner',
+      symbol,
+      timeframeMinutes,
+      requestedLimit: requestLimit,
+      expectedSessionId,
+    });
+    this._trimRetainedAuthoritativeLatestRequests();
+    return request.then((bars) =>
+      this._selectBarsForRequest(bars, requestLimit, normalizedRange),
+    );
+  }
+
+  private async _getHistoryTransportScoped(
     symbol: string,
     timeframeMinutes: number,
     limit = DEFAULT_OHLC_HISTORY_LIMIT,
@@ -2867,23 +3088,42 @@ class OhlcWebSocketService {
       MAX_OHLC_HISTORY_LIMIT,
       Math.max(1, parsedLimit),
     );
+    const normalizedZeroLatestBounds =
+      normalizeOptionalUnixMs(range?.fromUnixMs) === 0 &&
+      normalizeOptionalUnixMs(range?.toUnixMs) === 0;
     const requestRange = normalizeHistoryRange(range);
+    const expectedSessionId = requestRange.expectedSessionId?.trim() || null;
+    if (expectedSessionId && this.sessionId && this.sessionId !== expectedSessionId) {
+      this._debugHistoryRequestCoordination('reject-history-scope-mismatch', {
+        source: 'expected-session-mismatch',
+        symbol,
+        timeframeMinutes,
+        expectedSessionId,
+      });
+      return [];
+    }
+    const requestScopeId = this.sessionId ?? expectedSessionId;
     const requestKey = makeCanonicalHistoryRequestKey(
-      this.sessionId,
+      requestScopeId,
       key,
       requestLimit,
       requestRange,
     );
     const semanticLatestKey =
-      isSemanticLatestHistoryRange(requestRange) &&
-      requestRange.bypassPendingLatest !== true
-      ? makeSemanticLatestHistoryRequestKey(this.sessionId, symbol, timeframeMinutes)
+      isSemanticLatestHistoryRange(requestRange)
+      ? makeSemanticLatestHistoryRequestKey(requestScopeId, symbol, timeframeMinutes)
       : undefined;
     const hasDirectReadScope = this._hasDirectHistoryForKey(key, { includeCurrent: true });
     const pendingRequestKey = hasDirectReadScope
-      ? makeHistoryRequestKey(this.sessionId, key, requestLimit, requestRange)
+      ? makeHistoryRequestKey(requestScopeId, key, requestLimit, requestRange)
       : requestKey;
-    const canReuseCachedHistory = requestRange.cacheFirst !== false;
+    // Before the expected account is attached, the service-level history maps do
+    // not yet have a provable owner. Do not satisfy an explicitly scoped request
+    // from those maps; queue it until the exact session can be attached instead.
+    const expectedSessionIsCurrent =
+      !expectedSessionId || this.sessionId === expectedSessionId;
+    const canReuseCachedHistory =
+      requestRange.cacheFirst !== false && expectedSessionIsCurrent;
     const canUseEarlyCommittedCachedHistory =
       canReuseCachedHistory && (
         Boolean(semanticLatestKey) ||
@@ -2899,16 +3139,12 @@ class OhlcWebSocketService {
         )
       : null;
     if (fastCachedHistory) {
-      this._refreshCachedHistoryInBackground(
-        requestKey,
+      this._debugHistoryRequestCoordination('reuse-committed-latest', {
+        source: 'memory-cache-no-auto-refresh',
         symbol,
         timeframeMinutes,
-        requestLimit,
-        requestRange,
-        key,
-        bucketMs,
-        semanticLatestKey,
-      );
+        requestedLimit: requestLimit,
+      });
       return fastCachedHistory;
     }
     const committedCachedHistory = canUseEarlyCommittedCachedHistory
@@ -2919,22 +3155,27 @@ class OhlcWebSocketService {
         )
       : null;
     if (committedCachedHistory) {
-      this._refreshCachedHistoryInBackground(
-        requestKey,
+      this._debugHistoryRequestCoordination('reuse-partial-committed-latest', {
+        source: 'committed-cache-no-auto-refresh',
         symbol,
         timeframeMinutes,
-        requestLimit,
-        requestRange,
-        key,
-        bucketMs,
-        semanticLatestKey,
-      );
+        requestedLimit: requestLimit,
+      });
       return committedCachedHistory;
     }
     const pendingLatestRequest = semanticLatestKey
       ? this._getReusablePendingLatestHistoryRequest(semanticLatestKey, requestLimit, requestRange, key)
       : null;
     if (pendingLatestRequest) {
+      this._promotePendingHistoryRequest(pendingLatestRequest, requestRange);
+      this._debugHistoryRequestCoordination('join-pending-latest', {
+        source: 'semantic-pending-single-flight',
+        symbol,
+        timeframeMinutes,
+        requestedLimit: requestLimit,
+        pendingLimit: pendingLatestRequest.limit,
+        pendingAgeMs: Math.max(0, Date.now() - (pendingLatestRequest.createdAtMs ?? Date.now())),
+      });
       if (
         pendingLatestRequest.started &&
         pendingLatestRequest.limit < requestLimit
@@ -2957,6 +3198,16 @@ class OhlcWebSocketService {
       ? this._getSmallerPendingLatestHistoryRequest(semanticLatestKey, requestLimit, requestRange, key)
       : null;
     if (smallerPendingLatestRequest) {
+      this._promotePendingHistoryRequest(smallerPendingLatestRequest, requestRange);
+      if (!smallerPendingLatestRequest.started) {
+        smallerPendingLatestRequest.limit = Math.max(
+          smallerPendingLatestRequest.limit,
+          requestLimit,
+        );
+        return smallerPendingLatestRequest.promise.then((bars) =>
+          this._selectBarsForRequest(bars, requestLimit, requestRange),
+        );
+      }
       return this._loadLargerLatestHistoryAfterPending(
         smallerPendingLatestRequest,
         semanticLatestKey!,
@@ -2967,10 +3218,17 @@ class OhlcWebSocketService {
       );
     }
 
-    const cachedLatestResult = canReuseCachedHistory && semanticLatestKey
+    const cachedLatestResult = semanticLatestKey && requestRange.cacheOnly !== true
       ? this._getReusableRecentLatestHistoryResult(key, semanticLatestKey, requestLimit, requestRange)
       : null;
     if (cachedLatestResult) {
+      this._debugHistoryRequestCoordination('reuse-recent-latest', {
+        source: 'recent-success-snapshot',
+        symbol,
+        timeframeMinutes,
+        requestedLimit: requestLimit,
+        cacheFirst: requestRange.cacheFirst ?? true,
+      });
       return cachedLatestResult;
     }
 
@@ -2979,6 +3237,7 @@ class OhlcWebSocketService {
       pendingRequest &&
       this._pendingHistoryRequestMatchesReadScope(key, pendingRequest)
     ) {
+      this._promotePendingHistoryRequest(pendingRequest, requestRange);
       return pendingRequest.promise;
     }
 
@@ -2987,17 +3246,15 @@ class OhlcWebSocketService {
       : undefined;
     if (cachedResult) {
       if (this._cachedHistoryResultMatchesReadScope(key, cachedResult)) {
-        if (Date.now() - cachedResult.storedAtMs <= this._getRecentHistoryResultTtlMs(cachedResult)) {
-          this._refreshCachedHistoryInBackground(
-            requestKey,
-            symbol,
-            timeframeMinutes,
-            requestLimit,
-            requestRange,
-            key,
-            bucketMs,
-            semanticLatestKey,
-          );
+        if (
+          cachedResult.bars.length === 0 ||
+          this._isRetryableDeferredHistoryResult(cachedResult)
+        ) {
+          this.recentHistoryRequestResults.delete(pendingRequestKey);
+        } else if (
+          Date.now() - cachedResult.storedAtMs <=
+          this._getRecentHistoryResultTtlMs(cachedResult)
+        ) {
           return cachedResult.bars.map((bar) => ({ ...bar }));
         }
 
@@ -3041,7 +3298,8 @@ class OhlcWebSocketService {
         const refreshRange: HistoryRequestRange = {
           ...requestRange,
           cacheFirst: false,
-          fromUnixMs: Math.max(0, latestPersistentTime - bucketMs),
+          fromUnixMs: Math.max(1, latestPersistentTime - bucketMs),
+          toUnixMs: Math.max(Date.now(), latestPersistentTime + bucketMs),
         };
         const refreshRequestKey = makeCanonicalHistoryRequestKey(
           requestSessionId,
@@ -3049,15 +3307,17 @@ class OhlcWebSocketService {
           requestLimit,
           refreshRange,
         );
-        this._refreshCachedHistoryInBackground(
-          refreshRequestKey,
-          symbol,
-          timeframeMinutes,
-          requestLimit,
-          refreshRange,
-          key,
-          bucketMs,
-        );
+        if (requestRange.priority !== 'foreground') {
+          this._refreshCachedHistoryInBackground(
+            refreshRequestKey,
+            symbol,
+            timeframeMinutes,
+            requestLimit,
+            refreshRange,
+            key,
+            bucketMs,
+          );
+        }
         return selectedPersistentBars;
       }
     }
@@ -3074,6 +3334,14 @@ class OhlcWebSocketService {
         )
       : null;
     if (pendingLatestAfterPersistentRead) {
+      this._promotePendingHistoryRequest(pendingLatestAfterPersistentRead, requestRange);
+      this._debugHistoryRequestCoordination('join-pending-after-persistent-read', {
+        source: 'semantic-pending-after-persistent-read',
+        symbol,
+        timeframeMinutes,
+        requestedLimit: requestLimit,
+        pendingLimit: pendingLatestAfterPersistentRead.limit,
+      });
       if (
         pendingLatestAfterPersistentRead.started &&
         pendingLatestAfterPersistentRead.limit < requestLimit
@@ -3093,11 +3361,61 @@ class OhlcWebSocketService {
       );
     }
 
+    // The matching network request may have completed while IndexedDB was being
+    // read. Recheck its successful snapshot before creating a second request.
+    const recentLatestAfterPersistentRead = semanticLatestKey && requestRange.cacheOnly !== true
+      ? this._getReusableRecentLatestHistoryResult(
+          key,
+          semanticLatestKey,
+          requestLimit,
+          requestRange,
+        )
+      : null;
+    if (recentLatestAfterPersistentRead) {
+      this._debugHistoryRequestCoordination('reuse-recent-after-persistent-read', {
+        source: 'recent-success-after-persistent-read',
+        symbol,
+        timeframeMinutes,
+        requestedLimit: requestLimit,
+      });
+      return recentLatestAfterPersistentRead;
+    }
+
+    const smallerPendingLatestAfterPersistentRead = semanticLatestKey
+      ? this._getSmallerPendingLatestHistoryRequest(
+          semanticLatestKey,
+          requestLimit,
+          requestRange,
+          key,
+        )
+      : null;
+    if (smallerPendingLatestAfterPersistentRead) {
+      this._promotePendingHistoryRequest(smallerPendingLatestAfterPersistentRead, requestRange);
+      if (!smallerPendingLatestAfterPersistentRead.started) {
+        smallerPendingLatestAfterPersistentRead.limit = Math.max(
+          smallerPendingLatestAfterPersistentRead.limit,
+          requestLimit,
+        );
+        return smallerPendingLatestAfterPersistentRead.promise.then((bars) =>
+          this._selectBarsForRequest(bars, requestLimit, requestRange),
+        );
+      }
+      return this._loadLargerLatestHistoryAfterPending(
+        smallerPendingLatestAfterPersistentRead,
+        semanticLatestKey!,
+        symbol,
+        timeframeMinutes,
+        requestLimit,
+        requestRange,
+      );
+    }
+
     const pendingRequestAfterPersistentRead = this.pendingHistoryRequests.get(pendingRequestKey);
     if (
       pendingRequestAfterPersistentRead &&
       this._pendingHistoryRequestMatchesReadScope(key, pendingRequestAfterPersistentRead)
     ) {
+      this._promotePendingHistoryRequest(pendingRequestAfterPersistentRead, requestRange);
       return pendingRequestAfterPersistentRead.promise.then((bars) =>
         this._selectBarsForRequest(bars, requestLimit, requestRange),
       );
@@ -3106,46 +3424,85 @@ class OhlcWebSocketService {
     const pendingEntry: PendingHistoryRequest = {
       limit: requestLimit,
       promise: Promise.resolve([]),
+      sessionId: requestScopeId,
+      connectionGeneration: this.clientAttachGeneration,
       semanticKey: semanticLatestKey,
       historyKey: key,
       cacheFirst: requestRange.cacheFirst,
       cacheOnly: requestRange.cacheOnly,
+      priority: requestRange.priority ?? 'foreground',
+      createdAtMs: Date.now(),
       started: false,
     };
+    const requestSessionId = requestScopeId;
     const request = (async () => {
       if (semanticLatestKey) {
         await delay(LATEST_HISTORY_REQUEST_COALESCE_DELAY_MS);
       }
 
       pendingEntry.started = true;
+      pendingEntry.startedWithLiveClient =
+        this.hasLiveClient() &&
+        (!expectedSessionId || this.sessionId === expectedSessionId);
+      this._debugHistoryRequestCoordination('start-history-request', {
+        source: normalizedZeroLatestBounds
+          ? 'normalized-zero-bound-latest'
+          : 'coordinated-history-load',
+        symbol,
+        timeframeMinutes,
+        requestedLimit: pendingEntry.limit,
+        requestType: getHistoryRequestType(requestRange),
+        priority: pendingEntry.priority ?? 'foreground',
+      });
       return this._loadHistory(
         symbol,
         timeframeMinutes,
         pendingEntry.limit,
-        requestRange,
+        {
+          ...requestRange,
+          priority: pendingEntry.priority ?? requestRange.priority ?? 'foreground',
+        },
         key,
         bucketMs,
       );
     })()
       .then((bars) => {
-        const retryableDeferred = this._isRetryableHistoryResult(
+        const requestIsCurrent =
+          this.sessionId === requestSessionId &&
+          this.clientAttachGeneration === pendingEntry.connectionGeneration;
+        if (bars.length > 0 && requestIsCurrent) {
+          this._rememberRecentHistoryResult(pendingRequestKey, {
+            bars: bars.map((bar) => ({ ...bar })),
+            limit: pendingEntry.limit,
+            storedAtMs: Date.now(),
+            sessionId: requestSessionId,
+            connectionGeneration: pendingEntry.connectionGeneration,
+            semanticKey: semanticLatestKey,
+            historyKey: key,
+          });
+        }
+        this._debugHistoryRequestCoordination('complete-history-request', {
           symbol,
           timeframeMinutes,
-        );
-        this._rememberRecentHistoryResult(pendingRequestKey, {
-          bars: bars.map((bar) => ({ ...bar })),
-          limit: pendingEntry.limit,
-          storedAtMs: Date.now(),
-          semanticKey: semanticLatestKey,
-          historyKey: key,
-          retryableEmpty: bars.length === 0 && retryableDeferred,
-          retryableDeferred,
+          requestedLimit: pendingEntry.limit,
+          requestType: getHistoryRequestType(requestRange),
+          returnedBars: bars.length,
+          elapsedMs: Math.max(0, Date.now() - (pendingEntry.createdAtMs ?? Date.now())),
+          source: 'coordinated-history-load',
+          reusable: bars.length > 0 && requestIsCurrent,
+          retryReason: !requestIsCurrent
+            ? 'stale-session'
+            : bars.length === 0
+              ? 'empty'
+              : undefined,
         });
         return bars;
       })
       .finally(() => {
-        this.pendingHistoryRequests.delete(pendingRequestKey);
-    });
+        if (this.pendingHistoryRequests.get(pendingRequestKey) === pendingEntry) {
+          this.pendingHistoryRequests.delete(pendingRequestKey);
+        }
+      });
     pendingEntry.promise = request;
     this.pendingHistoryRequests.set(pendingRequestKey, pendingEntry);
     return request.then((bars) =>
@@ -3179,7 +3536,15 @@ class OhlcWebSocketService {
           }
         }
 
-        return this.getHistory(symbol, timeframeMinutes, requestLimit, range);
+        // Stay inside the transport coordinator. Re-entering the public retained
+        // latest registry here would join the outer promise that is awaiting this
+        // continuation and create a promise cycle.
+        return this._getHistoryTransportScoped(
+          symbol,
+          timeframeMinutes,
+          requestLimit,
+          range,
+        );
       });
   }
 
@@ -3248,16 +3613,36 @@ class OhlcWebSocketService {
     pendingRequest: PendingHistoryRequest,
     range: HistoryRequestRange,
   ): boolean {
-    return (
-      (pendingRequest.cacheFirst !== false) === (range.cacheFirst !== false) &&
-      (pendingRequest.cacheOnly === true) === (range.cacheOnly === true)
-    );
+    // Once a latest network request exists, cacheFirst only describes the work
+    // performed before that request was created. Joining the same in-flight
+    // request is safe and prevents cache-first warmup + authoritative refresh
+    // from issuing duplicate MT5 calls. cacheOnly remains a hard boundary.
+    return (pendingRequest.cacheOnly === true) === (range.cacheOnly === true);
+  }
+
+  private _promotePendingHistoryRequest(
+    pendingRequest: PendingHistoryRequest,
+    range: HistoryRequestRange,
+  ): void {
+    if (!pendingRequest.started && (range.priority ?? 'foreground') === 'foreground') {
+      pendingRequest.priority = 'foreground';
+    }
   }
 
   private _pendingHistoryRequestMatchesReadScope(
     key: SubKey,
     pendingRequest: PendingHistoryRequest,
   ): boolean {
+    const sessionMatches =
+      pendingRequest.sessionId === this.sessionId ||
+      (this.sessionId === null && Boolean(pendingRequest.sessionId));
+    if (
+      !sessionMatches ||
+      pendingRequest.connectionGeneration !== this.clientAttachGeneration
+    ) {
+      return false;
+    }
+
     if (!this._hasDirectHistoryForKey(key, { includeCurrent: true })) {
       return true;
     }
@@ -3275,7 +3660,18 @@ class OhlcWebSocketService {
     let bestMatch: CachedHistoryRequest | null = null;
 
     for (const [cacheKey, cachedResult] of this.recentHistoryRequestResults.entries()) {
-      if (nowMs - cachedResult.storedAtMs > this._getRecentHistoryResultTtlMs(cachedResult)) {
+      if (
+        cachedResult.bars.length === 0 ||
+        this._isRetryableDeferredHistoryResult(cachedResult)
+      ) {
+        this.recentHistoryRequestResults.delete(cacheKey);
+        continue;
+      }
+
+      if (
+        nowMs - cachedResult.storedAtMs >
+        this._getRecentHistoryResultTtlMs(cachedResult, range)
+      ) {
         this.recentHistoryRequestResults.delete(cacheKey);
         continue;
       }
@@ -3291,14 +3687,6 @@ class OhlcWebSocketService {
         continue;
       }
 
-      if (
-        this._isRetryableDeferredHistoryResult(cachedResult) &&
-        this._hasStoredRealHistoryForRequest(key, requestLimit, range)
-      ) {
-        this.recentHistoryRequestResults.delete(cacheKey);
-        continue;
-      }
-
       if (!bestMatch || cachedResult.limit < bestMatch.limit) {
         bestMatch = cachedResult;
       }
@@ -3309,28 +3697,17 @@ class OhlcWebSocketService {
       : null;
   }
 
-  private _hasStoredRealHistoryForRequest(
-    key: SubKey,
-    requestLimit: number,
-    range: HistoryRequestRange,
-  ): boolean {
-    for (const historyKey of this._getHistoryReadKeys(key, { includeCurrent: false })) {
-      const storedHistory = this.history.get(historyKey) ?? [];
-      if (
-        this._selectBarsForRequest(storedHistory, requestLimit, range)
-          .some((bar) => !isContinuityBar(bar))
-      ) {
-        return true;
-      }
-    }
-
-    return false;
-  }
-
   private _cachedHistoryResultMatchesReadScope(
     key: SubKey,
     cachedResult: CachedHistoryRequest,
   ): boolean {
+    if (
+      cachedResult.sessionId !== this.sessionId ||
+      cachedResult.connectionGeneration !== this.clientAttachGeneration
+    ) {
+      return false;
+    }
+
     if (!this._hasDirectHistoryForKey(key, { includeCurrent: true })) {
       return true;
     }
@@ -3338,10 +3715,15 @@ class OhlcWebSocketService {
     return cachedResult.historyKey === key;
   }
 
-  private _getRecentHistoryResultTtlMs(cachedResult: CachedHistoryRequest): number {
+  private _getRecentHistoryResultTtlMs(
+    cachedResult: CachedHistoryRequest,
+    range?: HistoryRequestRange,
+  ): number {
     return this._isRetryableDeferredHistoryResult(cachedResult)
       ? EMPTY_HISTORY_RETRY_DELAY_MS
-      : HISTORY_RESULT_CACHE_TTL_MS;
+      : range?.cacheFirst === false
+        ? LATEST_HISTORY_AUTHORITATIVE_REUSE_TTL_MS
+        : HISTORY_RESULT_CACHE_TTL_MS;
   }
 
   private _isRetryableDeferredHistoryResult(cachedResult: CachedHistoryRequest): boolean {
@@ -3396,6 +3778,103 @@ class OhlcWebSocketService {
     return this.sessionId;
   }
 
+  /** Read-only coordination state for focused service tests and diagnostics. */
+  public getRetainedAuthoritativeLatestSnapshotForTests(): Array<{
+    sessionId: string;
+    semanticKey: string;
+    limit: number;
+    state: 'pending' | 'ready';
+    barCount: number;
+  }> {
+    this._pruneRetainedAuthoritativeLatestRequests();
+    return [...this.retainedAuthoritativeLatestRequests.values()].map((request) => ({
+      sessionId: request.sessionId,
+      semanticKey: request.semanticKey,
+      limit: request.limit,
+      state: request.completedAtMs === null ? 'pending' : 'ready',
+      barCount: request.bars?.length ?? 0,
+    }));
+  }
+
+  private _retainAuthoritativeLatestRequestsForSession(sessionId: string): void {
+    for (const [requestKey, request] of this.retainedAuthoritativeLatestRequests) {
+      if (request.sessionId !== sessionId) {
+        this.retainedAuthoritativeLatestRequests.delete(requestKey);
+      }
+    }
+  }
+
+  private _pruneRetainedAuthoritativeLatestRequests(nowMs = Date.now()): void {
+    for (const [requestKey, request] of this.retainedAuthoritativeLatestRequests) {
+      if (
+        request.completedAtMs !== null &&
+        (
+          !request.bars ||
+          nowMs - request.completedAtMs >
+            LATEST_HISTORY_AUTHORITATIVE_REUSE_TTL_MS
+        )
+      ) {
+        this.retainedAuthoritativeLatestRequests.delete(requestKey);
+      }
+    }
+  }
+
+  private _trimRetainedAuthoritativeLatestRequests(): void {
+    this._pruneRetainedAuthoritativeLatestRequests();
+    if (
+      this.retainedAuthoritativeLatestRequests.size <=
+      RETAINED_AUTHORITATIVE_LATEST_MAX_ENTRIES
+    ) {
+      return;
+    }
+
+    // Never evict an in-flight owner: doing so would re-open the duplicate
+    // request race. Only completed snapshots participate in the LRU bound.
+    for (const [requestKey, request] of this.retainedAuthoritativeLatestRequests) {
+      if (request.completedAtMs === null) {
+        continue;
+      }
+      this.retainedAuthoritativeLatestRequests.delete(requestKey);
+      if (
+        this.retainedAuthoritativeLatestRequests.size <=
+        RETAINED_AUTHORITATIVE_LATEST_MAX_ENTRIES
+      ) {
+        break;
+      }
+    }
+  }
+
+  private _debugHistoryRequestCoordination(
+    event: string,
+    detail: Record<string, unknown>,
+  ): void {
+    if (!this.historyDiagnosticsDebugEnabled) {
+      return;
+    }
+
+    console.debug('[ohlcWebSocketService] history request coordination', {
+      event,
+      sessionId: this.sessionId,
+      ...detail,
+    });
+  }
+
+  public hasPendingLatestHistoryRequest(symbol: string, timeframeMinutes: number): boolean {
+    const semanticKey = makeSemanticLatestHistoryRequestKey(
+      this.sessionId,
+      symbol,
+      timeframeMinutes,
+    );
+    for (const pendingRequest of this.pendingHistoryRequests.values()) {
+      if (
+        pendingRequest.semanticKey === semanticKey &&
+        pendingRequest.sessionId === this.sessionId &&
+        pendingRequest.connectionGeneration === this.clientAttachGeneration
+      ) return true;
+    }
+    return false;
+  }
+
   public isCurrentSession(sessionId: string | null | undefined): boolean {
     const expectedSessionId = sessionId?.trim();
     if (!expectedSessionId) {
@@ -3413,14 +3892,13 @@ class OhlcWebSocketService {
     range: HistoryRequestRange,
     key: SubKey,
     bucketMs: number,
-    semanticLatestKey?: string,
   ) {
-    const pendingLatestRequest = semanticLatestKey
-      ? this._getReusablePendingLatestHistoryRequest(semanticLatestKey, requestLimit, range, key)
-      : null;
+    const isPositiveBoundedRepair =
+      (range.fromUnixMs ?? 0) > 0 &&
+      (range.toUnixMs ?? 0) > 0;
     if (
       range.cacheOnly ||
-      pendingLatestRequest ||
+      !isPositiveBoundedRepair ||
       this.pendingHistoryRequests.has(requestKey) ||
       this.backgroundHistoryRefreshes.has(requestKey)
     ) {
@@ -3433,10 +3911,9 @@ class OhlcWebSocketService {
       symbol,
       timeframeMinutes,
       requestLimit,
-      range,
+      range: { ...range, priority: 'background' },
       key,
       bucketMs,
-      ...(semanticLatestKey ? { semanticLatestKey } : {}),
     });
     void this._drainBackgroundHistoryRefreshQueue();
   }
@@ -3459,18 +3936,7 @@ class OhlcWebSocketService {
         }
 
         try {
-          const pendingLatestRequest = task.semanticLatestKey
-            ? this._getReusablePendingLatestHistoryRequest(
-                task.semanticLatestKey,
-                task.requestLimit,
-                task.range,
-                task.key,
-              )
-            : null;
-          if (
-            pendingLatestRequest ||
-            this.pendingHistoryRequests.has(task.requestKey)
-          ) {
+          if (this.pendingHistoryRequests.has(task.requestKey)) {
             continue;
           }
 
@@ -3499,19 +3965,16 @@ class OhlcWebSocketService {
           if (pumpGeneration !== this.backgroundHistoryRefreshGeneration) {
             continue;
           }
-          const retryableDeferred = this._isRetryableHistoryResult(
-            task.symbol,
-            task.timeframeMinutes,
-          );
-          this._rememberRecentHistoryResult(task.requestKey, {
-            bars: bars.map((bar) => ({ ...bar })),
-            limit: task.requestLimit,
-            storedAtMs: Date.now(),
-            semanticKey: task.semanticLatestKey,
-            historyKey: task.key,
-            retryableEmpty: bars.length === 0 && retryableDeferred,
-            retryableDeferred,
-          });
+          if (bars.length > 0) {
+            this._rememberRecentHistoryResult(task.requestKey, {
+              bars: bars.map((bar) => ({ ...bar })),
+              limit: task.requestLimit,
+              storedAtMs: Date.now(),
+              sessionId: this.sessionId,
+              connectionGeneration: this.clientAttachGeneration,
+              historyKey: task.key,
+            });
+          }
         } catch {
           // Keep the fast cached response path quiet; foreground requests surface errors.
         } finally {
@@ -3879,9 +4342,9 @@ class OhlcWebSocketService {
     lastHistoryBarMs: number,
     missingBuckets: number,
   ): Promise<void> {
-    // Fill in passes of up to 1500 bars each so large overnight/weekend gaps
-    // (e.g. 989 M1 bars = 16h) are covered without hitting the server limit.
-    const PASS_SIZE = 1500;
+    // Fetch large gaps as bounded 100-bar pages so no per-symbol history
+    // request exceeds the terminal chart contract.
+    const PASS_SIZE = 100;
     let fromMs = lastHistoryBarMs;
     let remaining = missingBuckets + 5;
 
@@ -3966,7 +4429,7 @@ class OhlcWebSocketService {
     gaps: Array<{ fromMs: number; toMs: number; buckets: number }>,
   ): Promise<void> {
     let filledAny = false;
-    const PASS_SIZE = 200;
+    const PASS_SIZE = 100;
     for (const gap of gaps) {
       try {
         let fromMs = gap.fromMs;
@@ -4020,6 +4483,29 @@ class OhlcWebSocketService {
     key: SubKey,
     bucketMs: number,
   ): Promise<OHLCBar[]> {
+    const expectedSessionId = range.expectedSessionId?.trim() || null;
+    if (
+      expectedSessionId &&
+      (
+        this.sessionId !== expectedSessionId ||
+        !this.hasLiveClient()
+      )
+    ) {
+      const expectedClientAttached = await this._waitForLiveClientAttached(
+        HISTORY_CLIENT_ATTACH_WAIT_MS,
+        expectedSessionId,
+      );
+      if (!expectedClientAttached) {
+        this._debugHistoryRequestCoordination('history-expected-session-not-attached', {
+          source: 'expected-session-attach-timeout',
+          symbol,
+          timeframeMinutes,
+          expectedSessionId,
+        });
+        return [];
+      }
+    }
+
     const requestSessionId = this.sessionId;
     const requestClient = this.wsClient;
     const requestClientGeneration = this.clientAttachGeneration;
@@ -4047,6 +4533,10 @@ class OhlcWebSocketService {
         requestSessionId,
         requestClient,
         requestClientGeneration,
+      ) &&
+      !this._canAcceptAuthoritativeLatestAcrossTransportHandoff(
+        requestSessionId,
+        range,
       )
     ) {
       return [];
@@ -4187,6 +4677,7 @@ class OhlcWebSocketService {
     this.sessionId = null;
     this._clearStorePriceSubscriptions();
     this.subscribers.clear();
+    this.retainedAuthoritativeLatestRequests.clear();
     this._clearSessionScopedState();
   }
 
@@ -4256,6 +4747,61 @@ class OhlcWebSocketService {
     }
   }
 
+  private _rotateClientAttachGenerationPreservingLatestSuccess(): void {
+    this.clientAttachGeneration += 1;
+
+    const sessionId = this.sessionId;
+    let preservedUnboundPendingRequests = 0;
+    for (const [requestKey, pendingRequest] of this.pendingHistoryRequests.entries()) {
+      const canRebindPendingRequest =
+        Boolean(pendingRequest.sessionId) &&
+        (sessionId === null || pendingRequest.sessionId === sessionId) &&
+        Boolean(pendingRequest.semanticKey) &&
+        (
+          pendingRequest.started !== true ||
+          pendingRequest.startedWithLiveClient === false
+        );
+      if (!canRebindPendingRequest) {
+        this.pendingHistoryRequests.delete(requestKey);
+        continue;
+      }
+
+      // A cold-start history promise either belongs to the current concrete
+      // session or carries an explicit expected session while the service is not
+      // connected yet. It is therefore safe to rebase across transport handoffs;
+      // anonymous and mismatched-session work is still discarded above.
+      pendingRequest.connectionGeneration = this.clientAttachGeneration;
+      preservedUnboundPendingRequests += 1;
+    }
+
+    let preservedLatestResults = 0;
+    for (const [requestKey, cachedResult] of this.recentHistoryRequestResults.entries()) {
+      const canPreserve =
+        Boolean(sessionId) &&
+        cachedResult.sessionId === sessionId &&
+        Boolean(cachedResult.semanticKey) &&
+        cachedResult.bars.length > 0 &&
+        !this._isRetryableDeferredHistoryResult(cachedResult);
+      if (!canPreserve) {
+        this.recentHistoryRequestResults.delete(requestKey);
+        continue;
+      }
+
+      // Candle data belongs to the account/session, not to one websocket object.
+      // Rebase only a successful semantic latest snapshot; pending work and
+      // explicit bounded-range results never cross the transport handoff.
+      cachedResult.connectionGeneration = this.clientAttachGeneration;
+      preservedLatestResults += 1;
+    }
+
+    this._debugHistoryRequestCoordination('transport-generation-rotated', {
+      source: 'same-session-transport-handoff',
+      connectionGeneration: this.clientAttachGeneration,
+      preservedUnboundPendingRequests,
+      preservedLatestResults,
+    });
+  }
+
   private ensureClientAttached() {
     const client = this._getPreferredStoreClient();
 
@@ -4264,7 +4810,7 @@ class OhlcWebSocketService {
       const attachedClientSupportsOhlc =
         attachedClient?.supportsOhlcActions === true;
       if (attachedClient && (attachedClient !== client || !attachedClientSupportsOhlc)) {
-        this.clientAttachGeneration += 1;
+        this._rotateClientAttachGenerationPreservingLatestSuccess();
         this.detachOhlcListener?.();
         this.detachOhlcListener = null;
         this.detachOhlcHistoryMetadataListener?.();
@@ -4294,7 +4840,7 @@ class OhlcWebSocketService {
     this.detachOhlcListener?.();
     this.detachOhlcHistoryMetadataListener?.();
     this.wsClient = client;
-    this.clientAttachGeneration += 1;
+    this._rotateClientAttachGenerationPreservingLatestSuccess();
     this.subscribedKeys.clear();
     this.pendingSubscribeRequests.clear();
     this.pendingSubscribeAliases.clear();
@@ -4416,14 +4962,21 @@ class OhlcWebSocketService {
 
   private async _waitForLiveClientAttached(
     timeoutMs = LIVE_CLIENT_ATTACH_WAIT_MS,
+    expectedSessionId?: string | null,
   ): Promise<boolean> {
+    const normalizedExpectedSessionId = expectedSessionId?.trim() || null;
+    const isExpectedClientAttached = () => (
+      this.hasLiveClient() &&
+      (!normalizedExpectedSessionId || this.sessionId === normalizedExpectedSessionId)
+    );
     this.ensureClientAttached();
-    if (this.hasLiveClient()) {
+    if (isExpectedClientAttached()) {
       return true;
     }
 
     const normalizedTimeoutMs = Math.max(0, Math.trunc(timeoutMs));
-    const pendingWait = this.pendingClientAttachWaits.get(normalizedTimeoutMs);
+    const waitKey = `${normalizedTimeoutMs}:${normalizedExpectedSessionId ?? 'any'}`;
+    const pendingWait = this.pendingClientAttachWaits.get(waitKey);
     if (pendingWait) {
       return pendingWait;
     }
@@ -4433,18 +4986,18 @@ class OhlcWebSocketService {
       while (Date.now() - startedAt < normalizedTimeoutMs) {
         await delay(LIVE_CLIENT_ATTACH_POLL_MS);
         this.ensureClientAttached();
-        if (this.hasLiveClient()) {
+        if (isExpectedClientAttached()) {
           return true;
         }
       }
 
       this.ensureClientAttached();
-      return this.hasLiveClient();
+      return isExpectedClientAttached();
     })().finally(() => {
-      this.pendingClientAttachWaits.delete(normalizedTimeoutMs);
+      this.pendingClientAttachWaits.delete(waitKey);
     });
 
-    this.pendingClientAttachWaits.set(normalizedTimeoutMs, wait);
+    this.pendingClientAttachWaits.set(waitKey, wait);
     return wait;
   }
 
@@ -4519,6 +5072,30 @@ class OhlcWebSocketService {
         this.clientAttachGeneration === requestClientGeneration &&
         this.hasLiveClient(),
     );
+  }
+
+  private _canAcceptAuthoritativeLatestAcrossTransportHandoff(
+    requestSessionId: string | null,
+    range: HistoryRequestRange,
+  ): boolean {
+    const expectedSessionId = range.expectedSessionId?.trim() || null;
+    const canAccept = Boolean(
+      requestSessionId &&
+      this.sessionId === requestSessionId &&
+      (!expectedSessionId || expectedSessionId === requestSessionId) &&
+      isSemanticLatestHistoryRange(range),
+    );
+    if (canAccept) {
+      this._debugHistoryRequestCoordination(
+        'accept-authoritative-latest-after-transport-handoff',
+        {
+          source: 'same-session-transport-response',
+          expectedSessionId,
+          connectionGeneration: this.clientAttachGeneration,
+        },
+      );
+    }
+    return canAccept;
   }
 
   private async _sendSubscribe(symbol: string, timeframeMinutes: number) {
@@ -5394,6 +5971,15 @@ class OhlcWebSocketService {
     requestKey: string,
     result: CachedHistoryRequest,
   ): void {
+    if (
+      result.bars.length === 0 ||
+      this._isRetryableDeferredHistoryResult(result) ||
+      result.sessionId !== this.sessionId ||
+      result.connectionGeneration !== this.clientAttachGeneration
+    ) {
+      return;
+    }
+
     this.recentHistoryRequestResults.delete(requestKey);
     this.recentHistoryRequestResults.set(requestKey, result);
 
@@ -6564,6 +7150,7 @@ class OhlcWebSocketService {
       requestType,
       cacheFirst,
       cacheOnly,
+      priority: range.priority ?? 'foreground',
       ...(range.beforeUnixMs !== undefined
         ? {
             before: range.beforeUnixMs,
@@ -6733,7 +7320,9 @@ class OhlcWebSocketService {
       limit,
       range,
     ).finally(() => {
-      this.pendingHistoryPayloadRequests.delete(requestKey);
+      if (this.pendingHistoryPayloadRequests.get(requestKey) === request) {
+        this.pendingHistoryPayloadRequests.delete(requestKey);
+      }
     });
 
     this.pendingHistoryPayloadRequests.set(requestKey, request);
@@ -6959,6 +7548,10 @@ class OhlcWebSocketService {
             requestSessionId,
             requestClient,
             requestClientGeneration,
+          ) &&
+          !this._canAcceptAuthoritativeLatestAcrossTransportHandoff(
+            requestSessionId,
+            range,
           )
         ) {
           return null;

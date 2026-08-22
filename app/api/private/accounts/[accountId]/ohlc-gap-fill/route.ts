@@ -20,7 +20,7 @@ import {
 } from "@/lib/server/terminal-ws-bridge";
 
 interface RouteContext {
-  params: { accountId: string };
+  params: Promise<{ accountId: string }>;
 }
 
 interface GapRange {

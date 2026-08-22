@@ -14,9 +14,9 @@ interface ChangePasswordBody {
 }
 
 interface RouteContext {
-  params: {
+  params: Promise<{
     accountId: string;
-  };
+  }>;
 }
 
 const toMt5ErrorStatus = (error: Mt5AccountOperationError): number => {
@@ -60,6 +60,8 @@ export async function POST(request: NextRequest, context: RouteContext) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  const { accountId } = await context.params;
+
   let body: ChangePasswordBody;
   try {
     body = (await request.json()) as ChangePasswordBody;
@@ -86,7 +88,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
   try {
     const result = await changeTradingAccountPasswordForUser(
       auth.user.id,
-      context.params.accountId,
+      accountId,
       passwordType,
       newPassword,
     );
@@ -116,7 +118,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
     if (error instanceof Mt5AccountOperationError) {
       console.error("[api/private/accounts/password] MT5 password change failed", {
         userId: auth.user.id,
-        accountId: context.params.accountId,
+        accountId,
         stage: error.stage,
         code: error.code,
         message: error.message,

@@ -7,6 +7,7 @@ import { useTheme } from 'next-themes';
 import { memo, useMemo, useState, useRef, useEffect, useCallback, type MutableRefObject, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { ChartCandlesIcon, ChartHlcBarsIcon, ChartHollowCandlesIcon, ChartLineIcon } from './ChartIcons';
+import KlineChartContainer from './KlineChartContainer';
 import { usePriceBySymbol } from '@/store/webtrader-store';
 import { DEFAULT_CHART_TYPES, type ChartType } from '@/lib/terminal/chart-visual-config';
 
@@ -113,12 +114,6 @@ function ChartPaneLoadingFallback() {
         </div>
     );
 }
-
-
-const KlineChartContainer = dynamic(() => import('./KlineChartContainer'), {
-    ssr: false,
-    loading: () => <ChartPaneLoadingFallback />,
-});
 
 const IndicatorsModal = dynamic(() => import('./IndicatorsModal'), {
     ssr: false,
@@ -378,21 +373,22 @@ function ChartPaneWithPriceSeed({
         ? 0
         : Math.min(Math.max(0, hydrationDelayMs ?? 0), 200);
 
+    const shouldMountImmediately = isForegroundChart && isPrimaryPane !== false;
     const [isChartRuntimeReady, setIsChartRuntimeReady] = useState(
-        () => isForegroundChart && isPrimaryPane !== false && effectiveHydrationDelayMs === 0,
+        () => shouldMountImmediately,
     );
 
     useEffect(() => {
         if (isChartRuntimeReady) {
             return;
         }
-        if (isForegroundChart) {
+        if (shouldMountImmediately) {
             setIsChartRuntimeReady(true);
             return;
         }
 
         return scheduleChartRuntimeMount(() => setIsChartRuntimeReady(true), effectiveHydrationDelayMs);
-    }, [effectiveHydrationDelayMs, isChartRuntimeReady, isForegroundChart]);
+    }, [effectiveHydrationDelayMs, isChartRuntimeReady, shouldMountImmediately]);
 
     if (!isChartRuntimeReady) {
         return <ChartPaneLoadingFallback />;

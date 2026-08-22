@@ -42,7 +42,7 @@ export const GLOBAL_CHART_SPACING = {
 export const GLOBAL_CHART_VIEWPORT = {
   initialVisibleBars: 100,
   minInitialVisibleBars: 80,
-  maxInitialVisibleBars: 200,
+  maxInitialVisibleBars: 100,
 } as const;
 
 const CHART_MIN_VISIBLE_PRICE_RANGE_RATIO = 0.0015;

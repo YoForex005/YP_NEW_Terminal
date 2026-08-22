@@ -28,6 +28,14 @@ export const DEFAULT_FIRST_RUN_TERMINAL_SYMBOLS = [
   'BTCUSD',
 ] as const;
 
+// Default chart tabs are independent from the broader first-run market watch.
+// Each base symbol is resolved against the active broker catalogue at runtime.
+export const DEFAULT_TERMINAL_CHART_SYMBOLS = [
+  'XAUUSD',
+  'EURUSD',
+  'BTCUSD',
+] as const;
+
 export const DEFAULT_REQUESTED_TERMINAL_WARM_SYMBOLS = [
   'XAUUSD',
   'EURUSD',

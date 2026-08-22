@@ -5,9 +5,9 @@ import { authenticateRequest } from "@/lib/server/auth";
 import { AccountsBackendError, requestAccountsBackend } from "@/lib/server/accounts-backend";
 
 interface RouteContext {
-  params: {
+  params: Promise<{
     groupName: string;
-  };
+  }>;
 }
 
 /**

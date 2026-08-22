@@ -10,9 +10,9 @@ import {
 import { resolveOwnedMt5Login } from "@/lib/server/mt5-account-scope";
 
 interface RouteContext {
-  params: {
+  params: Promise<{
     accountId: string;
-  };
+  }>;
 }
 
 export const dynamic = "force-dynamic";
@@ -81,7 +81,7 @@ export async function GET(request: NextRequest, context: RouteContext) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const accountId = context.params.accountId?.trim() ?? "";
+  const accountId = (await context.params).accountId?.trim() ?? "";
   if (!accountId) {
     return NextResponse.json(
       { error: "accountId is required.", code: "ACCOUNT_ID_REQUIRED" },
@@ -136,7 +136,7 @@ export async function PUT(request: NextRequest, context: RouteContext) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const accountId = context.params.accountId?.trim() ?? "";
+  const accountId = (await context.params).accountId?.trim() ?? "";
   if (!accountId) {
     return NextResponse.json(
       { error: "accountId is required.", code: "ACCOUNT_ID_REQUIRED" },

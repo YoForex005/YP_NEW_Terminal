@@ -89,7 +89,7 @@ type TerminalSessionNonOkResponseError = TerminalBridgeError & {
 };
 
 const DEFAULT_WS_TIMEOUT_MS = 30_000;
-export const TERMINAL_OHLC_REPAIR_DEFAULT_LIMIT = 720;
+export const TERMINAL_OHLC_REPAIR_DEFAULT_LIMIT = 100;
 export const TERMINAL_OHLC_REPAIR_MAX_LIMIT = 5_000;
 export const TERMINAL_OHLC_REPAIR_PROBE_TIMEOUT_MS = 6_000;
 export const TERMINAL_OHLC_REPAIR_FILL_TIMEOUT_MS = 8_000;
@@ -1988,12 +1988,9 @@ export const requestTerminalOhlcGapRepair = async (
   input: unknown,
 ): Promise<TerminalOhlcRepairResult> => {
   const rawNormalized = normalizeTerminalOhlcRepairRequest(input);
-  // Ensure the minimum history fetch is 300 bars regardless of what the frontend
-  // requests. The initial chart load uses maxInitialVisibleBars (300) but older
-  // callers may send smaller limits. Fetching ≥300 bars on the first request
-  // gives 5h of 1-min data instantly, eliminating the gap between history and
-  // live bars without extra round-trips.
-  const BRIDGE_MIN_SNAPSHOT_LIMIT = 300;
+  // Keep repair snapshots on the same 100-bar page as direct terminal history.
+  // The bridge must not silently enlarge a per-symbol request.
+  const BRIDGE_MIN_SNAPSHOT_LIMIT = 100;
   const normalized: typeof rawNormalized = {
     ...rawNormalized,
     limit: Math.max(rawNormalized.limit, BRIDGE_MIN_SNAPSHOT_LIMIT),

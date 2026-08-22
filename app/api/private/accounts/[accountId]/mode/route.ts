@@ -12,9 +12,9 @@ import {
 import type { TradingAccount } from "@/types/dashboard";
 
 interface RouteContext {
-  params: {
+  params: Promise<{
     accountId: string;
-  };
+  }>;
 }
 
 interface ModeRequestBody {

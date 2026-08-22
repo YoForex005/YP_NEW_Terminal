@@ -16,9 +16,9 @@ interface VerifyBody {
 }
 
 interface RouteContext {
-  params: {
+  params: Promise<{
     accountId: string;
-  };
+  }>;
 }
 
 const toMt5ErrorStatus = (error: Mt5AccountOperationError): number => {
@@ -82,6 +82,8 @@ export async function POST(request: NextRequest, context: RouteContext) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  const { accountId } = await context.params;
+
   let body: VerifyBody;
   try {
     body = (await request.json()) as VerifyBody;
@@ -100,7 +102,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
   try {
     const result = await verifyTradingAccountCredentialsForUser(
       auth.user.id,
-      context.params.accountId,
+      accountId,
       passwordType,
       body.password,
     );
@@ -130,7 +132,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
     if (error instanceof Mt5AccountOperationError) {
       console.error("[api/private/accounts/credentials/verify] MT5 verification failed", {
         userId: auth.user.id,
-        accountId: context.params.accountId,
+        accountId,
         stage: error.stage,
         code: error.code,
         message: error.message,

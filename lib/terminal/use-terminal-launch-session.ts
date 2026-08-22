@@ -2,14 +2,15 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { TradingAccount as DashboardTradingAccount } from '@/types/dashboard';
-import type { SymbolInfo, TradingSession } from '@/types/webtrader';
 import { useWebtraderStore } from '@/store/webtrader-store';
-import { DEFAULT_REQUESTED_TERMINAL_WARM_SYMBOLS } from '@/lib/trading/terminal-symbols';
+import { getPreferredTerminalSubscriptionSymbols } from '@/lib/trading/terminal-symbols';
+import { buildOhlcSessionScopeId } from '@/lib/trading/use-auto-connect';
 import { ohlcService } from '@/lib/terminal/ohlcWebSocketService';
 import type { WebSocketTradingClient } from '@/lib/trading/websocket-client';
 import {
   TerminalExchangeResponse,
   TerminalTicketRealtimeClient,
+  createAndExchangeTerminalSession,
   exchangeTerminalLaunchCode,
   getTerminalApiBaseUrl,
   getTerminalWsBaseUrl,
@@ -18,10 +19,13 @@ import {
 type LaunchStatus =
   | 'idle'
   | 'exchanging'
+  | 'authenticating'
   | 'restoring'
   | 'connecting'
   | 'connected'
   | 'ready'
+  | 'locked'
+  | 'degraded'
   | 'reconnecting'
   | 'error'
   | 'disconnected';
@@ -37,7 +41,8 @@ interface UseTerminalLaunchSessionResult {
 }
 
 type TerminalSessionStart =
-  { mode: 'launch-code'; launchCode: string };
+  | { mode: 'launch-code'; launchCode: string }
+  | { mode: 'account-login'; login: string };
 
 const TERMINAL_EXPIRY_SAFETY_WINDOW_MS = 5_000;
 
@@ -77,11 +82,6 @@ const firstLaunchCodeFromParams = (params: URLSearchParams): string | null => {
   return null;
 };
 
-const hasAccountIdQueryParam = (): boolean => {
-  if (typeof window === 'undefined') return false;
-  return new URLSearchParams(window.location.search).has('accountId');
-};
-
 const getAccountContext = (
   exchange: TerminalExchangeResponse | null,
 ): Record<string, unknown> | undefined =>
@@ -100,7 +100,10 @@ const buildLaunchAccount = (
   const currency = parseString(context?.currency, 'USD');
 
   return {
-    id: `terminal-launch-${accountNumber}`,
+    // The exchange is already ownership-gated and returns the immutable account
+    // UUID. Preserve it so session-scoped OHLC work never starts under a temporary
+    // login identity and then restarts when the dashboard catalog arrives.
+    id: parseString(context?.account_id ?? context?.accountId, `terminal-launch-${accountNumber}`),
     accountNumber,
     name: parseString(context?.name, `MT5 ${accountNumber}`),
     platform: 'mt5',
@@ -123,42 +126,6 @@ const buildLaunchAccount = (
     },
   };
 };
-
-const buildFallbackSymbols = (): SymbolInfo[] =>
-  DEFAULT_REQUESTED_TERMINAL_WARM_SYMBOLS.map((name) => ({
-    name,
-    description: name,
-    baseCurrency: name.slice(0, 3),
-    quoteCurrency: name.slice(3, 6) || 'USD',
-    digits: name.includes('JPY') ? 3 : 5,
-    point: name.includes('JPY') ? 0.001 : 0.00001,
-    tickSize: name.includes('JPY') ? 0.001 : 0.00001,
-    tickValue: 1,
-    tradeContractSize: 100000,
-    tradeMode: 'full',
-    calcMode: 'forex',
-    volumeMin: 0.01,
-    volumeMax: 100,
-    volumeStep: 0.01,
-    marginInitial: 0,
-    marginMaintenance: 0,
-    swapLong: 0,
-    swapShort: 0,
-  }));
-
-const normalizeOhlcSessionGroup = (group?: string): string =>
-  (group ?? '').trim().replace(/\//g, '\\');
-
-const buildLaunchOhlcSessionScopeId = (
-  accountId: string,
-  session: TradingSession,
-): string =>
-  [
-    accountId.trim(),
-    Number.isFinite(session.login) ? String(session.login) : '',
-    session.server.trim(),
-    normalizeOhlcSessionGroup(session.group),
-  ].filter(Boolean).join('|');
 
 const readLaunchCodeFromLocation = (): string | null => {
   if (typeof window === 'undefined') return null;
@@ -200,13 +167,60 @@ const removeLaunchCodeFromLocation = (): void => {
   window.history.replaceState(window.history.state, '', nextUrl);
 };
 
-export const useTerminalLaunchSession = (): UseTerminalLaunchSessionResult => {
-  const [sessionStart, setSessionStart] = useState<TerminalSessionStart | null>(null);
+const parseAccountLogin = (accountId: string | null | undefined): string | null => {
+  const candidate = accountId?.trim().replace(/^mt5-/i, '') ?? '';
+  if (!/^\d+$/.test(candidate) || Number(candidate) <= 0) return null;
+  return candidate;
+};
+
+// React Strict Mode replays effects in development. Reuse the in-flight
+// one-time-code exchange during that replay so the first request cannot consume
+// the code and leave the second connection with an already-used ticket.
+const pendingExchangeByKey = new Map<string, Promise<TerminalExchangeResponse>>();
+
+const acquireTerminalExchange = (
+  start: TerminalSessionStart,
+): Promise<TerminalExchangeResponse> => {
+  const key = start.mode === 'launch-code'
+    ? `launch:${start.launchCode}`
+    : `account:${start.login}`;
+  const pending = pendingExchangeByKey.get(key);
+  if (pending) return pending;
+
+  const request = start.mode === 'launch-code'
+    ? exchangeTerminalLaunchCode(start.launchCode, getTerminalApiBaseUrl())
+    : createAndExchangeTerminalSession(start.login, getTerminalApiBaseUrl());
+  pendingExchangeByKey.set(key, request);
+  void request.then(
+    () => pendingExchangeByKey.delete(key),
+    () => pendingExchangeByKey.delete(key),
+  );
+  return request;
+};
+
+export const useTerminalLaunchSession = (
+  requestedAccountId?: string | null,
+  canonicalAccountId?: string | null,
+): UseTerminalLaunchSessionResult => {
+  const locationLaunchCode = useMemo(readLaunchCodeFromLocation, []);
+  const accountLogin = useMemo(
+    () => parseAccountLogin(requestedAccountId),
+    [requestedAccountId],
+  );
+  const sessionStart = useMemo<TerminalSessionStart | null>(() => {
+    if (locationLaunchCode) {
+      return { mode: 'launch-code', launchCode: locationLaunchCode };
+    }
+    return accountLogin ? { mode: 'account-login', login: accountLogin } : null;
+  }, [accountLogin, locationLaunchCode]);
+  const ohlcSessionScopeId = useMemo(() => {
+    const accountId = canonicalAccountId?.trim();
+    return accountId ? buildOhlcSessionScopeId(accountId) : null;
+  }, [canonicalAccountId]);
   const [exchange, setExchange] = useState<TerminalExchangeResponse | null>(null);
   const [status, setStatus] = useState<LaunchStatus>('idle');
   const [error, setError] = useState<string | null>(null);
   const clientRef = useRef<TerminalTicketRealtimeClient | null>(null);
-  const initializedRef = useRef(false);
 
   const setConnectionStatus = useWebtraderStore((state) => state.setConnectionStatus);
   const setConnectionError = useWebtraderStore((state) => state.setConnectionError);
@@ -222,40 +236,22 @@ export const useTerminalLaunchSession = (): UseTerminalLaunchSessionResult => {
   const setOhlcSessionScopeId = useWebtraderStore((state) => state.setOhlcSessionScopeId);
 
   useEffect(() => {
-    if (initializedRef.current) return;
-
-    const nextLaunchCode = readLaunchCodeFromLocation();
-    if (nextLaunchCode) {
-      initializedRef.current = true;
-      setSessionStart({ mode: 'launch-code', launchCode: nextLaunchCode });
+    if (!sessionStart) {
+      setExchange(null);
+      setStatus('idle');
+      setError(null);
       return;
     }
-
-    // The legacy accountId autoconnect path owns normal /terminal?accountId=...
-    // visits. Ticket-session restore is only for launched terminal views.
-    if (hasAccountIdQueryParam()) {
-      initializedRef.current = true;
-      return;
-    }
-
-    initializedRef.current = true;
-  }, []);
-
-  useEffect(() => {
-    if (!sessionStart) return;
 
     let isCancelled = false;
     let didExchange = false;
     let initialAccountRefreshComplete = false;
     let terminalExpiryTimer: ReturnType<typeof setTimeout> | null = null;
-    setStatus(sessionStart.mode === 'launch-code' ? 'exchanging' : 'restoring');
+    setExchange(null);
+    setStatus('exchanging');
     setConnectionStatus('connecting');
     setError(null);
     setConnectionError(null);
-
-    const buildPayload = async (): Promise<TerminalExchangeResponse> => {
-      return exchangeTerminalLaunchCode(sessionStart.launchCode, getTerminalApiBaseUrl());
-    };
 
     const expireTerminalSession = (message: string): void => {
       if (isCancelled) return;
@@ -277,7 +273,7 @@ export const useTerminalLaunchSession = (): UseTerminalLaunchSessionResult => {
       ohlcService.setUseHistoryApi(true);
     };
 
-    void buildPayload()
+    void acquireTerminalExchange(sessionStart)
       .then(async (payload) => {
         if (isCancelled) return;
 
@@ -287,11 +283,25 @@ export const useTerminalLaunchSession = (): UseTerminalLaunchSessionResult => {
 
         didExchange = true;
         setExchange(payload);
-        removeLaunchCodeFromLocation();
+        if (sessionStart.mode === 'launch-code') {
+          removeLaunchCodeFromLocation();
+        }
         ohlcService.setUseHistoryApi(false);
         const accountContext = getAccountContext(payload);
         const launchLogin = parseLogin(accountContext);
         const launchAccountId = launchLogin > 0 ? `mt5-${launchLogin}` : null;
+        const launchCanonicalAccountId = parseString(
+          accountContext?.account_id ?? accountContext?.accountId,
+        );
+        const resolvedOhlcSessionScopeId = ohlcSessionScopeId ?? (
+          launchCanonicalAccountId
+            ? buildOhlcSessionScopeId(launchCanonicalAccountId)
+            : null
+        );
+        if (resolvedOhlcSessionScopeId) {
+          setOhlcSessionScopeId(resolvedOhlcSessionScopeId);
+          ohlcService.connect(resolvedOhlcSessionScopeId);
+        }
 
         const client = new TerminalTicketRealtimeClient({
           terminalToken: payload.terminal_token,
@@ -334,8 +344,17 @@ export const useTerminalLaunchSession = (): UseTerminalLaunchSessionResult => {
           onSession: (session) => {
             if (isCancelled) return;
             setSession(session);
-            if (session && launchAccountId) {
-              const scopeId = buildLaunchOhlcSessionScopeId(launchAccountId, session);
+            if (session && (resolvedOhlcSessionScopeId || launchAccountId)) {
+              // Account hints provide the immutable UUID on the normal launch
+              // path. Preserve the old server/group isolation only as a direct-
+              // launch fallback when no account snapshot was available.
+              const fallbackIdentity = [
+                launchAccountId,
+                Number.isFinite(session.login) ? String(session.login) : '',
+                session.server.trim(),
+                (session.group ?? '').trim().replace(/\//g, '\\'),
+              ].filter(Boolean).join('|');
+              const scopeId = resolvedOhlcSessionScopeId ?? buildOhlcSessionScopeId(fallbackIdentity);
               setOhlcSessionScopeId(scopeId);
               ohlcService.connect(scopeId);
             }
@@ -378,15 +397,20 @@ export const useTerminalLaunchSession = (): UseTerminalLaunchSessionResult => {
         setMarketWsClient(storeClient);
         setOhlcWsClient(storeClient);
 
-        if (useWebtraderStore.getState().symbols.length === 0) {
-          setSymbols(buildFallbackSymbols());
+        const sessionSymbols = await client.getSymbols();
+        if (sessionSymbols.length === 0) {
+          throw new Error(
+            'No trading symbols are available for this account broker group. Reopen the terminal after the broker catalog is refreshed.',
+          );
         }
+        setSymbols(sessionSymbols);
 
         setStatus('connecting');
         await client.connect();
         if (isCancelled) return;
 
-        await client.subscribeSymbols([...DEFAULT_REQUESTED_TERMINAL_WARM_SYMBOLS]).catch(() => undefined);
+        const subscriptionSymbols = getPreferredTerminalSubscriptionSymbols(sessionSymbols);
+        await client.subscribeSymbols(subscriptionSymbols).catch(() => undefined);
         setStatus('restoring');
         setConnectionStatus('connected');
 
@@ -424,6 +448,7 @@ export const useTerminalLaunchSession = (): UseTerminalLaunchSessionResult => {
       ohlcService.setUseHistoryApi(true);
     };
   }, [
+    ohlcSessionScopeId,
     sessionStart,
     setAccountInfo,
     setConnectionError,
@@ -445,7 +470,7 @@ export const useTerminalLaunchSession = (): UseTerminalLaunchSessionResult => {
   const isRestoring = status === 'exchanging' || status === 'restoring' || status === 'connecting' || status === 'reconnecting';
 
   return {
-    isActive: Boolean(exchange || sessionStart),
+    isActive: Boolean(sessionStart),
     status,
     error,
     account,

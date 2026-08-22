@@ -9,6 +9,10 @@ import { subscribeToLivePriceBySymbol, getLivePriceSnapshotBySymbol } from '@/st
 import { SymbolIcon } from './SymbolIcon';
 import { getSafePriceDigits } from '@/lib/terminal/price-digits';
 import { formatMt5DateTimeShort } from '@/lib/mt5-time';
+import {
+    computeOpenPositionLivePrice,
+    computeOpenPositionLiveProfit,
+} from '@/lib/terminal/live-position-pnl';
 
 interface PositionsTableProps {
     openPositions: Position[];
@@ -580,34 +584,6 @@ interface OpenPositionRowProps {
 
 const POSITION_PRICE_FLASH_CLASSES = ['quote-flash-up', 'quote-flash-down'] as const;
 
-function computeOpenPositionLivePrice(
-    pos: Pick<DisplayPosition, 'type' | 'isHedged' | 'currentPrice'>,
-    snap: ReturnType<typeof getLivePriceSnapshotBySymbol> | undefined,
-) {
-    // Live closing price: bid for buy (sell to close), ask for sell (buy to close).
-    // Hedged rows fall back to server currentPrice.
-    if (!pos.isHedged && snap) {
-        return pos.type === 'buy' ? snap.bid : snap.ask;
-    }
-    return pos.currentPrice;
-}
-
-function computeOpenPositionLiveProfit(
-    pos: Pick<DisplayPosition, 'type' | 'isAggregated' | 'contractSize' | 'openPrice' | 'volume' | 'swap' | 'profit'>,
-    liveCurrentPrice: number,
-    snap: ReturnType<typeof getLivePriceSnapshotBySymbol> | undefined,
-) {
-    // Client-side floating P&L when contractSize is available; include static swap.
-    if (!pos.isAggregated && pos.contractSize && snap) {
-        const directional =
-            pos.type === 'buy'
-                ? (liveCurrentPrice - pos.openPrice) * pos.volume * pos.contractSize
-                : (pos.openPrice - liveCurrentPrice) * pos.volume * pos.contractSize;
-        return directional + pos.swap;
-    }
-    return pos.profit;
-}
-
 function OpenPositionRowComponent({
     pos,
     isVisible,
@@ -684,7 +660,6 @@ function OpenPositionRowComponent({
     const priceDigits = getSafePriceDigits(pos.digits);
     const isHedged = pos.isHedged;
     const isAggregated = pos.isAggregated;
-    const isOptimistic = pos.id.startsWith('optimistic-') || pos.ticket === 'Syncing' || (pos as Position & { isOptimistic?: boolean }).isOptimistic === true;
 
     const [isExpanded, setIsExpanded] = useState(false);
 
@@ -767,10 +742,8 @@ function OpenPositionRowComponent({
                 <td className="py-0 font-mono">
                     {isAggregated ? <span className="text-muted-foreground">--</span> : (
                         <div
-                            className={`group/cell relative inline-block ${isOptimistic ? 'cursor-default' : 'cursor-pointer'}`}
-                            onClick={() => {
-                                if (!isOptimistic) setEditingCell({ id: pos.id, field: 'tp', value: pos.tp ? pos.tp.toString() : '' });
-                            }}
+                            className="group/cell relative inline-block cursor-pointer"
+                            onClick={() => setEditingCell({ id: pos.id, field: 'tp', value: pos.tp ? pos.tp.toString() : '' })}
                         >
                             {editingCell?.id === pos.id && editingCell?.field === 'tp' ? (
                                 <input
@@ -796,10 +769,8 @@ function OpenPositionRowComponent({
                 <td className="py-0 font-mono">
                     {isAggregated ? <span className="text-muted-foreground">--</span> : (
                         <div
-                            className={`group/cell relative inline-block ${isOptimistic ? 'cursor-default' : 'cursor-pointer'}`}
-                            onClick={() => {
-                                if (!isOptimistic) setEditingCell({ id: pos.id, field: 'sl', value: pos.sl ? pos.sl.toString() : '' });
-                            }}
+                            className="group/cell relative inline-block cursor-pointer"
+                            onClick={() => setEditingCell({ id: pos.id, field: 'sl', value: pos.sl ? pos.sl.toString() : '' })}
                         >
                             {editingCell?.id === pos.id && editingCell?.field === 'sl' ? (
                                 <input
@@ -822,7 +793,7 @@ function OpenPositionRowComponent({
 
             {isVisible('ticket') && (
                 <td className="py-0 font-mono text-foreground">
-                    {!isAggregated && (isOptimistic ? <span className="text-muted-foreground">--</span> : pos.ticket)}
+                    {!isAggregated && pos.ticket}
                 </td>
             )}
             {isVisible('openTime') && (
@@ -849,10 +820,9 @@ function OpenPositionRowComponent({
                         <button 
                             onClick={(e) => {
                                 e.stopPropagation();
-                                if (!isOptimistic) setModifyingPosition(pos);
+                                setModifyingPosition(pos);
                             }}
-                            className={`p-1 rounded-[2px] transition-all ${isOptimistic ? 'cursor-default text-muted-foreground/35' : 'text-muted-foreground hover:bg-accent hover:text-foreground'}`}
-                            aria-disabled={isOptimistic ? true : undefined}
+                            className="p-1 rounded-[2px] transition-all text-muted-foreground hover:bg-accent hover:text-foreground"
                         >
                             <Edit2 size={12} strokeWidth={2} />
                         </button>
@@ -860,16 +830,13 @@ function OpenPositionRowComponent({
                     <button
                         onClick={(e) => { 
                             e.stopPropagation();
-                            if (!isOptimistic) {
-                                if (isAggregated && pos.positions) {
-                                    pos.positions.forEach(p => onClosePosition(p.id));
-                                } else {
-                                    onClosePosition(pos.id);
-                                }
+                            if (isAggregated && pos.positions) {
+                                pos.positions.forEach(p => onClosePosition(p.id));
+                            } else {
+                                onClosePosition(pos.id);
                             }
                         }}
-                        className={`p-1 rounded-[2px] transition-all ${isOptimistic ? 'cursor-default text-muted-foreground/35' : 'text-muted-foreground hover:bg-accent hover:text-foreground'}`}
-                        aria-disabled={isOptimistic ? true : undefined}
+                        className="p-1 rounded-[2px] transition-all text-muted-foreground hover:bg-accent hover:text-foreground"
                     >
                         <XCircle size={13} strokeWidth={1.5} />
                     </button>

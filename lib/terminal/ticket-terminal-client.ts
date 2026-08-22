@@ -41,6 +41,13 @@ type PendingRequest<T = unknown> = {
   request?: JsonRecord;
   clientSentAtMs: number;
 };
+type ChartHistoryRequestPriority = 'foreground' | 'background';
+type QueuedChartHistoryRequest = {
+  priority: ChartHistoryRequestPriority;
+  execute: () => Promise<JsonRecord>;
+  resolve: (value: JsonRecord) => void;
+  reject: (reason?: unknown) => void;
+};
 
 export interface TerminalExchangeResponse {
   success?: boolean;
@@ -132,56 +139,6 @@ const parseInteger = (value: unknown, fallback = 0): number =>
 
 const parseString = (value: unknown, fallback = ''): string =>
   typeof value === 'string' && value.trim() ? value.trim() : fallback;
-
-const collectContextText = (
-  context: JsonRecord | undefined,
-  keys: string[],
-): string => {
-  if (!context) return '';
-
-  return keys
-    .map((key) => context[key])
-    .map((value) => (typeof value === 'string' || typeof value === 'number' ? String(value) : ''))
-    .join(' ')
-    .toLowerCase();
-};
-
-const isDemoTradingContext = (context: JsonRecord | undefined): boolean => {
-  const contextText = collectContextText(context, [
-    'mode',
-    'type',
-    'account_type',
-    'accountType',
-    'challenge_type',
-    'challengeType',
-    'product_code',
-    'productCode',
-    'group',
-    'mt5_group',
-    'mt5Group',
-    'server',
-    'name',
-  ]);
-  if (!contextText) return false;
-
-  return /(^|[^a-z0-9])(demo|sandbox|paper|practice|trial|free[_\s-]?trial)([^a-z0-9]|$)/.test(contextText);
-};
-
-const isLiveTradingContext = (context: JsonRecord | undefined): boolean => {
-  const contextText = collectContextText(context, [
-    'mode',
-    'type',
-    'account_type',
-    'accountType',
-    'challenge_type',
-    'challengeType',
-    'product_code',
-    'productCode',
-  ]);
-  if (!contextText) return false;
-
-  return /(^|[^a-z0-9])(live|funded|real|production)([^a-z0-9]|$)/.test(contextText);
-};
 
 const getErrorPayloadMessage = (payload: unknown, fallback: string): string => {
   if (!isRecord(payload)) return fallback;
@@ -324,6 +281,48 @@ export const createTerminalLaunchSession = async (
   }
 
   return payload as unknown as TerminalLaunchSessionResponse;
+};
+
+const TERMINAL_LAUNCH_CODE_PARAM_NAMES = ['launch', 'launch_code', 'launchCode', 'code'] as const;
+
+const getLaunchCodeFromSessionResponse = (
+  payload: TerminalLaunchSessionResponse,
+): string => {
+  const directCode = parseString(payload.launch_code);
+  if (directCode) return directCode;
+
+  const launchUrl = parseString(payload.launch_url);
+  if (!launchUrl) {
+    throw new Error('Terminal session did not return a launch code.');
+  }
+
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(
+      launchUrl,
+      typeof window !== 'undefined' ? window.location.origin : 'http://localhost',
+    );
+  } catch {
+    throw new Error('Terminal session returned an invalid launch URL.');
+  }
+
+  const hashParams = new URLSearchParams(
+    parsedUrl.hash.startsWith('#') ? parsedUrl.hash.slice(1) : parsedUrl.hash,
+  );
+  for (const name of TERMINAL_LAUNCH_CODE_PARAM_NAMES) {
+    const code = parsedUrl.searchParams.get(name)?.trim() || hashParams.get(name)?.trim();
+    if (code) return code;
+  }
+
+  throw new Error('Terminal session launch URL did not contain a launch code.');
+};
+
+export const createAndExchangeTerminalSession = async (
+  login: number | string,
+  apiBaseUrl = getTerminalApiBaseUrl(),
+): Promise<TerminalExchangeResponse> => {
+  const session = await createTerminalLaunchSession(login, apiBaseUrl);
+  return exchangeTerminalLaunchCode(getLaunchCodeFromSessionResponse(session), apiBaseUrl);
 };
 
 export const refreshTerminalWsTickets = async (
@@ -1008,9 +1007,12 @@ export class TerminalTicketRealtimeClient {
   private ohlcListeners = new Set<(payload: OhlcPayload) => void>();
   private ohlcHistoryMetadataListeners = new Set<(metadata: OhlcHistoryResponseMetadata) => void>();
   // The terminal feed backend keeps only the newest chart request on a socket.
-  // Serialize requests so a background prewarm cannot cancel the selected
-  // symbol's in-flight history response.
-  private chartRequestQueue: Promise<void> = Promise.resolve();
+  // Keep one request in flight, but choose the visible chart ahead of queued
+  // background prewarms. Starting requests concurrently would make the backend
+  // supersede the older response, so priority scheduling belongs on the client.
+  private chartRequestQueue: QueuedChartHistoryRequest[] = [];
+  private chartRequestActive = false;
+  private lastPositionEventAtMs = 0;
 
   private terminalToken: string;
   private feedTicket: string;
@@ -1054,9 +1056,11 @@ export class TerminalTicketRealtimeClient {
   }
 
   private shouldDryRunMutatingCommands(): boolean {
-    if (!REAL_TRADING_ENABLED || REQUESTED_DRY_RUN) return true;
-    if (isLiveTradingContext(this.options.accountContext)) return true;
-    return !isDemoTradingContext(this.options.accountContext);
+    // Execution is fail-closed unless both public build-time switches explicitly
+    // authorize broker mutations. Do not infer permission from account/group
+    // labels: valid live/funded groups are broker-specific and the backend still
+    // enforces ownership, account status, risk rules and MT5 permissions.
+    return !REAL_TRADING_ENABLED || REQUESTED_DRY_RUN;
   }
 
   public addOhlcListener(listener: (payload: OhlcPayload) => void): () => void {
@@ -1075,8 +1079,10 @@ export class TerminalTicketRealtimeClient {
     };
   }
 
-  public async subscribeOhlc(symbol: string, timeframeMinutes: number): Promise<boolean> {
-    await this.requestChartHistory(symbol, timeframeMinutes, { limit: 500 }).catch(() => null);
+  public async subscribeOhlc(_symbol: string, _timeframeMinutes: number): Promise<boolean> {
+    // Live prices already arrive through the feed subscription. History is
+    // requested explicitly by the chart so subscribing must not enqueue a
+    // duplicate snapshot ahead of the visible chart's 100-bar request.
     return true;
   }
 
@@ -1111,11 +1117,14 @@ export class TerminalTicketRealtimeClient {
         parseString(request.symbol),
         parseTimeframeMinutes(request.timeframeMinutes ?? request.timeframe),
         {
-          limit: parseInteger(request.limit, 500),
+          limit: parseInteger(request.limit, 100),
           from: request.fromUnixMs ?? request.from,
           to: request.toUnixMs ?? request.to,
           before: request.beforeUnixMs ?? request.before,
           timeoutMs,
+          priority: parseString(request.priority).toLowerCase() === 'background'
+            ? 'background'
+            : 'foreground',
         },
       );
       return payload as T;
@@ -1153,6 +1162,7 @@ export class TerminalTicketRealtimeClient {
     this.stateRefreshPromise = null;
     this.feedSubscribedSymbols.clear();
     this.desiredFeedSymbols.clear();
+    this.rejectQueuedChartHistoryRequests(new Error('Terminal websocket disconnected.'));
     this.feedSocket?.close();
     this.tradeSocket?.close();
     this.feedSocket = null;
@@ -1242,6 +1252,7 @@ export class TerminalTicketRealtimeClient {
       to?: unknown;
       before?: unknown;
       timeoutMs?: number;
+      priority?: ChartHistoryRequestPriority;
     } = {},
   ): Promise<JsonRecord> {
     const normalizedSymbol = symbol.trim();
@@ -1254,24 +1265,59 @@ export class TerminalTicketRealtimeClient {
       symbol: normalizedSymbol,
       timeframe: formatBackendTimeframe(timeframeMinutes),
       timeframeMinutes,
-      limit: options.limit ?? 500,
+      limit: options.limit ?? 100,
       ...(options.from !== undefined ? { from: options.from } : {}),
       ...(options.to !== undefined ? { to: options.to } : {}),
       ...(options.before !== undefined ? { before: options.before } : {}),
     };
 
-    const request = this.chartRequestQueue.then(() =>
-      this.sendFeedRequest<JsonRecord>(
+    return this.enqueueChartHistoryRequest(
+      () => this.sendFeedRequest<JsonRecord>(
         payload,
         ['chart.history'],
         options.timeoutMs ?? 45_000,
       ),
+      options.priority ?? 'foreground',
     );
-    this.chartRequestQueue = request.then(
-      () => undefined,
-      () => undefined,
+  }
+
+  private enqueueChartHistoryRequest(
+    execute: () => Promise<JsonRecord>,
+    priority: ChartHistoryRequestPriority,
+  ): Promise<JsonRecord> {
+    return new Promise<JsonRecord>((resolve, reject) => {
+      this.chartRequestQueue.push({
+        priority,
+        execute,
+        resolve,
+        reject,
+      });
+      this.drainChartHistoryRequestQueue();
+    });
+  }
+
+  private drainChartHistoryRequestQueue(): void {
+    if (this.chartRequestActive || this.chartRequestQueue.length === 0) return;
+
+    const foregroundIndex = this.chartRequestQueue.findIndex(
+      (entry) => entry.priority === 'foreground',
     );
-    return request;
+    const nextIndex = foregroundIndex >= 0 ? foregroundIndex : 0;
+    const [nextRequest] = this.chartRequestQueue.splice(nextIndex, 1);
+    if (!nextRequest) return;
+
+    this.chartRequestActive = true;
+    void nextRequest.execute()
+      .then(nextRequest.resolve, nextRequest.reject)
+      .finally(() => {
+        this.chartRequestActive = false;
+        this.drainChartHistoryRequestQueue();
+      });
+  }
+
+  private rejectQueuedChartHistoryRequests(error: Error): void {
+    const queuedRequests = this.chartRequestQueue.splice(0);
+    queuedRequests.forEach((request) => request.reject(error));
   }
 
   public async placeOrder(request: TradeRequest): Promise<TradeResult> {
@@ -1560,13 +1606,27 @@ export class TerminalTicketRealtimeClient {
       .filter((order): order is Order => Boolean(order));
 
     this.accountInfo = account;
-    this.positions = positions;
+    // A GetPositions snapshot taken immediately after ACK can still be empty
+    // while a live `position` add has already painted Open. Do not let that
+    // stale empty snapshot wipe the event-driven row.
+    const keepEventDrivenPositions =
+      positions.length === 0 &&
+      this.positions.length > 0 &&
+      this.lastPositionEventAtMs > 0 &&
+      Date.now() - this.lastPositionEventAtMs < 1_000;
+    if (!keepEventDrivenPositions) {
+      this.positions = positions;
+    }
     this.orders = orders;
 
     if (account) this.streamRouter.publish('account.balance', { account });
-    this.streamRouter.publish('account.positions', positions);
+    this.streamRouter.publish('account.positions', this.positions);
     this.streamRouter.publish('account.orders', orders);
-    this.options.onAccountSummary?.({ account, positions, orders });
+    this.options.onAccountSummary?.({
+      account,
+      positions: this.positions,
+      orders,
+    });
   }
 
   private applyAccountSummaryDelta(frame: JsonRecord): void {
@@ -1624,6 +1684,7 @@ export class TerminalTicketRealtimeClient {
           ? 'added'
           : 'modified';
 
+    this.lastPositionEventAtMs = Date.now();
     if (action === 'deleted') {
       this.positions = this.positions.filter((entry) => entry.ticket !== position.ticket);
     } else {
@@ -1720,7 +1781,9 @@ export class TerminalTicketRealtimeClient {
       id: parseString(frame.session_id ?? frame.sessionId ?? context.session_id, `terminal-${login || Date.now()}`),
       login,
       server: parseString(context.server ?? frame.server),
-      group: parseString(context.group ?? frame.group) || undefined,
+      group: parseString(
+        context.mt5_group ?? context.mt5Group ?? context.group ?? frame.mt5_group ?? frame.group,
+      ) || undefined,
       name: parseString(context.name),
       company: parseString(context.company),
       currency: parseString(context.currency, 'USD'),

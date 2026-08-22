@@ -12,9 +12,9 @@ interface StatusBody {
 }
 
 interface RouteContext {
-  params: {
+  params: Promise<{
     accountId: string;
-  };
+  }>;
 }
 
 const toMt5ErrorStatus = (error: Mt5AccountOperationError): number => {
@@ -58,6 +58,8 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  const { accountId } = await context.params;
+
   let body: StatusBody;
   try {
     body = (await request.json()) as StatusBody;
@@ -75,14 +77,14 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
   try {
     const result = await setTradingAccountStatusForUser(
       auth.user.id,
-      context.params.accountId,
+      accountId,
       body.status,
     );
 
     if (!result.ok && result.message === "Account not found.") {
       // It might be a NodeJS backend unified account (not stored in local NextJS SQLite).
       // Only proxy after proving the MT5 login belongs to the authenticated user.
-      const login = await resolveOwnedMt5Login(auth.user, context.params.accountId);
+      const login = await resolveOwnedMt5Login(auth.user, accountId);
       if (!login) {
         return NextResponse.json(
           { error: "Account not found." },
@@ -157,7 +159,7 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
     if (error instanceof Mt5AccountOperationError) {
       console.error("[api/private/accounts/status] MT5 account status update failed", {
         userId: auth.user.id,
-        accountId: context.params.accountId,
+        accountId,
         stage: error.stage,
         code: error.code,
         message: error.message,

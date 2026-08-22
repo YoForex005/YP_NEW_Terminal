@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "functions": {
+    "/api/private/accounts/[accountId]/terminal-ohlc-repair": {},
+    "/api/private/accounts/[accountId]/ohlc-gap-fill": {},
+    "/api/trading/account": {},
+    "/api/trading/ohlc-history": {},
+    "/api/trading/history": {},
+    "/api/trading/orders": {},
+    "/api/trading/symbols/group/active": {},
+    "/api/trading/symbols/market-status": {},
+    "/api/trading/symbols": {},
+    "/api/trading/positions": {}
+  }
+}

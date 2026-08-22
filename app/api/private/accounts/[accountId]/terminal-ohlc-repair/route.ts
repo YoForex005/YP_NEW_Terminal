@@ -11,9 +11,9 @@ import {
 } from "@/lib/server/terminal-ws-bridge";
 
 interface RouteContext {
-  params: {
+  params: Promise<{
     accountId: string;
-  };
+  }>;
 }
 
 export const dynamic = "force-dynamic";

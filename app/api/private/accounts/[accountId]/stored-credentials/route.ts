@@ -22,9 +22,9 @@ const STEP_UP_RATE_LIMIT = 5;
 const STEP_UP_RATE_WINDOW_MS = 10 * 60_000;
 
 interface RouteContext {
-  params: {
+  params: Promise<{
     accountId: string;
-  };
+  }>;
 }
 
 const findAccountByIdOrLogin = (

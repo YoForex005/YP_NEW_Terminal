@@ -99,7 +99,7 @@ const configurationData = {
 
 const DATAFEED_HISTORY_TIMEOUT_MS = 25_000;
 const DATAFEED_HISTORY_RETRY_ATTEMPTS = 2;
-const DATAFEED_HISTORY_LIMIT = 5000;
+const DATAFEED_HISTORY_LIMIT = 100;
 const DATAFEED_SCROLLBACK_HISTORY_LIMIT = DATAFEED_HISTORY_LIMIT;
 const DATAFEED_FIRST_PAINT_HISTORY_LIMIT = GLOBAL_CHART_VIEWPORT.maxInitialVisibleBars;
 const UNIX_SECONDS_TO_MILLISECONDS_THRESHOLD = 10_000_000_000;
@@ -474,8 +474,8 @@ function generateSeedBars(
     const fromMs = from * 1000;
     const toMs = to * 1000;
 
-    // Max 500 bars to prevent performance issues
-    const maxBars = 500;
+    // Match the live terminal's per-symbol history page.
+    const maxBars = 100;
     const rangeMs = toMs - fromMs;
     const totalBars = Math.min(Math.floor(rangeMs / intervalMs), maxBars);
 

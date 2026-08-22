@@ -1,9 +1,13 @@
+import { createHmac, randomUUID } from "node:crypto";
+
 import { NextRequest, NextResponse } from "next/server";
 
-import { authenticateRequest } from "@/lib/server/auth";
+import { authenticateRequest, type AuthContext } from "@/lib/server/auth";
+import { resolveBackendEnvValue } from "@/lib/server/backend-env";
 
 const TERMINAL_PROXY_TIMEOUT_MS = 15_000;
 const DEFAULT_TERMINAL_PROXY_ORIGIN = "https://terminal.yopips.com";
+const TERMINAL_PROXY_JWT_TTL_SECONDS = 5 * 60;
 
 // Public terminal session exchange may run without a CRM cookie when using a
 // one-time launch code. Everything else requires an authenticated session.
@@ -52,6 +56,43 @@ const getTerminalProxyOrigin = (): string => {
   return DEFAULT_TERMINAL_PROXY_ORIGIN;
 };
 
+const isJwt = (token: string): boolean => token.split(".").length === 3;
+
+const encodeJwtPart = (value: Record<string, unknown>): string =>
+  Buffer.from(JSON.stringify(value)).toString("base64url");
+
+const getTerminalBackendBearerToken = (auth: AuthContext): string | null => {
+  if (isJwt(auth.token)) {
+    return auth.token;
+  }
+
+  // Some local/dev logins use an opaque app_sessions token. Exchange that
+  // server-side authenticated identity for a short-lived C++-compatible JWT;
+  // the JWT is forwarded only on this internal proxy request.
+  const secret =
+    process.env.JWT_SECRET?.trim() ||
+    resolveBackendEnvValue("JWT_SECRET");
+  if (!secret) return null;
+
+  const now = Math.floor(Date.now() / 1_000);
+  const header = encodeJwtPart({ alg: "HS256", typ: "JWT" });
+  const payload = encodeJwtPart({
+    iss: "propfirm",
+    jti: `terminal-proxy-${randomUUID()}`,
+    id: auth.user.id,
+    email: auth.user.email,
+    name: auth.user.name,
+    role: auth.user.role,
+    aud: "user",
+    iat: now,
+    exp: now + TERMINAL_PROXY_JWT_TTL_SECONDS,
+  });
+  const signature = createHmac("sha256", secret)
+    .update(`${header}.${payload}`)
+    .digest("base64url");
+  return `${header}.${payload}.${signature}`;
+};
+
 const sanitizeTerminalProxyPath = (path: string[] | undefined): string[] | null => {
   const segments = (path ?? [])
     .map((segment) => segment.trim())
@@ -91,19 +132,30 @@ const buildTargetUrl = (request: NextRequest, path: string[]): string => {
 
 const proxyTerminalRequest = async (
   request: NextRequest,
-  context: { params: { path?: string[] } },
+  context: { params: Promise<{ path?: string[] }> },
 ): Promise<NextResponse> => {
-  const safePath = sanitizeTerminalProxyPath(context.params.path);
+  const safePath = sanitizeTerminalProxyPath((await context.params).path);
   if (!safePath) {
     return NextResponse.json({ error: "Invalid terminal proxy path" }, { status: 400 });
   }
 
   const publicPathKey = safePath.join("/");
   const isPublicLaunchExchange = PUBLIC_TERMINAL_PROXY_PATHS.has(publicPathKey);
+  let authenticatedToken: string | null = null;
   if (!isPublicLaunchExchange) {
     const auth = await authenticateRequest(request);
     if (!auth) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+    authenticatedToken = getTerminalBackendBearerToken(auth);
+    if (!authenticatedToken) {
+      return NextResponse.json(
+        {
+          error: "Terminal backend authentication is unavailable.",
+          code: "TERMINAL_BACKEND_AUTH_UNAVAILABLE",
+        },
+        { status: 503 },
+      );
     }
   }
 
@@ -121,7 +173,13 @@ const proxyTerminalRequest = async (
   const cookie = request.headers.get("cookie");
 
   if (accept) headers.set("accept", accept);
-  if (authorization) headers.set("authorization", authorization);
+  if (authorization) {
+    headers.set("authorization", authorization);
+  } else if (authenticatedToken) {
+    // Browser authentication is stored in an HttpOnly cookie. The C++ API
+    // accepts the underlying backend JWT as a bearer token, not that cookie.
+    headers.set("authorization", `Bearer ${authenticatedToken}`);
+  }
   if (contentType) headers.set("content-type", contentType);
   if (cookie) headers.set("cookie", cookie);
   headers.set("origin", getTerminalProxyOrigin());

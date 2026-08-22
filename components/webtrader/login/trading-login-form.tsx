@@ -6,6 +6,7 @@
 'use client';
 
 import { useState, useCallback } from 'react';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
@@ -328,13 +329,13 @@ export function TradingLoginForm({ onSuccess, className }: TradingLoginFormProps
           <div className="text-center text-sm text-muted-foreground space-y-2">
             <p>Don&apos;t have an account?</p>
             <div className="flex justify-center gap-4">
-              <a href="/register" className="text-primary hover:underline">
+              <Link href="/register" className="text-primary hover:underline">
                 Register
-              </a>
+              </Link>
               <span className="text-border">|</span>
-              <a href="/" className="text-primary hover:underline">
+              <Link href="/" className="text-primary hover:underline">
                 Back to Dashboard
-              </a>
+              </Link>
             </div>
           </div>
         </CardContent>

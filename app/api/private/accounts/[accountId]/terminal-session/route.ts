@@ -21,9 +21,9 @@ import { resolveBackendEnvValue } from "@/lib/server/backend-env";
 import type { TradingAccount, TradingAccountCredentials } from "@/types/dashboard";
 
 interface RouteContext {
-  params: {
+  params: Promise<{
     accountId: string;
-  };
+  }>;
 }
 
 export const dynamic = "force-dynamic";

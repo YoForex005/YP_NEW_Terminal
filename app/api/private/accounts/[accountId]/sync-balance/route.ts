@@ -18,14 +18,14 @@ interface BalanceSyncData {
 
 export async function POST(
     request: NextRequest,
-    { params }: { params: { accountId: string } }
+    { params }: { params: Promise<{ accountId: string }> }
 ) {
     const auth = await authenticateRequest(request);
     if (!auth) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const { accountId } = params;
+    const { accountId } = await params;
     if (!accountId) {
         return NextResponse.json({ error: "accountId is required" }, { status: 400 });
     }
