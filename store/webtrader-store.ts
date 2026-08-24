@@ -4,7 +4,7 @@
  * connection churn avoid persist/devtools overhead on the hot path.
  */
 
-import { useSyncExternalStore } from 'react';
+import { useCallback, useSyncExternalStore } from 'react';
 import { useStore } from 'zustand';
 import { createStore, type StoreApi } from 'zustand/vanilla';
 import { devtools, persist } from 'zustand/middleware';
@@ -395,6 +395,8 @@ const EMPTY_LIVE_PRICE_UNIVERSE_SNAPSHOT: LivePriceUniverseSnapshot = {
 };
 let livePriceUniverseSnapshot: LivePriceUniverseSnapshot =
   EMPTY_LIVE_PRICE_UNIVERSE_SNAPSHOT;
+let pendingLivePriceUniverseNotifyHandle: number | null = null;
+let pendingLivePriceUniverseNotifyUsesAnimationFrame = false;
 
 const getPriceForSymbolFromRecord = (
   prices: Record<string, PriceSnapshot>,
@@ -430,6 +432,45 @@ const notifyLivePriceUniverseListeners = () => {
   livePriceUniverseListeners.forEach((listener) => listener());
 };
 
+const cancelPendingLivePriceUniverseNotify = () => {
+  if (pendingLivePriceUniverseNotifyHandle === null) {
+    return;
+  }
+
+  if (
+    pendingLivePriceUniverseNotifyUsesAnimationFrame &&
+    typeof window !== 'undefined' &&
+    typeof window.cancelAnimationFrame === 'function'
+  ) {
+    window.cancelAnimationFrame(pendingLivePriceUniverseNotifyHandle);
+  } else {
+    clearTimeout(pendingLivePriceUniverseNotifyHandle);
+  }
+
+  pendingLivePriceUniverseNotifyHandle = null;
+  pendingLivePriceUniverseNotifyUsesAnimationFrame = false;
+};
+
+const scheduleLivePriceUniverseNotify = () => {
+  if (pendingLivePriceUniverseNotifyHandle !== null) {
+    return;
+  }
+
+  const flush = () => {
+    pendingLivePriceUniverseNotifyHandle = null;
+    pendingLivePriceUniverseNotifyUsesAnimationFrame = false;
+    notifyLivePriceUniverseListeners();
+  };
+
+  if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+    pendingLivePriceUniverseNotifyUsesAnimationFrame = true;
+    pendingLivePriceUniverseNotifyHandle = window.requestAnimationFrame(flush);
+    return;
+  }
+
+  pendingLivePriceUniverseNotifyHandle = setTimeout(flush, 0) as unknown as number;
+};
+
 const hasUsableLiveQuote = (price: PriceSnapshot | undefined): boolean =>
   Boolean(
     price &&
@@ -441,7 +482,7 @@ const hasUsableLiveQuote = (price: PriceSnapshot | undefined): boolean =>
   );
 
 const refreshLivePriceUniverseSnapshot = () => {
-  livePriceUniverseSnapshot =
+  const nextSnapshot =
     livePriceUniverseSymbols.size > 0
       ? {
           count: livePriceUniverseSymbols.size,
@@ -450,7 +491,16 @@ const refreshLivePriceUniverseSnapshot = () => {
             .join(LIVE_PRICE_SYMBOL_KEY_SEPARATOR),
         }
       : EMPTY_LIVE_PRICE_UNIVERSE_SNAPSHOT;
-  notifyLivePriceUniverseListeners();
+
+  if (
+    nextSnapshot.count === livePriceUniverseSnapshot.count &&
+    nextSnapshot.symbolKey === livePriceUniverseSnapshot.symbolKey
+  ) {
+    return;
+  }
+
+  livePriceUniverseSnapshot = nextSnapshot;
+  scheduleLivePriceUniverseNotify();
 };
 
 const trackLivePriceUniverseAliases = (aliases: string[]) => {
@@ -474,12 +524,17 @@ const trackLivePriceUniverseAliases = (aliases: string[]) => {
 };
 
 const resetLivePriceUniverseSnapshot = () => {
-  if (livePriceUniverseSymbols.size === 0) {
+  if (
+    livePriceUniverseSymbols.size === 0 &&
+    livePriceUniverseSnapshot === EMPTY_LIVE_PRICE_UNIVERSE_SNAPSHOT
+  ) {
+    cancelPendingLivePriceUniverseNotify();
     return;
   }
 
   livePriceUniverseSymbols.clear();
   livePriceUniverseSnapshot = EMPTY_LIVE_PRICE_UNIVERSE_SNAPSHOT;
+  cancelPendingLivePriceUniverseNotify();
   notifyLivePriceUniverseListeners();
 };
 
@@ -560,12 +615,37 @@ export const subscribeToLivePriceUniverse = (listener: () => void) => {
   };
 };
 
+const getHasLiveQuotesSnapshot = (): boolean => livePriceUniverseSnapshot.count > 0;
+
 export const useLivePriceUniverse = () =>
   useSyncExternalStore(
     subscribeToLivePriceUniverse,
     getLivePriceUniverseSnapshot,
     getLivePriceUniverseSnapshot,
   );
+
+export const useHasLiveQuotes = (): boolean =>
+  useSyncExternalStore(
+    subscribeToLivePriceUniverse,
+    getHasLiveQuotesSnapshot,
+    getHasLiveQuotesSnapshot,
+  );
+
+export const useLivePricePresence = (symbol: string): boolean => {
+  const trimmed = symbol.trim();
+  const subscribe = useCallback(
+    (listener: () => void) => (
+      trimmed ? subscribeLivePriceBySymbol(trimmed, listener) : () => undefined
+    ),
+    [trimmed],
+  );
+
+  return useSyncExternalStore(
+    subscribe,
+    () => hasUsableLiveQuote(getLivePriceBySymbol(trimmed)),
+    () => false,
+  );
+};
 
 const getMarginLevel = (account: TradingAccountInfo | null): number => {
   if (!account) return 0;

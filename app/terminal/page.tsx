@@ -28,7 +28,7 @@ import {
 import { useGroupActiveSymbols } from '@/lib/trading/use-group-active-symbols';
 import type { Instrument, Position, PriceAlert, ClosedTrade } from '@/lib/terminal/types';
 import { useTradingStore } from '@/store/trading-store';
-import { getLivePriceSnapshotBySymbol, useLivePriceUniverse, useWebtraderStore } from '@/store/webtrader-store';
+import { getLivePriceSnapshotBySymbol, useHasLiveQuotes, useLivePricePresence, useWebtraderStore } from '@/store/webtrader-store';
 import { buildOhlcSessionScopeId } from '@/lib/trading/use-auto-connect';
 import type { WebSocketTradingClient } from '@/lib/trading/websocket-client';
 import type { TradingAccount as DashboardTradingAccount } from '@/types/dashboard';
@@ -2860,9 +2860,7 @@ function TradingDashboardInner() {
     const storeMarketWsClient = useWebtraderStore(state => state.marketWsClient);
     const storeOhlcWsClient = useWebtraderStore(state => state.ohlcWsClient);
     const storeSymbolCount = useWebtraderStore((state) => state.symbols.length);
-    const livePriceUniverse = useLivePriceUniverse();
-    const storePriceCount = livePriceUniverse.count;
-    const livePriceSymbolKey = livePriceUniverse.symbolKey;
+    const hasAnyLiveQuote = useHasLiveQuotes();
     const hasStoreAccountInfo = useWebtraderStore((state) => Boolean(state.accountInfo));
     const storePositionCount = useWebtraderStore((state) => state.positions.length);
     const setStoreAccountInfo = useWebtraderStore(state => state.setAccountInfo);
@@ -3175,7 +3173,7 @@ function TradingDashboardInner() {
         );
         const hasLiveOrCachedTerminalData =
             storeSymbolCount > 0 ||
-            storePriceCount > 0 ||
+            hasAnyLiveQuote ||
             hasStoreAccountInfo ||
             storePositionCount > 0;
 
@@ -3231,7 +3229,7 @@ function TradingDashboardInner() {
         storeConnectionStatus,
         hasStoreAccountInfo,
         storePositionCount,
-        storePriceCount,
+        hasAnyLiveQuote,
         storeSymbolCount,
         storeWsClient,
     ]);
@@ -3255,6 +3253,7 @@ function TradingDashboardInner() {
     const connectionToastKeyRef = useRef<string | null>(null);
     const connectionErrorKeyRef = useRef<string | null>(null);
     const [selectedSymbol, setSelectedSymbol] = useState(immediateChartSymbol);
+    const selectedSymbolHasLivePrice = useLivePricePresence(selectedSymbol);
     const [selectedSymbolAccountId, setSelectedSymbolAccountId] = useState<string | null>(
         connectAccountId ?? null,
     );
@@ -3331,7 +3330,6 @@ function TradingDashboardInner() {
         retryAfterUntil?: number;
     }>>(new Map());
     const symbolCatalogRefreshInFlightRef = useRef(false);
-    const hasAnyLiveQuote = livePriceSymbolKey.length > 0;
     const clearOhlcWarmupTimers = useCallback(() => {
         if (symbolHoverHistoryPrewarmTimeoutRef.current !== null) {
             window.clearTimeout(symbolHoverHistoryPrewarmTimeoutRef.current);
@@ -3378,7 +3376,7 @@ function TradingDashboardInner() {
             connectStatus,
             storeConnectionStatus,
             storeSymbolCount,
-            storePriceCount,
+            hasAnyLiveQuote,
             storePositionCount,
         });
     }, [
@@ -3386,7 +3384,7 @@ function TradingDashboardInner() {
         markTerminalBootMilestone,
         storeConnectionStatus,
         storePositionCount,
-        storePriceCount,
+        hasAnyLiveQuote,
         storeSymbolCount,
         terminalConnectionStatus,
     ]);
@@ -3400,10 +3398,10 @@ function TradingDashboardInner() {
     useEffect(() => {
         if (hasAnyLiveQuote) {
             markTerminalBootMilestone('quotes-ready', {
-                count: storePriceCount,
+                hasQuotes: true,
             });
         }
-    }, [hasAnyLiveQuote, markTerminalBootMilestone, storePriceCount]);
+    }, [hasAnyLiveQuote, markTerminalBootMilestone]);
     useEffect(() => {
         if (storePositionCount > 0) {
             markTerminalBootMilestone('positions-ready', {
@@ -3418,7 +3416,7 @@ function TradingDashboardInner() {
             latestStorePricesRef.current,
             selectedSymbol,
         ),
-        [immediateChartSymbolCatalog, livePriceSymbolKey, selectedSymbol],
+        [immediateChartSymbolCatalog, selectedSymbol, selectedSymbolHasLivePrice],
     );
     const renderedChartKeepAliveSymbols = useMemo(
         () => reconcileTerminalChartKeepAliveSymbols(
@@ -3473,11 +3471,11 @@ function TradingDashboardInner() {
             latestStorePricesRef.current,
             { allowInputFallback: true },
         ),
-        [livePriceSymbolKey, storePositions, storeSymbols],
+        [storePositions, storeSymbols],
     );
     const catalogMarketSymbols = useMemo(
         () => getMarketWatchSymbols(storeSymbols, latestStorePricesRef.current, selectedBrokerSymbol),
-        [livePriceSymbolKey, selectedBrokerSymbol, storeSymbols],
+        [selectedBrokerSymbol, selectedSymbolHasLivePrice, storeSymbols],
     );
     const marketWatchSymbols = useMemo(
         () => {
@@ -3504,7 +3502,7 @@ function TradingDashboardInner() {
                 ))
                 .filter((symbol): symbol is SymbolInfo => symbol !== null);
         },
-        [livePriceSymbolKey, selectedBrokerSymbol, storeSymbols, watchlistSymbols],
+        [selectedBrokerSymbol, selectedSymbolHasLivePrice, storeSymbols, watchlistSymbols],
     );
     const liveSubscriptionSymbols = useMemo(
         () => getCappedMarketSubscriptionSymbols(
@@ -3514,7 +3512,7 @@ function TradingDashboardInner() {
             latestStorePricesRef.current,
             { allowInputFallback: true },
         ),
-        [livePriceSymbolKey, storeSymbols, visibleMarketSymbols],
+        [storeSymbols, visibleMarketSymbols],
     );
     const selectedSubscriptionSymbols = useMemo(
         () => {
@@ -3533,7 +3531,7 @@ function TradingDashboardInner() {
                 },
             );
         },
-        [livePriceSymbolKey, selectedBrokerSymbol, storeSymbols],
+        [selectedBrokerSymbol, selectedSymbolHasLivePrice, storeSymbols],
     );
     const quoteWsClient = getPreferredQuoteWsClient(storeMarketWsClient, storeWsClient);
     const isRealtimeClientReady = isReadyRealtimeClient(storeWsClient);
@@ -4212,7 +4210,7 @@ function TradingDashboardInner() {
                 storeSymbols,
                 latestStorePricesRef.current,
             ).slice(0, 1),
-        [livePriceSymbolKey, selectedBrokerSymbol, storeSymbols],
+        [selectedBrokerSymbol, selectedSymbolHasLivePrice, storeSymbols],
     );
     const activeLiveSubscriptionSymbols = useMemo(
         () => {
@@ -4252,8 +4250,8 @@ function TradingDashboardInner() {
         ),
         [
             connectAccountId,
-            livePriceSymbolKey,
             selectedSymbol,
+            selectedSymbolHasLivePrice,
             selectedSymbolAccountId,
             storeSymbols,
             terminalPreferences,
@@ -5678,7 +5676,6 @@ function TradingDashboardInner() {
         selectedFirstLoadSymbols,
         selectedBrokerSymbol,
         storeSymbols,
-        livePriceSymbolKey,
     ]);
 
     // Keep-alive charts own their history hydration. The page only maintains their
@@ -6017,7 +6014,6 @@ function TradingDashboardInner() {
         connectAccountId,
         currentIsFallback,
         activeGroupCatalogSettled,
-        livePriceSymbolKey,
         terminalPreferences,
         terminalBootstrapState,
         terminalPreferencesBootstrapKey,
