@@ -1,4 +1,4 @@
-name: CI/CD for Yopips-terminal
+name: CI/CD for YP_NEW_Terminal
 
 on:
   push:
@@ -6,11 +6,8 @@ on:
       - main
 
 concurrency:
-  group: yp-terminal
-  cancel-in-progress: false
-
-permissions:
-  contents: read
+  group: YP-Terminal-production
+  cancel-in-progress: true
 
 jobs:
   deploy:
@@ -18,59 +15,86 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-
-      - name: Package release
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          ARCHIVE="yopips-terminal-${GITHUB_SHA}.tar.gz"
-          mkdir -p .deploy
-
-          tar \
-            --exclude=.git \
-            --exclude=.github \
-            --exclude=.deploy \
-            --exclude=.env \
-            --exclude=.env.local \
-            --exclude=.env.production \
-            --exclude=.env.production.local \
-            --exclude=node_modules \
-            --exclude=.next \
-            -czf ".deploy/$ARCHIVE" .
-
-          ls -lh ".deploy/$ARCHIVE"
-
-      - name: Upload release
-        uses: appleboy/scp-action@v1
+      - name: Deploy using SSH
+        uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.SERVER_HOST }}
-          port: ${{ secrets.SERVER_SSH_PORT }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
-          source: .deploy/yopips-terminal-${{ github.sha }}.tar.gz
-          target: /tmp/
-          strip_components: 1
-          overwrite: true
-
-      - name: Deploy release
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          port: ${{ secrets.SERVER_SSH_PORT }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: 22
           command_timeout: 20m
+
           script: |
-            set -eu
-            archive='/tmp/yopips-terminal-${{ github.sha }}.tar.gz'
-            trap 'rm -f "$archive"' EXIT
+            set -Eeuo pipefail
 
-            sudo -u yopips-terminal /usr/local/sbin/deploy-yopips-terminal \
-              "$archive" \
-              '${{ github.sha }}'
+            APP_DIR="/home/ubuntu/YP_NEW_Terminal"
+            COMMIT_SHA="${{ github.sha }}"
 
-            sudo -u yopips-terminal pm2 status yopips-terminal
-            curl --fail --retry 10 --retry-delay 3 http://127.0.0.1:3012/api/node-bridge/health
+            cd "$APP_DIR"
+
+            # Save currently deployed commit before changing anything.
+            PREVIOUS_COMMIT="$(git rev-parse HEAD)"
+
+            rollback() {
+              echo "========================================"
+              echo "DEPLOYMENT FAILED - STARTING ROLLBACK"
+              echo "========================================"
+              echo "Rolling back to: $PREVIOUS_COMMIT"
+
+              # Prevent rollback errors from causing another trap invocation.
+              trap - ERR
+              set +e
+
+              cd "$APP_DIR"
+
+              git reset --hard "$PREVIOUS_COMMIT"
+
+              echo "Installing dependencies for previous version..."
+              npm ci
+
+              echo "Building previous version..."
+              npm run build
+
+              echo "Restarting PM2 with previous version..."
+              pm2 restart yopips-terminal --update-env
+
+              pm2 save
+
+              echo "========================================"
+              echo "ROLLBACK COMPLETED"
+              echo "Restored commit: $PREVIOUS_COMMIT"
+              echo "========================================"
+            }
+
+            trap rollback ERR
+
+            echo "========================================"
+            echo "Starting deployment"
+            echo "Previous commit: $PREVIOUS_COMMIT"
+            echo "New commit: $COMMIT_SHA"
+            echo "========================================"
+
+            echo "Fetching latest commit..."
+            git fetch origin
+
+            echo "Checking out $COMMIT_SHA..."
+            git reset --hard "$COMMIT_SHA"
+
+            echo "Installing dependencies..."
+            npm ci
+
+            echo "Building Next.js application..."
+            npm run build
+
+            echo "Restarting PM2 application..."
+            pm2 restart yopips-terminal --update-env
+
+            pm2 save
+
+            # Deployment succeeded, so disable rollback trap.
+            trap - ERR
+
+            echo "========================================"
+            echo "DEPLOYMENT SUCCESSFUL"
+            echo "Deployed commit: $COMMIT_SHA"
+            echo "========================================"
