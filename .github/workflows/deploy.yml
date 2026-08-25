@@ -17,127 +17,127 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
-steps:
-  - name: Checkout source
-    uses: actions/checkout@v4
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
 
-  - name: Resolve release ID
-    id: release
-    shell: bash
-    run: |
-      echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Resolve release ID
+        id: release
+        shell: bash
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-  - name: Create release archive
-    shell: bash
-    run: |
-      set -Eeuo pipefail
+      - name: Create release archive
+        shell: bash
+        run: |
+          set -Eeuo pipefail
 
-      SHA="${{ steps.release.outputs.sha }}"
+          SHA="${{ steps.release.outputs.sha }}"
 
-      echo "Creating release: $SHA"
+          echo "Creating release: $SHA"
 
-      tar \
-        --exclude=.git \
-        --exclude=.github \
-        --exclude=.env \
-        --exclude=.env.local \
-        --exclude=.env.production \
-        --exclude=node_modules \
-        --exclude=.next \
-        -czf "/tmp/yopips-terminal-$SHA.tar.gz" .
+          tar \
+            --exclude=.git \
+            --exclude=.github \
+            --exclude=.env \
+            --exclude=.env.local \
+            --exclude=.env.production \
+            --exclude=node_modules \
+            --exclude=.next \
+            -czf "/tmp/yopips-terminal-$SHA.tar.gz" .
 
-      ls -lh "/tmp/yopips-terminal-$SHA.tar.gz"
+          ls -lh "/tmp/yopips-terminal-$SHA.tar.gz"
 
-  - name: Configure SSH
-    shell: bash
-    env:
-      SSH_PRIVATE_KEY: ${{ secrets.SERVER_SSH_KEY }}
-      SSH_HOST_KEY: ${{ secrets.SERVER_HOST_KEY }}
-    run: |
-      set -Eeuo pipefail
+      - name: Configure SSH
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SERVER_SSH_KEY }}
+          SSH_HOST_KEY: ${{ secrets.SERVER_HOST_KEY }}
+        run: |
+          set -Eeuo pipefail
 
-      install -d -m 0700 ~/.ssh
+          install -d -m 0700 ~/.ssh
 
-      printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
-      chmod 0600 ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 0600 ~/.ssh/id_ed25519
 
-      if [ -n "${SSH_HOST_KEY:-}" ]; then
-        printf '%s\n' "$SSH_HOST_KEY" > ~/.ssh/known_hosts
-      else
-        ssh-keyscan -p "${{ secrets.SERVER_SSH_PORT || 22 }}" \
-          "${{ secrets.SERVER_HOST }}" > ~/.ssh/known_hosts
-      fi
+          if [ -n "${SSH_HOST_KEY:-}" ]; then
+            printf '%s\n' "$SSH_HOST_KEY" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -p "${{ secrets.SERVER_SSH_PORT || 22 }}" \
+              "${{ secrets.SERVER_HOST }}" > ~/.ssh/known_hosts
+          fi
 
-      chmod 0600 ~/.ssh/known_hosts
+          chmod 0600 ~/.ssh/known_hosts
 
-  - name: Upload release
-    shell: bash
-    env:
-      HOST: ${{ secrets.SERVER_HOST }}
-      PORT: ${{ secrets.SERVER_SSH_PORT }}
-      USER: ${{ secrets.SERVER_USER }}
-      SHA: ${{ steps.release.outputs.sha }}
-    run: |
-      set -Eeuo pipefail
+      - name: Upload release
+        shell: bash
+        env:
+          HOST: ${{ secrets.SERVER_HOST }}
+          PORT: ${{ secrets.SERVER_SSH_PORT }}
+          USER: ${{ secrets.SERVER_USER }}
+          SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          set -Eeuo pipefail
 
-      scp \
-        -P "${PORT:-22}" \
-        "/tmp/yopips-terminal-$SHA.tar.gz" \
-        "$USER@$HOST:/tmp/"
+          scp \
+            -P "${PORT:-22}" \
+            "/tmp/yopips-terminal-$SHA.tar.gz" \
+            "$USER@$HOST:/tmp/"
 
-  - name: Deploy release
-    shell: bash
-    env:
-      HOST: ${{ secrets.SERVER_HOST }}
-      PORT: ${{ secrets.SERVER_SSH_PORT }}
-      USER: ${{ secrets.SERVER_USER }}
-      SHA: ${{ steps.release.outputs.sha }}
-    run: |
-      set -Eeuo pipefail
+      - name: Deploy release
+        shell: bash
+        env:
+          HOST: ${{ secrets.SERVER_HOST }}
+          PORT: ${{ secrets.SERVER_SSH_PORT }}
+          USER: ${{ secrets.SERVER_USER }}
+          SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          set -Eeuo pipefail
 
-      ssh \
-        -p "${PORT:-22}" \
-        "$USER@$HOST" \
-        "sudo -u yopips-terminal /usr/local/sbin/deploy-yopips-terminal '/tmp/yopips-terminal-$SHA.tar.gz' '$SHA'"
+          ssh \
+            -p "${PORT:-22}" \
+            "$USER@$HOST" \
+            "sudo -u yopips-terminal /usr/local/sbin/deploy-yopips-terminal '/tmp/yopips-terminal-$SHA.tar.gz' '$SHA'"
 
-  - name: Verify deployment
-    shell: bash
-    env:
-      HOST: ${{ secrets.SERVER_HOST }}
-      PORT: ${{ secrets.SERVER_SSH_PORT }}
-      USER: ${{ secrets.SERVER_USER }}
-    run: |
-      set -Eeuo pipefail
+      - name: Verify deployment
+        shell: bash
+        env:
+          HOST: ${{ secrets.SERVER_HOST }}
+          PORT: ${{ secrets.SERVER_SSH_PORT }}
+          USER: ${{ secrets.SERVER_USER }}
+        run: |
+          set -Eeuo pipefail
 
-      ssh \
-        -p "${PORT:-22}" \
-        "$USER@$HOST" \
-        "echo 'Active release:'; readlink -f /opt/yopips-terminal/current; echo 'PM2:'; sudo -u yopips-terminal pm2 status yopips-terminal"
+          ssh \
+            -p "${PORT:-22}" \
+            "$USER@$HOST" \
+            "echo 'Active release:'; readlink -f /opt/yopips-terminal/current; echo 'PM2:'; sudo -u yopips-terminal pm2 status yopips-terminal"
 
-  - name: Health check
-    shell: bash
-    run: |
-      set -Eeuo pipefail
+      - name: Health check
+        shell: bash
+        run: |
+          set -Eeuo pipefail
 
-      curl \
-        --fail \
-        --retry 10 \
-        --retry-delay 3 \
-        --retry-all-errors \
-        https://terminal.yopips.com/api/node-bridge/health
+          curl \
+            --fail \
+            --retry 10 \
+            --retry-delay 3 \
+            --retry-all-errors \
+            https://terminal.yopips.com/api/node-bridge/health
 
-      echo "Production health check passed."
+          echo "Production health check passed."
 
-  - name: Cleanup uploaded archive
-    if: always()
-    shell: bash
-    env:
-      HOST: ${{ secrets.SERVER_HOST }}
-      PORT: ${{ secrets.SERVER_SSH_PORT }}
-      USER: ${{ secrets.SERVER_USER }}
-      SHA: ${{ steps.release.outputs.sha }}
-    run: |
-      ssh \
-        -p "${PORT:-22}" \
-        "$USER@$HOST" \
-        "rm -f '/tmp/yopips-terminal-$SHA.tar.gz'" || true
+      - name: Cleanup uploaded archive
+        if: always()
+        shell: bash
+        env:
+          HOST: ${{ secrets.SERVER_HOST }}
+          PORT: ${{ secrets.SERVER_SSH_PORT }}
+          USER: ${{ secrets.SERVER_USER }}
+          SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          ssh \
+            -p "${PORT:-22}" \
+            "$USER@$HOST" \
+            "rm -f '/tmp/yopips-terminal-$SHA.tar.gz'" || true
