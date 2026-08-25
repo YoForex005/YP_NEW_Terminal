@@ -21,33 +21,27 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Resolve release ID
-        id: release
-        shell: bash
-        run: |
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Create release archive
+      - name: Package release
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          SHA="${{ steps.release.outputs.sha }}"
-
-          echo "Creating release: $SHA"
+          ARCHIVE="yopips-terminal-${GITHUB_SHA}.tar.gz"
+          mkdir -p .deploy
 
           tar \
             --exclude=.git \
             --exclude=.github \
+            --exclude=.deploy \
             --exclude=.env \
             --exclude=.env.local \
             --exclude=.env.production \
             --exclude=.env.production.local \
             --exclude=node_modules \
             --exclude=.next \
-            -czf "yopips-terminal-$SHA.tar.gz" .
+            -czf ".deploy/$ARCHIVE" .
 
-          ls -lh "yopips-terminal-$SHA.tar.gz"
+          ls -lh ".deploy/$ARCHIVE"
 
       - name: Upload release
         uses: appleboy/scp-action@v1
@@ -56,8 +50,9 @@ jobs:
           port: ${{ secrets.SERVER_SSH_PORT }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
-          source: yopips-terminal-${{ steps.release.outputs.sha }}.tar.gz
+          source: .deploy/yopips-terminal-${{ github.sha }}.tar.gz
           target: /tmp/
+          strip_components: 1
           overwrite: true
 
       - name: Deploy release
@@ -70,45 +65,12 @@ jobs:
           command_timeout: 20m
           script: |
             set -eu
+            archive='/tmp/yopips-terminal-${{ github.sha }}.tar.gz'
+            trap 'rm -f "$archive"' EXIT
+
             sudo -u yopips-terminal /usr/local/sbin/deploy-yopips-terminal \
-              '/tmp/yopips-terminal-${{ steps.release.outputs.sha }}.tar.gz' \
-              '${{ steps.release.outputs.sha }}'
+              "$archive" \
+              '${{ github.sha }}'
 
-      - name: Verify deployment
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          port: ${{ secrets.SERVER_SSH_PORT }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          script: |
-            set -eu
-            echo 'Active release:'
-            readlink -f /opt/yopips-terminal/current
-            echo 'PM2:'
             sudo -u yopips-terminal pm2 status yopips-terminal
-
-      - name: Health check
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          curl \
-            --fail \
-            --retry 10 \
-            --retry-delay 3 \
-            --retry-all-errors \
-            https://terminal.yopips.com/api/node-bridge/health
-
-          echo "Production health check passed."
-
-      - name: Cleanup uploaded archive
-        if: always()
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          port: ${{ secrets.SERVER_SSH_PORT }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          script: |
-            rm -f '/tmp/yopips-terminal-${{ steps.release.outputs.sha }}.tar.gz'
+            curl --fail --retry 10 --retry-delay 3 http://127.0.0.1:3012/api/node-bridge/health
