@@ -6,8 +6,8 @@ on:
       - main
 
 concurrency:
-group: yp-terminal
-cancel-in-progress: true
+    group: yp-terminal
+    cancel-in-progress: true
 
 jobs:
   deploy:
