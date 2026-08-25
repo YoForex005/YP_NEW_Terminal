@@ -42,77 +42,51 @@ jobs:
             --exclude=.env \
             --exclude=.env.local \
             --exclude=.env.production \
+            --exclude=.env.production.local \
             --exclude=node_modules \
             --exclude=.next \
-            -czf "/tmp/yopips-terminal-$SHA.tar.gz" .
+            -czf "yopips-terminal-$SHA.tar.gz" .
 
-          ls -lh "/tmp/yopips-terminal-$SHA.tar.gz"
-
-      - name: Configure SSH
-        shell: bash
-        env:
-          SSH_PRIVATE_KEY: ${{ secrets.SERVER_SSH_KEY }}
-          SSH_HOST_KEY: ${{ secrets.SERVER_HOST_KEY }}
-        run: |
-          set -Eeuo pipefail
-
-          install -d -m 0700 ~/.ssh
-
-          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
-          chmod 0600 ~/.ssh/id_ed25519
-
-          if [ -n "${SSH_HOST_KEY:-}" ]; then
-            printf '%s\n' "$SSH_HOST_KEY" > ~/.ssh/known_hosts
-          else
-            ssh-keyscan -p "${{ secrets.SERVER_SSH_PORT || 22 }}" \
-              "${{ secrets.SERVER_HOST }}" > ~/.ssh/known_hosts
-          fi
-
-          chmod 0600 ~/.ssh/known_hosts
+          ls -lh "yopips-terminal-$SHA.tar.gz"
 
       - name: Upload release
-        shell: bash
-        env:
-          HOST: ${{ secrets.SERVER_HOST }}
-          PORT: ${{ secrets.SERVER_SSH_PORT }}
-          USER: ${{ secrets.SERVER_USER }}
-          SHA: ${{ steps.release.outputs.sha }}
-        run: |
-          set -Eeuo pipefail
-
-          scp \
-            -P "${PORT:-22}" \
-            "/tmp/yopips-terminal-$SHA.tar.gz" \
-            "$USER@$HOST:/tmp/"
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          port: ${{ secrets.SERVER_SSH_PORT }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          source: yopips-terminal-${{ steps.release.outputs.sha }}.tar.gz
+          target: /tmp/
+          overwrite: true
 
       - name: Deploy release
-        shell: bash
-        env:
-          HOST: ${{ secrets.SERVER_HOST }}
-          PORT: ${{ secrets.SERVER_SSH_PORT }}
-          USER: ${{ secrets.SERVER_USER }}
-          SHA: ${{ steps.release.outputs.sha }}
-        run: |
-          set -Eeuo pipefail
-
-          ssh \
-            -p "${PORT:-22}" \
-            "$USER@$HOST" \
-            "sudo -u yopips-terminal /usr/local/sbin/deploy-yopips-terminal '/tmp/yopips-terminal-$SHA.tar.gz' '$SHA'"
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          port: ${{ secrets.SERVER_SSH_PORT }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          command_timeout: 20m
+          script: |
+            set -eu
+            sudo -u yopips-terminal /usr/local/sbin/deploy-yopips-terminal \
+              '/tmp/yopips-terminal-${{ steps.release.outputs.sha }}.tar.gz' \
+              '${{ steps.release.outputs.sha }}'
 
       - name: Verify deployment
-        shell: bash
-        env:
-          HOST: ${{ secrets.SERVER_HOST }}
-          PORT: ${{ secrets.SERVER_SSH_PORT }}
-          USER: ${{ secrets.SERVER_USER }}
-        run: |
-          set -Eeuo pipefail
-
-          ssh \
-            -p "${PORT:-22}" \
-            "$USER@$HOST" \
-            "echo 'Active release:'; readlink -f /opt/yopips-terminal/current; echo 'PM2:'; sudo -u yopips-terminal pm2 status yopips-terminal"
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          port: ${{ secrets.SERVER_SSH_PORT }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            set -eu
+            echo 'Active release:'
+            readlink -f /opt/yopips-terminal/current
+            echo 'PM2:'
+            sudo -u yopips-terminal pm2 status yopips-terminal
 
       - name: Health check
         shell: bash
@@ -130,14 +104,11 @@ jobs:
 
       - name: Cleanup uploaded archive
         if: always()
-        shell: bash
-        env:
-          HOST: ${{ secrets.SERVER_HOST }}
-          PORT: ${{ secrets.SERVER_SSH_PORT }}
-          USER: ${{ secrets.SERVER_USER }}
-          SHA: ${{ steps.release.outputs.sha }}
-        run: |
-          ssh \
-            -p "${PORT:-22}" \
-            "$USER@$HOST" \
-            "rm -f '/tmp/yopips-terminal-$SHA.tar.gz'" || true
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          port: ${{ secrets.SERVER_SSH_PORT }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            rm -f '/tmp/yopips-terminal-${{ steps.release.outputs.sha }}.tar.gz'
