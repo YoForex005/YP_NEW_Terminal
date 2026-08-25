@@ -4,80 +4,141 @@ on:
   push:
     branches:
       - main
+workflow_dispatch:
 
 concurrency:
-    group: yp-terminal
-    cancel-in-progress: true
+  group: yp-terminal
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
-    steps:
-      - name: Deploy using SSH
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          port: 22
-          command_timeout: 20m
+steps:
+  - name: Checkout source
+    uses: actions/checkout@v4
 
-          script: |
-            set -Eeuo pipefail
+  - name: Resolve release ID
+    id: release
+    shell: bash
+    run: |
+      echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-            APP_DIR="/opt/yopips-terminal/current"
-            COMMIT_SHA="${{ github.sha }}"
-            PM2_NAME="yopips-terminal"
+  - name: Create release archive
+    shell: bash
+    run: |
+      set -Eeuo pipefail
 
-            rollback() {
-              echo "Deployment failed. Rolling back..."
+      SHA="${{ steps.release.outputs.sha }}"
 
-              cd "$APP_DIR"
+      echo "Creating release: $SHA"
 
-              git reset --hard "$PREVIOUS_SHA"
+      tar \
+        --exclude=.git \
+        --exclude=.github \
+        --exclude=.env \
+        --exclude=.env.local \
+        --exclude=.env.production \
+        --exclude=node_modules \
+        --exclude=.next \
+        -czf "/tmp/yopips-terminal-$SHA.tar.gz" .
 
-              echo "Restarting previous version..."
-              pm2 restart "$PM2_NAME" --update-env
-              pm2 save
+      ls -lh "/tmp/yopips-terminal-$SHA.tar.gz"
 
-              echo "Rollback completed."
-              echo "Running commit: $(git rev-parse HEAD)"
-            }
+  - name: Configure SSH
+    shell: bash
+    env:
+      SSH_PRIVATE_KEY: ${{ secrets.SERVER_SSH_KEY }}
+      SSH_HOST_KEY: ${{ secrets.SERVER_HOST_KEY }}
+    run: |
+      set -Eeuo pipefail
 
-            trap rollback ERR
+      install -d -m 0700 ~/.ssh
 
-            cd "$APP_DIR"
+      printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+      chmod 0600 ~/.ssh/id_ed25519
 
-            echo "Current commit:"
-            git rev-parse HEAD
+      if [ -n "${SSH_HOST_KEY:-}" ]; then
+        printf '%s\n' "$SSH_HOST_KEY" > ~/.ssh/known_hosts
+      else
+        ssh-keyscan -p "${{ secrets.SERVER_SSH_PORT || 22 }}" \
+          "${{ secrets.SERVER_HOST }}" > ~/.ssh/known_hosts
+      fi
 
-            PREVIOUS_SHA="$(git rev-parse HEAD)"
+      chmod 0600 ~/.ssh/known_hosts
 
-            echo "Previous commit: $PREVIOUS_SHA"
-            echo "Deploying commit: $COMMIT_SHA"
+  - name: Upload release
+    shell: bash
+    env:
+      HOST: ${{ secrets.SERVER_HOST }}
+      PORT: ${{ secrets.SERVER_SSH_PORT }}
+      USER: ${{ secrets.SERVER_USER }}
+      SHA: ${{ steps.release.outputs.sha }}
+    run: |
+      set -Eeuo pipefail
 
-            echo "Fetching latest commit..."
-            git fetch origin
+      scp \
+        -P "${PORT:-22}" \
+        "/tmp/yopips-terminal-$SHA.tar.gz" \
+        "$USER@$HOST:/tmp/"
 
-            echo "Updating application..."
-            git reset --hard "$COMMIT_SHA"
+  - name: Deploy release
+    shell: bash
+    env:
+      HOST: ${{ secrets.SERVER_HOST }}
+      PORT: ${{ secrets.SERVER_SSH_PORT }}
+      USER: ${{ secrets.SERVER_USER }}
+      SHA: ${{ steps.release.outputs.sha }}
+    run: |
+      set -Eeuo pipefail
 
-            echo "Installing dependencies..."
-            npm ci
+      ssh \
+        -p "${PORT:-22}" \
+        "$USER@$HOST" \
+        "sudo -u yopips-terminal /usr/local/sbin/deploy-yopips-terminal '/tmp/yopips-terminal-$SHA.tar.gz' '$SHA'"
 
-            echo "Building Next.js application..."
-            npm run build
+  - name: Verify deployment
+    shell: bash
+    env:
+      HOST: ${{ secrets.SERVER_HOST }}
+      PORT: ${{ secrets.SERVER_SSH_PORT }}
+      USER: ${{ secrets.SERVER_USER }}
+    run: |
+      set -Eeuo pipefail
 
-            echo "Restarting PM2..."
-            pm2 restart "$PM2_NAME" --update-env
+      ssh \
+        -p "${PORT:-22}" \
+        "$USER@$HOST" \
+        "echo 'Active release:'; readlink -f /opt/yopips-terminal/current; echo 'PM2:'; sudo -u yopips-terminal pm2 status yopips-terminal"
 
-            pm2 save
+  - name: Health check
+    shell: bash
+    run: |
+      set -Eeuo pipefail
 
-            trap - ERR
+      curl \
+        --fail \
+        --retry 10 \
+        --retry-delay 3 \
+        --retry-all-errors \
+        https://terminal.yopips.com/api/node-bridge/health
 
-            echo "======================================"
-            echo "Deployment successful"
-            echo "Commit: $(git rev-parse HEAD)"
-            echo "======================================"
+      echo "Production health check passed."
+
+  - name: Cleanup uploaded archive
+    if: always()
+    shell: bash
+    env:
+      HOST: ${{ secrets.SERVER_HOST }}
+      PORT: ${{ secrets.SERVER_SSH_PORT }}
+      USER: ${{ secrets.SERVER_USER }}
+      SHA: ${{ steps.release.outputs.sha }}
+    run: |
+      ssh \
+        -p "${PORT:-22}" \
+        "$USER@$HOST" \
+        "rm -f '/tmp/yopips-terminal-$SHA.tar.gz'" || true
