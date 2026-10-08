@@ -2716,8 +2716,7 @@ function TerminalLaunchLoadingOverlay({ error, exiting = false }: { error?: stri
             ) : (
                 // Same logo + dot wave as the dashboard's /terminal-launch screen, so a
                 // silent re-launch reads as one continuous loading screen.
-                <div className="flex flex-col items-center gap-7">
-                    <img src="/brand/ASR.svg" alt="ASR" width={170} height={38} className="h-[38px] w-auto select-none opacity-95" draggable={false} />
+                <div className="flex flex-col items-center">
                     <div className="terminal-launch-loading-dots" aria-hidden="true">
                         <span className="terminal-launch-loading-dot" />
                         <span className="terminal-launch-loading-dot" />

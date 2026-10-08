@@ -912,8 +912,8 @@ function Header({ account, positions = [], selectedSymbol, openTabs, userProfile
                 <div className="hidden md:flex flex-col justify-center h-full pl-2 md:pl-4 pr-4 border-r border-border">
                     <div className="relative inline-flex items-center justify-center gap-2 rounded-none h-[64px] select-none group cursor-pointer">
                         <img
-                            src={theme === 'dark' ? '/brand/ASR.svg' : '/brand/ASR_light.svg'}
-                            alt="ASR"
+                            src={theme === 'dark' ? '/assets/yopips-logo-white.png' : '/assets/yopips-logo-dark.png'}
+                            alt="Yopips"
                             width={154}
                             height={34}
                             className="h-[30px] md:h-[34px] w-auto max-w-[148px] object-contain opacity-95 transition-opacity hover:opacity-100"

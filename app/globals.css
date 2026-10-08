@@ -17,7 +17,7 @@
     --card-foreground: 222 47% 11%;
     --popover: 0 0% 100%;
     --popover-foreground: 222 47% 11%;
-    --primary: 253 74% 54%;           /* ASR light primary #5A35E0 */
+    --primary: 253 74% 54%;           /* Yopips light primary #5A35E0 */
     --primary-foreground: 0 0% 100%;
     --secondary: 210 40% 96.1%;
     --secondary-foreground: 222 47% 11%;
@@ -54,7 +54,7 @@
     --card-foreground: 204 13% 94%;
     --popover: 222 26% 12%;
     --popover-foreground: 204 13% 94%;
-    --primary: 190 100% 50%;          /* ASR cyan #00D4FF */
+    --primary: 190 100% 50%;          /* Yopips cyan #00D4FF */
     --primary-foreground: 225 46% 5%;
     --secondary: 222 26% 11%;
     --secondary-foreground: 204 13% 94%;
@@ -83,7 +83,7 @@
     --card-foreground: 204 13% 94%;
     --popover: 222 26% 12%;
     --popover-foreground: 204 13% 94%;
-    --primary: 190 100% 50%;          /* ASR cyan #00D4FF */
+    --primary: 190 100% 50%;          /* Yopips cyan #00D4FF */
     --primary-foreground: 225 46% 5%;
     --secondary: 222 26% 11%;
     --secondary-foreground: 204 13% 94%;
@@ -314,22 +314,3 @@
   }
 }
 
-/* ---- ASR brand gradient ----
-   Solid brand fills (primary buttons, active-tab bars, checked boxes) use the
-   ASR logo gradient in both themes, matching the ASR client app. Only the solid
-   bg-primary utility is targeted: tinted fills (bg-primary/10) and buy/sell
-   colours (--success / --destructive) are untouched. */
-:root {
-  --brand-gradient: linear-gradient(90deg, #00D4FF 0%, #7B5CFF 50%, #FF2D8D 100%);
-}
-html .bg-primary {
-  background-image: var(--brand-gradient);
-  background-size: 100% 100%;
-}
-html .bg-primary.text-primary-foreground,
-html .bg-primary .text-primary-foreground {
-  color: #FFFFFF;
-}
-html .bg-primary:hover:not(:disabled) {
-  filter: brightness(1.08);
-}

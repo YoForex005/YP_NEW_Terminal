@@ -174,7 +174,7 @@ const removeLaunchCodeFromLocation = (): void => {
 // Keep the exchanged terminal session for this browser tab only (sessionStorage
 // is per-tab and cleared when the tab closes) and resume it on reload by minting
 // fresh websocket tickets with the terminal token.
-const TERMINAL_SESSION_STORAGE_KEY = 'asr-terminal-session';
+const TERMINAL_SESSION_STORAGE_KEY = 'yopips-terminal-session';
 
 interface StoredTerminalSession {
   terminalToken: string;

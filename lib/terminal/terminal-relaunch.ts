@@ -7,8 +7,8 @@ import { getTerminalDashboardUrl } from '@/lib/terminal/ticket-terminal-client';
 // route. The dashboard is already logged in, issues a fresh one-time launch
 // code for the account and sends the browser straight back here.
 
-const LAST_LOGIN_STORAGE_KEY = 'asr-terminal-last-login';
-const RELAUNCH_ATTEMPT_STORAGE_KEY = 'asr-terminal-relaunch-at';
+const LAST_LOGIN_STORAGE_KEY = 'yopips-terminal-last-login';
+const RELAUNCH_ATTEMPT_STORAGE_KEY = 'yopips-terminal-relaunch-at';
 // A relaunch that comes back without a working session within this window is
 // treated as failed, so the terminal shows the "session ended" screen instead
 // of bouncing between the two apps forever.

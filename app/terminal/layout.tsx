@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-    title: "ASR Web Terminal",
-    description: "ASR web trading terminal with real-time market data, charts, and order management.",
+    title: "Yopips Web Terminal",
+    description: "Yopips web trading terminal with real-time market data, charts, and order management.",
 };
 
 export default function TerminalLayout({

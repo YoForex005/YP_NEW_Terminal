@@ -70,8 +70,8 @@ export function BrandBadge({
       </div>
 
       <Image
-        src="/brand/ASR_light.svg"
-        alt="ASR logo"
+        src="/assets/yopips-logo-dark.png"
+        alt="Yopips logo"
         width={240}
         height={54}
         priority={priority}
@@ -84,8 +84,8 @@ export function BrandBadge({
         )}
       />
       <Image
-        src="/brand/ASR.svg"
-        alt="ASR logo"
+        src="/assets/yopips-logo-white.png"
+        alt="Yopips logo"
         width={240}
         height={54}
         priority={priority}
